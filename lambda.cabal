@@ -1,0 +1,109 @@
+cabal-version:      3.0
+name:               lambda
+version:            0.1.0.0
+synopsis:           Systems engineering TUI agent harness in Haskell
+license:            MIT
+build-type:         Simple
+
+common common-options
+    default-language:   GHC2021
+    default-extensions:
+        OverloadedStrings
+        RecordWildCards
+        DeriveGeneric
+        DerivingStrategies
+        LambdaCase
+        BangPatterns
+    ghc-options:
+        -Wall
+        -Wcompat
+        -Widentities
+        -Wincomplete-record-updates
+        -Wincomplete-uni-patterns
+        -Wredundant-constraints
+
+library
+    import:           common-options
+    hs-source-dirs:   src
+    exposed-modules:
+        Lambda.Types
+        Lambda.Config
+        Lambda.Core.ModelDriver
+        Lambda.Core.ToolProvider
+        Lambda.Core.EngineInterface
+        Lambda.Driver.OpenAI
+        Lambda.Provider.JsonRpc
+        Lambda.Provider.Builtin
+        Lambda.Engine.State
+        Lambda.Engine.Security
+        Lambda.Engine.Dispatcher
+        Lambda.Engine.Compactor
+        Lambda.Engine.SubAgent
+        Lambda.Engine.Artifacts
+        Lambda.UI.Types
+        Lambda.UI.Draw
+        Lambda.UI.Events
+    build-depends:
+        base >= 4.17 && < 5,
+        text,
+        bytestring,
+        aeson >= 2.1,
+        vector,
+        containers,
+        unordered-containers,
+        stm,
+        async,
+        typed-process,
+        http-client,
+        http-client-tls,
+        http-types,
+        conduit,
+        conduit-extra,
+        case-insensitive,
+        brick >= 2.3,
+        vty >= 6.0,
+        vty-crossplatform,
+        Glob,
+        filepath,
+        directory,
+        time,
+        microlens,
+        microlens-th
+
+executable lambda
+    import:           common-options
+    main-is:          Main.hs
+    hs-source-dirs:   app
+    ghc-options:
+        -threaded
+        -rtsopts
+        -with-rtsopts=-N
+    build-depends:
+        base,
+        lambda,
+        brick,
+        vty,
+        vty-crossplatform,
+        text,
+        stm,
+        containers
+
+test-suite lambda-test
+    import:           common-options
+    type:             exitcode-stdio-1.0
+    main-is:          Spec.hs
+    hs-source-dirs:   test
+    ghc-options:
+        -threaded
+        -rtsopts
+        -with-rtsopts=-N
+    build-depends:
+        base,
+        lambda,
+        text,
+        aeson,
+        containers,
+        stm,
+        directory,
+        filepath,
+        bytestring

@@ -1,0 +1,22 @@
+# Environment & Secrets
+.env
+.env.local
+*.env
+
+# Haskell Cabal & GHC build artifacts
+dist/
+dist-newstyle/
+*.o
+*.hi
+*.dyn_o
+*.dyn_hi
+
+# lambdA runtime artifacts & local config
+.lambda/
+.config/
+
+# Editor & OS files
+.DS_Store
+*.swp
+*.swo
+*~
