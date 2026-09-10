@@ -8,7 +8,8 @@ import qualified Data.ByteString.Lazy as BL
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import System.Directory (removeDirectoryRecursive, doesFileExist)
+import qualified Data.Text.IO as TIO
+import System.Directory (removeDirectoryRecursive, doesFileExist, removeFile)
 import System.Environment (setEnv, unsetEnv)
 import System.Exit (exitFailure)
 
@@ -41,6 +42,7 @@ main = do
   testPersistentSystemPrompt
   testLiveMcpServerIntegration
   testSubAgentViewportInvariant
+  testPlanModeSubAgentAndContextGuard
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -296,6 +298,36 @@ testSubAgentViewportInvariant = do
       widget = renderSubAgents sampleMap
   assert "renderSubAgents has Fixed vertical size" (vSize widget == Fixed)
   putStrLn "  -> OK: renderSubAgents produces Fixed vertical height for SubAgentView viewport."
+
+-- 14. Verify PlanMode SubAgent and Context Mass Guard Invariants
+testPlanModeSubAgentAndContextGuard :: IO ()
+testPlanModeSubAgentAndContextGuard = do
+  putStrLn "\n[Test 14] PlanMode SubAgent & Context Mass Guard Invariants"
+  let largeFilePath = "large_test_file.txt"
+      largeContent = T.unlines [ "Line " <> T.pack (show n) | n <- [1..300 :: Int] ]
+  TIO.writeFile largeFilePath largeContent
+
+  let readTool = readFileTool "."
+  -- MainAgent direct read of large file (> 250 lines) should be intercepted by Context Mass Guard
+  resMainLarge <- toolExecute readTool MainAgent (Aeson.object ["path" Aeson..= T.pack largeFilePath])
+  assert "Context Mass Guard blocks main agent direct large read" ("Context Mass Guard" `T.isInfixOf` resultStderr resMainLarge)
+
+  -- MainAgent targeted slice (<= 250 lines) should succeed
+  resMainSlice <- toolExecute readTool MainAgent (Aeson.object
+    [ "path" Aeson..= T.pack largeFilePath
+    , "start_line" Aeson..= (1 :: Int)
+    , "line_count" Aeson..= (50 :: Int)
+    ])
+  assert "Main agent sliced read succeeds" (resultStderr resMainSlice == "")
+  assert "Main agent sliced read returned 50 lines" (length (T.lines (resultStdout resMainSlice)) == 50)
+
+  -- Subagent direct read of large file should succeed without restriction (isolated context)
+  resSubLarge <- toolExecute readTool (SubAgentId 1 "Survey task") (Aeson.object ["path" Aeson..= T.pack largeFilePath])
+  assert "Subagent direct large read succeeds without guard" (resultStderr resSubLarge == "")
+  assert "Subagent received all 300 lines" (length (T.lines (resultStdout resSubLarge)) == 300)
+
+  removeFile largeFilePath
+  putStrLn "  -> OK: Large file reads properly guarded for MainAgent and delegated to SubAgents."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

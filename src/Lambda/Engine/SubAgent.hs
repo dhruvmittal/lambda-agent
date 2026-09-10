@@ -46,8 +46,23 @@ runEphemeralSubAgent engineState@AppEngineState{..} driver SubAgentSpec{..} = do
   task <- registerSubAgentTask engineState subTaskDescription subTurnBudget
   let sId = subAgentId task
 
+  curMode <- readTVarIO appMode
+
   -- Step 1: Upfront proactive capability authorization
-  authorized <- requestGrantApproval appSecurity sId subTaskDescription subGrantedGlobs
+  -- In PlanMode, filter out any destructive grants so subagent is strictly read-only
+  let isDestructiveGlob g = any (`T.isPrefixOf` g) ["bash*", "write_file*", "edit_file*"]
+      effectiveGrants = if curMode == PlanMode
+        then filter (not . isDestructiveGlob) subGrantedGlobs
+        else subGrantedGlobs
+
+  let isSafeReadGlob g = any (`T.isPrefixOf` g)
+        [ "read_file*", "list_directory*", "fetch_url*", "sd_*", "git status*", "git diff*", "git log*", "ls*", "pwd*", "cat*" ]
+      allSafe = all isSafeReadGlob effectiveGrants
+
+  authorized <- if curMode == PlanMode || allSafe
+    then pure True
+    else requestGrantApproval appSecurity sId subTaskDescription effectiveGrants
+
   if not authorized
     then do
       updateSubAgentStatus engineState sId (SubAgentBlocked "Capability grant denied by user")
@@ -57,23 +72,24 @@ runEphemeralSubAgent engineState@AppEngineState{..} driver SubAgentSpec{..} = do
       subTurnsVar <- newTVarIO
         [ Turn 1 SystemRole
             [ TextBlock $ T.unlines
-                [ "# Identity: lambdA Ephemeral Diagnostic Worker"
-                , "You are an ephemeral diagnostic sub-agent spawned for a specific investigation."
+                [ "# Identity: lambdA Ephemeral Worker"
+                , "You are an ephemeral subagent spawned for an isolated investigation, survey, or diagnostic task."
+                , "Operating Mode: " <> (if curMode == PlanMode then "[PLAN MODE - Read-Only]" else "[EXEC MODE - Mutating]")
                 , "Task: " <> subTaskDescription
-                , "Operate within your turn budget. When diagnosis is complete, output a structured block:"
+                , "Operate within your turn budget. When diagnosis or survey is complete, output a structured block:"
                 , "```diagnosis"
                 , "STATUS: SUCCESS | INCONCLUSIVE | BLOCKED"
-                , "ROOT_CAUSE: <explanation>"
-                , "EVIDENCE: <details>"
-                , "RECOMMENDED_REMEDY: <fix>"
+                , "ROOT_CAUSE: <summary or survey findings>"
+                , "EVIDENCE: <details or key file references>"
+                , "RECOMMENDED_REMEDY: <recommendations or next steps>"
                 , "```"
                 ]
             ]
-        , Turn 2 UserRole [TextBlock ("Begin investigation: " <> subTaskDescription)]
+        , Turn 2 UserRole [TextBlock ("Begin task: " <> subTaskDescription)]
         ]
 
       -- Step 3: Run execution loop
-      res <- subAgentLoop engineState driver sId subGrantedGlobs subTurnsVar 1 subTurnBudget
+      res <- subAgentLoop engineState driver sId effectiveGrants subTurnsVar 1 subTurnBudget
       case res of
         Right r -> do
           updateSubAgentStatus engineState sId (SubAgentSuccess (subStatus r))
@@ -97,7 +113,8 @@ subAgentLoop engineState@AppEngineState{..} driver sId grants turnsVar currentTu
   | otherwise = do
       turns <- readTVarIO turnsVar
       reg <- readTVarIO appToolRegistry
-      let toolSchemas = toolsToOpenAISchema ExecMode reg
+      mode <- readTVarIO appMode
+      let toolSchemas = toolsToOpenAISchema mode reg
 
       accumTextVar <- newTVarIO ("" :: Text)
       accumThinkingVar <- newTVarIO ("" :: Text)
@@ -169,13 +186,13 @@ parseDiagnosis txt
 spawnSubAgentTool :: AppEngineState -> ModelDriver -> ToolDefinition
 spawnSubAgentTool engineState driver = ToolDefinition
   { toolName = "spawn_diagnostic_subagent"
-  , toolDescription = "Spawn an ephemeral subagent to execute an isolated multi-step diagnostic or debugging task. Elides raw tool outputs from the main context."
+  , toolDescription = "Spawn an ephemeral subagent to execute an isolated task (e.g. codebase survey, inspecting multiple/large files, running tests, or diagnostics). In [/plan] mode, subagents are restricted to read-only exploration without mutating the workspace."
   , toolParameters = Aeson.object
       [ "type" .= ("object" :: Text)
       , "properties" .= Aeson.object
           [ "task" .= Aeson.object
               [ "type" .= ("string" :: Text)
-              , "description" .= ("Hypothesis or diagnostic goal for the subagent." :: Text)
+              , "description" .= ("Hypothesis, survey goal, or diagnostic task for the subagent." :: Text)
               ]
           , "budget" .= Aeson.object
               [ "type" .= ("integer" :: Text)
@@ -184,12 +201,12 @@ spawnSubAgentTool engineState driver = ToolDefinition
           , "granted_capabilities" .= Aeson.object
               [ "type" .= ("array" :: Text)
               , "items" .= Aeson.object [ "type" .= ("string" :: Text) ]
-              , "description" .= ("List of glob patterns the subagent is authorized to run (e.g. ['ctest*', 'gdb*', 'read_file*'])." :: Text)
+              , "description" .= ("List of glob patterns the subagent is authorized to run (e.g. ['read_file*', 'list_directory*', 'sd_*', 'ctest*'])." :: Text)
               ]
           ]
       , "required" .= (["task", "granted_capabilities"] :: [Text])
       ]
-  , toolCapability = Destructive
+  , toolCapability = ReadOnly
   , toolExecute = \_caller args -> do
       case parseEither parseArgs args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
