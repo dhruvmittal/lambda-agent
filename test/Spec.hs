@@ -17,6 +17,11 @@ import Lambda.Core.ToolProvider
 import Lambda.Engine.Artifacts
 import Lambda.Engine.Compactor
 import Lambda.Engine.Security
+import qualified Data.Map.Strict as Map
+import Brick.Types (vSize, Size(..))
+import Lambda.Provider.Builtin (listDirectoryTool, readFileTool, fetchUrlTool)
+import Lambda.Provider.Mcp (inferCapability, parseMcpCallResult, startAndLoadMcpServers, stopMcpClient)
+import Lambda.UI.Draw (renderSubAgents)
 import Lambda.Types
 
 main :: IO ()
@@ -29,6 +34,13 @@ main = do
   testSecurityGlobMatching
   testModeFiltering
   testConfigFallbacks
+  testDirectoryTools
+  testContextEstimation
+  testMcpProtocolAndMapping
+  testFetchUrlTool
+  testPersistentSystemPrompt
+  testLiveMcpServerIntegration
+  testSubAgentViewportInvariant
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -58,7 +70,8 @@ testThinkingEviction = do
 
   -- Wire JSON payload should have no thinking on historical turns
   let wireMessages = turnsToOpenAIPayload [turn1, turn2, turn3]
-  let t1Wire = head wireMessages
+  -- wireMessages !! 0 is persistent system prompt, wireMessages !! 1 is turn1
+  let t1Wire = wireMessages !! 1
   assert "Turn 1 wire JSON contains only text" (not ("scratchpad" `T.isInfixOf` T.pack (show t1Wire)))
   putStrLn "  -> OK: Historical reasoning strictly evicted from egress wire payloads."
   where
@@ -80,16 +93,20 @@ testWireToolCalling = do
         ]
       wire = turnsToOpenAIPayload [turnAssistant, turnTool]
 
-  assert "Generated 2 wire messages" (length wire == 2)
-  let asstJson = TE.decodeUtf8 (BL.toStrict (Aeson.encode (head wire)))
-      toolJson = TE.decodeUtf8 (BL.toStrict (Aeson.encode (last wire)))
+  assert "Generated 3 wire messages (system prompt + assistant + tool)" (length wire == 3)
+  let sysJson = TE.decodeUtf8 (BL.toStrict (Aeson.encode (head wire)))
+      asstJson = TE.decodeUtf8 (BL.toStrict (Aeson.encode (wire !! 1)))
+      toolJson = TE.decodeUtf8 (BL.toStrict (Aeson.encode (wire !! 2)))
 
+  assert "First message has role: system" ("\"role\":\"system\"" `T.isInfixOf` sysJson)
+  assert "System message contains lambdA prompt" ("lambdA" `T.isInfixOf` sysJson)
   assert "Assistant message has role: assistant" ("\"role\":\"assistant\"" `T.isInfixOf` asstJson)
   assert "Assistant message has native tool_calls array" ("\"tool_calls\":" `T.isInfixOf` asstJson)
   assert "Assistant message has tool call ID" ("call_abc123" `T.isInfixOf` asstJson)
+  assert "Assistant message tool arguments are stringified JSON" ("\"arguments\":\"{\\\"command\\\":\\\"ls -la\\\"}\"" `T.isInfixOf` asstJson)
   assert "Tool response has role: tool" ("\"role\":\"tool\"" `T.isInfixOf` toolJson)
   assert "Tool response references tool_call_id" ("\"tool_call_id\":\"call_abc123\"" `T.isInfixOf` toolJson)
-  putStrLn "  -> OK: Native OpenAI structured tool calls and tool responses formatted cleanly."
+  putStrLn "  -> OK: Native OpenAI structured tool calls (with stringified arguments) and tool responses formatted cleanly."
 
 -- 3. Verify Out-of-Band Artifact Spooling
 testArtifactSpooling :: IO ()
@@ -162,6 +179,123 @@ testConfigFallbacks = do
   unsetEnv "OPENROUTER_API_KEY"
   unsetEnv "OPENROUTER_MODEL"
   putStrLn "  -> OK: OpenRouter environment variables reliably detected and loaded."
+
+-- 7. Verify Directory Listing and Fallback
+testDirectoryTools :: IO ()
+testDirectoryTools = do
+  putStrLn "\n[Test 7] Directory Tools & Fallback Handling"
+  let listTool = listDirectoryTool "."
+  resList <- toolExecute listTool MainAgent (Aeson.object ["path" Aeson..= ("src" :: Text)])
+  assert "list_directory finds Lambda folder" ("Lambda" `T.isInfixOf` resultStdout resList)
+
+  let readTool = readFileTool "."
+  resReadDir <- toolExecute readTool MainAgent (Aeson.object ["path" Aeson..= ("src" :: Text)])
+  assert "read_file on directory lists contents gracefully" ("Specified path is a directory" `T.isInfixOf` resultStdout resReadDir)
+  putStrLn "  -> OK: Directory listing and directory fallback in read_file work correctly."
+
+-- 8. Verify Context Window Estimation
+testContextEstimation :: IO ()
+testContextEstimation = do
+  putStrLn "\n[Test 8] Context Window Token Estimation"
+  let turn = Turn 1 UserRole [TextBlock (T.replicate 400 "a")]
+      tokens = estimateTotalTokens [turn]
+  assert "400 characters estimated around ~100 tokens" (tokens >= 90 && tokens <= 110)
+  putStrLn "  -> OK: Token estimator produces accurate window estimations."
+
+-- 9. Verify MCP Protocol Capability Inference and Result Parsing
+testMcpProtocolAndMapping :: IO ()
+testMcpProtocolAndMapping = do
+  putStrLn "\n[Test 9] MCP Protocol Capability Inference and Response Parsing"
+  assert "sd_read inferred as ReadOnly" (inferCapability "sd_read" "Read a file" == ReadOnly)
+  assert "sd_recall inferred as ReadOnly" (inferCapability "sd_recall" "Recall memories" == ReadOnly)
+  assert "sd_add inferred as Destructive" (inferCapability "sd_add" "Store memory" == Destructive)
+  assert "nix inferred as ReadOnly" (inferCapability "nix" "Evaluate nix" == ReadOnly)
+  assert "arbitrary_mutator inferred as Destructive" (inferCapability "format_disk" "Format storage" == Destructive)
+
+  -- Test MCP response parsing
+  let okPayload = Aeson.object
+        [ "content" Aeson..= [ Aeson.object [ "type" Aeson..= ("text" :: Text), "text" Aeson..= ("hello mcp" :: Text) ] ]
+        , "isError" Aeson..= False
+        ]
+      (okTxt, okErr) = parseMcpCallResult okPayload
+  assert "Parsed text matches" (okTxt == "hello mcp")
+  assert "Parsed isError is False" (not okErr)
+
+  let errPayload = Aeson.object
+        [ "content" Aeson..= [ Aeson.object [ "type" Aeson..= ("text" :: Text), "text" Aeson..= ("failure" :: Text) ] ]
+        , "isError" Aeson..= True
+        ]
+      (errTxt, errFlag) = parseMcpCallResult errPayload
+  assert "Error text matches" (errTxt == "failure")
+  assert "Parsed isError is True" errFlag
+  putStrLn "  -> OK: MCP capabilities inferred and protocol payloads parsed accurately."
+
+-- 10. Verify Web URL Fetching Tool
+testFetchUrlTool :: IO ()
+testFetchUrlTool = do
+  putStrLn "\n[Test 10] Web URL Fetching Tool"
+  let tool = fetchUrlTool ".lambda/artifacts"
+  assert "Tool name is fetch_url" (toolName tool == "fetch_url")
+  assert "Tool capability is ReadOnly" (toolCapability tool == ReadOnly)
+  assert "Tool description mentions HTML" ("HTML" `T.isInfixOf` toolDescription tool)
+  putStrLn "  -> OK: fetch_url tool registered with ReadOnly capability and correct schema."
+
+-- 11. Verify Systems Engineering Persistent System Prompt
+testPersistentSystemPrompt :: IO ()
+testPersistentSystemPrompt = do
+  putStrLn "\n[Test 11] Systems Engineering Persistent System Prompt Injection"
+  assert "System prompt mentions lambdA" ("lambdA" `T.isInfixOf` defaultAgentSystemPrompt)
+  assert "System prompt includes Hypothesis-Driven Problem Solving" ("Hypothesis-Driven" `T.isInfixOf` defaultAgentSystemPrompt)
+  assert "System prompt includes spawn_diagnostic_subagent instruction" ("spawn_diagnostic_subagent" `T.isInfixOf` defaultAgentSystemPrompt)
+  assert "System prompt includes mode discipline" ("[/plan]" `T.isInfixOf` defaultAgentSystemPrompt)
+
+  -- Wire payload stripping of UI banners
+  let bannerTurn1 = Turn 1 SystemRole [TextBlock "lambdA initialized. Enter a goal or press /help for commands."]
+      bannerTurn2 = Turn 2 SystemRole [TextBlock "[Compaction Checkpoint: 10 historical turns preserved in disk archives]"]
+      userTurn    = Turn 3 UserRole [TextBlock "Debug this crash dump"]
+      wire = turnsToOpenAIPayload [bannerTurn1, bannerTurn2, userTurn]
+
+  assert "Wire payload has exactly 2 messages (system prompt + user message)" (length wire == 2)
+  let sysMsg = head wire
+      usrMsg = wire !! 1
+  assert "Root message is system prompt" ("\"role\":\"system\"" `T.isInfixOf` TE.decodeUtf8 (BL.toStrict (Aeson.encode sysMsg)))
+  assert "Root message contains defaultAgentSystemPrompt" ("Hypothesis-Driven" `T.isInfixOf` TE.decodeUtf8 (BL.toStrict (Aeson.encode sysMsg)))
+  assert "UI banners were stripped from wire payload" (not ("lambdA initialized" `T.isInfixOf` TE.decodeUtf8 (BL.toStrict (Aeson.encode sysMsg))))
+  assert "User turn preserved" ("\"role\":\"user\"" `T.isInfixOf` TE.decodeUtf8 (BL.toStrict (Aeson.encode usrMsg)))
+  putStrLn "  -> OK: Systems engineering prompt persists across turns and UI banners are cleanly filtered."
+
+-- 12. Verify Live StormDrain MCP Integration
+testLiveMcpServerIntegration :: IO ()
+testLiveMcpServerIntegration = do
+  putStrLn "\n[Test 12] Live StormDrain MCP Integration"
+  cfg <- loadConfig "."
+  case Map.lookup "stormdrain" (mcpServers cfg) of
+    Nothing -> putStrLn "  -> Skip: stormdrain not configured in mcp_servers"
+    Just srv -> do
+      (clients, tools) <- startAndLoadMcpServers (Map.singleton "stormdrain" srv)
+      assert "Loaded StormDrain tools via MCP" (length tools >= 10)
+      assert "Contains sd_read" (any (\t -> toolName t == "sd_read") tools)
+      assert "Contains sd_recall" (any (\t -> toolName t == "sd_recall") tools)
+      assert "Contains sd_add" (any (\t -> toolName t == "sd_add") tools)
+      mapM_ stopMcpClient clients
+      putStrLn $ "  -> OK: Live StormDrain MCP server successfully started, initialized, and loaded " <> show (length tools) <> " tools."
+
+-- 13. Verify SubAgent Viewport Height Invariant (Prevents Brick Infinite-Height Crash)
+testSubAgentViewportInvariant :: IO ()
+testSubAgentViewportInvariant = do
+  putStrLn "\n[Test 13] SubAgent Viewport Height Invariant"
+  let sampleTask = SubAgentTask
+        { subAgentId = 1
+        , subAgentHypothesis = "Test hypothesis for ASan crash"
+        , subAgentTurnCount = 2
+        , subAgentBudget = 10
+        , subAgentStatus = SubAgentRunning
+        , subAgentArtifact = Just ".lambda/artifacts/subagent_1.log"
+        }
+      sampleMap = Map.singleton 1 sampleTask
+      widget = renderSubAgents sampleMap
+  assert "renderSubAgents has Fixed vertical size" (vSize widget == Fixed)
+  putStrLn "  -> OK: renderSubAgents produces Fixed vertical height for SubAgentView viewport."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

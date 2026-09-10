@@ -6,6 +6,7 @@ import Brick.Widgets.Edit (Editor)
 import Data.Map.Strict (Map)
 import Data.Sequence (Seq)
 import Data.Text (Text)
+import Data.Time.Clock (UTCTime)
 
 import Lambda.Core.EngineInterface (EngineChannels)
 import Lambda.Types
@@ -30,4 +31,10 @@ data UIState = UIState
   , uiEditor         :: !(Editor Text ResourceName)
   , uiWorkingState   :: !Text
   , uiChannels       :: !EngineChannels
+  , uiLastEscTime    :: !(Maybe UTCTime)
+  , uiContextLimit   :: !Int
+  , uiPromptHistory  :: ![Text]
+  , uiHistoryIndex   :: !(Maybe Int)
+  , uiSavedDraft     :: !Text
+  , uiModelName      :: !Text
   }

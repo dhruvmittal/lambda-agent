@@ -22,6 +22,7 @@ import Lambda.Engine.Security (initSecurity)
 import Lambda.Engine.State (initEngineState, AppEngineState(..))
 import Lambda.Engine.SubAgent (spawnSubAgentTool)
 import Lambda.Provider.Builtin (builtinTools)
+import Lambda.Provider.Mcp (startAndLoadMcpServers)
 import Lambda.Types
 import Lambda.UI.Draw (drawApp)
 import Lambda.UI.Events (handleAppEvent)
@@ -45,11 +46,16 @@ theApp = App
       , (attrName "toolRole",       fg V.yellow)
       , (attrName "toolCall",       fg V.yellow)
       , (attrName "toolResult",     fg V.white)
+      , (attrName "toolError",      fg V.brightRed)
       , (attrName "artifact",       fg V.brightCyan)
       , (attrName "thinkingDim",    fg V.brightBlack)
       , (attrName "subRunning",     fg V.green)
       , (attrName "subSuccess",     fg V.cyan)
       , (attrName "subFailed",      fg V.red)
+      , (attrName "ctxNormal",      fg V.brightCyan)
+      , (attrName "ctxWarn",        fg V.yellow `V.withStyle` V.bold)
+      , (attrName "ctxHigh",        fg V.brightRed `V.withStyle` V.bold)
+      , (attrName "modelBadge",     fg V.brightMagenta)
       ]
   }
 
@@ -58,8 +64,10 @@ main = do
   -- 1. Load configuration and workspace rules
   cfg <- loadConfig "."
 
-  -- 2. Initialize tool registry with builtins
-  let baseRegistry = registerTools (builtinTools (workspaceRoot cfg) (artifactDir cfg)) emptyRegistry
+  -- 2. Initialize tool registry with builtins and configured MCP servers
+  let builtinReg = registerTools (builtinTools (workspaceRoot cfg) (artifactDir cfg)) emptyRegistry
+  (_mcpClients, mcpTools) <- startAndLoadMcpServers (mcpServers cfg)
+  let baseRegistry = registerTools mcpTools builtinReg
 
   -- 3. Initialize security state
   secState <- initSecurity (alwaysAllowGlobs cfg) (alwaysDenyGlobs cfg)
@@ -82,9 +90,10 @@ main = do
     ev <- atomically $ readTQueue (evQueue channels)
     writeBChan eventChan ev
 
-  -- 8. Setup Vty terminal with mouse mode enabled
+  -- 8. Setup Vty terminal with bracketed paste enabled (and mouse trap disabled)
+  -- Disabling V.Mouse enables native terminal click-and-drag text selection and copy/paste
   initialVty <- VCross.mkVty V.defaultConfig
-  V.setMode (V.outputIface initialVty) V.Mouse True
+  V.setMode (V.outputIface initialVty) V.BracketedPaste True
 
   -- 9. Initialize UI State
   let initialUIState = UIState
@@ -98,12 +107,18 @@ main = do
         , uiEditor         = E.editor EditorInput (Just 1) ""
         , uiWorkingState   = "GOAL: Awaiting task\nINVARIANTS: []\nACTIVE_HYPOTHESIS: None\nBLOCKED_ON: User"
         , uiChannels       = channels
+        , uiLastEscTime    = Nothing
+        , uiContextLimit   = contextWindowLimit cfg
+        , uiPromptHistory  = []
+        , uiHistoryIndex   = Nothing
+        , uiSavedDraft     = ""
+        , uiModelName      = modelName cfg
         }
 
   -- 10. Run Brick TUI
   let buildVty = do
         v <- VCross.mkVty V.defaultConfig
-        V.setMode (V.outputIface v) V.Mouse True
+        V.setMode (V.outputIface v) V.BracketedPaste True
         pure v
   _ <- customMain initialVty buildVty (Just eventChan) theApp initialUIState
   pure ()

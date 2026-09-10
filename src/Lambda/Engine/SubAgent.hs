@@ -118,7 +118,7 @@ subAgentLoop engineState@AppEngineState{..} driver sId grants turnsVar currentTu
       toolCalls <- readTVarIO toolCallsVar
 
       let assistantBlocks =
-            [ ThinkingBlock currentTurn fullThinking Collapsed | not (T.null fullThinking) ]
+            [ ThinkingBlock currentTurn fullThinking Visible | not (T.null fullThinking) ]
             ++ [ TextBlock fullText | not (T.null fullText) ]
             ++ map ToolCallBlock toolCalls
 

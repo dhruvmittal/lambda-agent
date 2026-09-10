@@ -31,18 +31,20 @@ data AppEngineState = AppEngineState
   , appToolRegistry :: !(TVar ToolRegistry)
   , appSecurity     :: !SecurityState
   , appEventQueue   :: !(TQueue EngineEvent)
+  , appInterrupted  :: !(TVar Bool)
   }
 
 initEngineState :: Config -> ToolRegistry -> SecurityState -> IO AppEngineState
 initEngineState cfg reg sec = do
   modeVar   <- newTVarIO PlanMode
-  turnsVar  <- newTVarIO []
-  tCountVar <- newTVarIO 1
+  turnsVar  <- newTVarIO [Turn 1 SystemRole [TextBlock "lambdA initialized. Enter a goal or press /help for commands."]]
+  tCountVar <- newTVarIO 2
   subsVar   <- newTVarIO Map.empty
   subSeqVar <- newTVarIO 1
-  stVecVar  <- newTVarIO "GOAL: Initialize\nINVARIANTS: []\nACTIVE_HYPOTHESIS: None\nBLOCKED_ON: User"
+  stVecVar  <- newTVarIO "GOAL: Awaiting task\nINVARIANTS: [Safe workspace ops, User grant required]\nACTIVE_HYPOTHESIS: None\nBLOCKED_ON: User input"
   regVar    <- newTVarIO reg
   evQueue   <- newTQueueIO
+  intrVar   <- newTVarIO False
   pure AppEngineState
     { appConfig       = cfg
     , appMode         = modeVar
@@ -54,6 +56,7 @@ initEngineState cfg reg sec = do
     , appToolRegistry = regVar
     , appSecurity     = sec
     , appEventQueue   = evQueue
+    , appInterrupted  = intrVar
     }
 
 addTurn :: AppEngineState -> Role -> [ContentBlock] -> IO Turn

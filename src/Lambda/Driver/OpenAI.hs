@@ -103,58 +103,62 @@ processSseStream reader callback = loop ("" :: Text)
 
     handleLine line =
       let trimmed = T.strip line
-      in case parseSseChunk trimmed of
-           Just c  -> callback c
-           Nothing -> pure ()
+      in mapM_ callback (parseSseChunk trimmed)
 
 -- | Parses a single SSE data line from an OpenAI-compatible stream
-parseSseChunk :: Text -> Maybe StreamChunk
+parseSseChunk :: Text -> [StreamChunk]
 parseSseChunk rawLine
-  | "data: [DONE]" `T.isInfixOf` rawLine = Just ChunkDone
+  | "data: [DONE]" `T.isInfixOf` rawLine = [ChunkDone]
   | "data: " `T.isPrefixOf` rawLine =
       let payload = T.drop 6 rawLine
       in case Aeson.decode (BL.fromStrict $ TE.encodeUtf8 payload) of
-           Just (Aeson.Object obj) -> extractDelta obj
-           _                       -> Nothing
-  | otherwise = Nothing
+           Just (Aeson.Object obj) -> extractDeltas obj
+           _                       -> []
+  | otherwise = []
 
-extractDelta :: Aeson.Object -> Maybe StreamChunk
-extractDelta obj = do
+extractDeltas :: Aeson.Object -> [StreamChunk]
+extractDeltas obj =
   case parseEither parseChoices (Aeson.Object obj) of
-    Right (Just chunk) -> Just chunk
-    _                  -> Nothing
+    Right chunks -> chunks
+    _            -> []
   where
     parseChoices = Aeson.withObject "Response" $ \o -> do
       choices <- o .: "choices"
       case choices of
         (Aeson.Object c : _) -> do
           delta <- c .: "delta"
-          -- Priority 1: reasoning_content (DeepSeek, Qwen reasoning, OpenRouter)
+          -- Priority 1: reasoning_content (openrouter/free, Qwen reasoning, OpenRouter)
           mReasoning <- delta .:? "reasoning_content"
           case mReasoning of
-            Just r | not (T.null r) -> pure $ Just (ChunkThinking r)
+            Just r | not (T.null r) -> pure [ChunkThinking r]
             _ -> do
               -- Priority 2: tool_calls delta
               mToolCalls <- delta .:? "tool_calls"
               case mToolCalls of
                 Just (Aeson.Object tc : _) -> do
                   mId <- tc .:? "id"
-                  fn <- tc .: "function"
-                  mName <- fn .:? "name"
-                  mArgs <- fn .:? "arguments"
-                  case (mId, mName) of
-                    (Just cid, Just name) -> pure $ Just (ChunkToolCallStart cid name)
-                    _ -> case mArgs of
-                      Just argsChunk | not (T.null argsChunk) ->
-                        pure $ Just (ChunkToolCallArgs (maybe "" id mId) argsChunk)
-                      _ -> pure Nothing
+                  mFn <- tc .:? "function"
+                  (mName, mArgs) <- case mFn of
+                    Just (Aeson.Object fn) -> do
+                      n <- fn .:? "name"
+                      a <- fn .:? "arguments"
+                      pure (n, a)
+                    _ -> pure (Nothing, Nothing)
+                  let startChunk = case (mId, mName) of
+                        (Just cid, Just name) -> [ChunkToolCallStart cid name]
+                        _                     -> []
+                      cidRef = maybe "" id mId
+                      argChunk = case mArgs of
+                        Just args | not (T.null args) -> [ChunkToolCallArgs cidRef args]
+                        _                             -> []
+                  pure (startChunk ++ argChunk)
                 _ -> do
                   -- Priority 3: content delta (with inline <think> tag support)
                   mContent <- delta .:? "content"
                   case mContent of
                     Just txt | not (T.null txt) ->
                       if "<think>" `T.isInfixOf` txt || "</think>" `T.isInfixOf` txt
-                        then pure $ Just (ChunkThinking txt)
-                        else pure $ Just (ChunkText txt)
-                    _ -> pure Nothing
-        _ -> pure Nothing
+                        then pure [ChunkThinking txt]
+                        else pure [ChunkText txt]
+                    _ -> pure []
+        _ -> pure []

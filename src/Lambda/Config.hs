@@ -6,6 +6,7 @@
 
 module Lambda.Config
   ( Config(..)
+  , McpServerConfig(..)
   , defaultConfig
   , loadConfig
   ) where
@@ -23,16 +24,38 @@ import System.Directory (createDirectoryIfMissing, doesFileExist, getHomeDirecto
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
 
+data McpServerConfig = McpServerConfig
+  { mcpCommand :: !FilePath
+  , mcpArgs    :: ![Text]
+  , mcpEnv     :: !(Map Text Text)
+  } deriving stock (Eq, Show, Generic)
+
+instance Aeson.ToJSON McpServerConfig where
+  toJSON McpServerConfig{..} = Aeson.object
+    [ "command" .= mcpCommand
+    , "args"    .= mcpArgs
+    , "env"     .= mcpEnv
+    ]
+
+instance Aeson.FromJSON McpServerConfig where
+  parseJSON = Aeson.withObject "McpServerConfig" $ \obj -> do
+    mcpCommand <- obj .:? "command" .!= ""
+    mcpArgs    <- obj .:? "args" .!= []
+    mcpEnv     <- obj .:? "env" .!= Map.empty
+    pure McpServerConfig{..}
+
 data Config = Config
-  { apiBaseUrl       :: !Text
-  , apiKey           :: !Text
-  , modelName        :: !Text
-  , customHeaders    :: !(Map Text Text)
-  , alwaysAllowGlobs :: ![String]
-  , alwaysDenyGlobs  :: ![String]
-  , workspaceRoot    :: !FilePath
-  , artifactDir      :: !FilePath
-  , maxTurnBudget    :: !Int
+  { apiBaseUrl          :: !Text
+  , apiKey              :: !Text
+  , modelName           :: !Text
+  , customHeaders       :: !(Map Text Text)
+  , alwaysAllowGlobs    :: ![String]
+  , alwaysDenyGlobs     :: ![String]
+  , workspaceRoot       :: !FilePath
+  , artifactDir         :: !FilePath
+  , maxTurnBudget       :: !Int
+  , contextWindowLimit  :: !Int
+  , mcpServers          :: !(Map Text McpServerConfig)
   } deriving stock (Eq, Show, Generic)
 
 instance Aeson.ToJSON Config where
@@ -44,17 +67,21 @@ instance Aeson.ToJSON Config where
     , "always_allow_globs"  .= alwaysAllowGlobs
     , "always_deny_globs"   .= alwaysDenyGlobs
     , "max_turn_budget"     .= maxTurnBudget
+    , "context_limit"       .= contextWindowLimit
+    , "mcp_servers"         .= mcpServers
     ]
 
 instance Aeson.FromJSON Config where
   parseJSON = Aeson.withObject "Config" $ \obj -> do
-    apiBaseUrl       <- obj .:? "api_base_url" .!= "https://openrouter.ai/api/v1"
-    apiKey           <- obj .:? "api_key" .!= ""
-    modelName        <- obj .:? "model_name" .!= "deepseek/deepseek-r1"
-    customHeaders    <- obj .:? "custom_headers" .!= Map.empty
-    alwaysAllowGlobs <- obj .:? "always_allow_globs" .!= defaultAllowGlobs
-    alwaysDenyGlobs  <- obj .:? "always_deny_globs" .!= defaultDenyGlobs
-    maxTurnBudget    <- obj .:? "max_turn_budget" .!= 30
+    apiBaseUrl         <- obj .:? "api_base_url" .!= "https://openrouter.ai/api/v1"
+    apiKey             <- obj .:? "api_key" .!= ""
+    modelName          <- obj .:? "model_name" .!= "openrouter/free"
+    customHeaders      <- obj .:? "custom_headers" .!= Map.empty
+    alwaysAllowGlobs   <- obj .:? "always_allow_globs" .!= defaultAllowGlobs
+    alwaysDenyGlobs    <- obj .:? "always_deny_globs" .!= defaultDenyGlobs
+    maxTurnBudget      <- obj .:? "max_turn_budget" .!= 30
+    contextWindowLimit <- obj .:? "context_limit" .!= 128000
+    mcpServers         <- obj .:? "mcp_servers" .!= Map.empty
     let workspaceRoot = "."
         artifactDir   = ".lambda/artifacts"
     pure Config{..}
@@ -68,6 +95,9 @@ defaultAllowGlobs =
   , "pwd*"
   , "cat *"
   , "read_file*"
+  , "list_directory*"
+  , "fetch_url*"
+  , "sd_*"
   ]
 
 defaultDenyGlobs :: [String]
@@ -79,15 +109,17 @@ defaultDenyGlobs =
 
 defaultConfig :: Config
 defaultConfig = Config
-  { apiBaseUrl       = "https://openrouter.ai/api/v1"
-  , apiKey           = ""
-  , modelName        = "deepseek/deepseek-r1"
-  , customHeaders    = Map.empty
-  , alwaysAllowGlobs = defaultAllowGlobs
-  , alwaysDenyGlobs  = defaultDenyGlobs
-  , workspaceRoot    = "."
-  , artifactDir      = ".lambda/artifacts"
-  , maxTurnBudget    = 30
+  { apiBaseUrl          = "https://openrouter.ai/api/v1"
+  , apiKey              = ""
+  , modelName           = "openrouter/free"
+  , customHeaders       = Map.empty
+  , alwaysAllowGlobs    = defaultAllowGlobs
+  , alwaysDenyGlobs     = defaultDenyGlobs
+  , workspaceRoot       = "."
+  , artifactDir         = ".lambda/artifacts"
+  , maxTurnBudget       = 30
+  , contextWindowLimit  = 128000
+  , mcpServers          = Map.empty
   }
 
 loadConfig :: FilePath -> IO Config
@@ -152,6 +184,11 @@ loadConfig wsRoot = do
       Just m | not (null m) -> pure (Just m)
       _ -> lookupVar "OPENAI_MODEL"
 
+  mEnvLimit <- lookupVar "CONTEXT_LIMIT"
+  let finalLimit = case mEnvLimit of
+        Just l | [(n, "")] <- reads l, n > 0 -> n
+        _ -> contextWindowLimit mergedCfg
+
   let finalKey = maybe (apiKey mergedCfg) T.pack mEnvKey
       finalUrl = maybe (apiBaseUrl mergedCfg) T.pack mEnvUrl
       finalMod = maybe (modelName mergedCfg) T.pack mEnvMod
@@ -161,11 +198,12 @@ loadConfig wsRoot = do
   createDirectoryIfMissing True (home </> ".config" </> "lambdA")
 
   pure mergedCfg
-    { apiBaseUrl    = finalUrl
-    , apiKey        = finalKey
-    , modelName     = finalMod
-    , workspaceRoot = wsRoot
-    , artifactDir   = artDir
+    { apiBaseUrl         = finalUrl
+    , apiKey             = finalKey
+    , modelName          = finalMod
+    , workspaceRoot      = wsRoot
+    , artifactDir        = artDir
+    , contextWindowLimit = finalLimit
     }
 
 -- | Simple parser for KEY=VALUE pairs in .env / .env.local files

@@ -4,6 +4,7 @@
 module Lambda.Provider.JsonRpc
   ( JsonRpcClient
   , startRpcClient
+  , startRpcClientWithEnv
   , stopRpcClient
   , sendRequest
   , sendNotification
@@ -22,6 +23,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
+import System.Environment (getEnvironment)
 import System.IO (BufferMode(..), Handle, hSetBuffering)
 import System.Process.Typed
 import Text.Read (readMaybe)
@@ -37,11 +39,17 @@ data JsonRpcClient = JsonRpcClient
   }
 
 startRpcClient :: Framing -> FilePath -> [Text] -> IO JsonRpcClient
-startRpcClient framing cmd args = do
-  let pConf = setStdin createPipe
-            $ setStdout createPipe
-            $ setStderr createPipe
-            $ proc cmd (map T.unpack args)
+startRpcClient framing cmd args = startRpcClientWithEnv framing cmd args []
+
+startRpcClientWithEnv :: Framing -> FilePath -> [Text] -> [(String, String)] -> IO JsonRpcClient
+startRpcClientWithEnv framing cmd args extraEnv = do
+  currEnv <- getEnvironment
+  let mergedEnv = if null extraEnv then currEnv else extraEnv ++ currEnv
+      baseProc = setStdin createPipe
+               $ setStdout createPipe
+               $ setStderr createPipe
+               $ proc cmd (map T.unpack args)
+      pConf = if null extraEnv then baseProc else setEnv mergedEnv baseProc
   p <- startProcess pConf
   hSetBuffering (getStdin p) LineBuffering
   hSetBuffering (getStdout p) LineBuffering

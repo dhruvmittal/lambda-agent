@@ -7,7 +7,9 @@ module Lambda.Types where
 import Control.Concurrent.STM (TMVar)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:))
+import qualified Data.ByteString.Lazy as BL
 import Data.Text (Text)
+import qualified Data.Text.Encoding as TE
 import GHC.Generics (Generic)
 
 -- | Operational modes for safety enforcement
@@ -73,9 +75,12 @@ instance Aeson.ToJSON ToolCall where
     , "type"     .= ("function" :: Text)
     , "function" .= Aeson.object
         [ "name"      .= toolCallName
-        , "arguments" .= toolCallArgs
+        , "arguments" .= encodeArgs toolCallArgs
         ]
     ]
+    where
+      encodeArgs (Aeson.String s) = s
+      encodeArgs val              = TE.decodeUtf8 (BL.toStrict (Aeson.encode val))
 
 instance Aeson.FromJSON ToolCall where
   parseJSON = Aeson.withObject "ToolCall" $ \obj -> do
@@ -191,9 +196,12 @@ data EngineEvent
 -- | Frontend to Engine dispatch commands
 data FrontendCommand
   = CmdUserPrompt !Text
+  | CmdSystemMessage !Text
+  | CmdClearHistory
   | CmdSetMode !AgentMode
   | CmdResolvePermission !Int !PermissionLevel
   | CmdCancelSubAgent !Int
   | CmdCompactHistory
+  | CmdInterrupt
   | CmdQuit
   deriving stock (Eq, Show, Generic)

@@ -3,6 +3,8 @@
 
 module Lambda.Provider.Builtin
   ( builtinTools
+  , listDirectoryTool
+  , fetchUrlTool
   , bashTool
   , readFileTool
   , writeFileTool
@@ -11,14 +13,18 @@ module Lambda.Provider.Builtin
 
 import Control.Exception (SomeException, try)
 import qualified Data.Aeson as Aeson
-import Data.Aeson ((.=), (.:), (.:?))
+import Data.Aeson ((.=), (.:), (.:?), (.!=))
 import Data.Aeson.Types (parseEither)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BL
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
-import System.Directory (doesFileExist, createDirectoryIfMissing)
+import Network.HTTP.Client
+import Network.HTTP.Client.TLS (newTlsManager)
+import Network.HTTP.Types.Header (hUserAgent, hAccept)
+import System.Directory (doesFileExist, doesDirectoryExist, listDirectory, createDirectoryIfMissing)
 import System.FilePath (takeDirectory, (</>))
 import System.Process.Typed
 import System.Timeout (timeout)
@@ -29,8 +35,10 @@ import Lambda.Types
 
 builtinTools :: FilePath -> FilePath -> [ToolDefinition]
 builtinTools wsRoot artDir =
-  [ bashTool wsRoot artDir
+  [ listDirectoryTool wsRoot
   , readFileTool wsRoot
+  , fetchUrlTool artDir
+  , bashTool wsRoot artDir
   , writeFileTool wsRoot
   , editFileTool wsRoot
   ]
@@ -80,6 +88,40 @@ bashTool wsRoot artDir = ToolDefinition
               pure $ ToolResult "" (compactOutput <> exitStatus) errText mArtifact
   }
 
+-- | Directory listing tool
+listDirectoryTool :: FilePath -> ToolDefinition
+listDirectoryTool wsRoot = ToolDefinition
+  { toolName = "list_directory"
+  , toolDescription = "List files and subdirectories in a workspace directory."
+  , toolParameters = Aeson.object
+      [ "type" .= ("object" :: Text)
+      , "properties" .= Aeson.object
+          [ "path" .= Aeson.object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("Path relative to workspace root (defaults to \".\")." :: Text)
+              ]
+          ]
+      ]
+  , toolCapability = ReadOnly
+  , toolExecute = \_caller args -> do
+      let parseArgs = Aeson.withObject "list_directory" $ \o -> do
+            p <- o .:? "path" .!= "."
+            pure p
+      case parseEither parseArgs args of
+        Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
+        Right relPath -> do
+          let fullPath = if T.null relPath || relPath == "."
+                           then wsRoot
+                           else wsRoot </> T.unpack relPath
+          isDir <- doesDirectoryExist fullPath
+          if not isDir
+            then pure $ ToolResult "" "" ("Directory not found: " <> relPath) Nothing
+            else do
+              entries <- listDirectory fullPath
+              let out = T.unlines (map T.pack entries)
+              pure $ ToolResult "" (if T.null out then "(empty directory)" else out) "" Nothing
+  }
+
 -- | File reading tool with optional line slicing
 readFileTool :: FilePath -> ToolDefinition
 readFileTool wsRoot = ToolDefinition
@@ -114,18 +156,24 @@ readFileTool wsRoot = ToolDefinition
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
         Right (relPath, mStart, mCount) -> do
           let fullPath = wsRoot </> T.unpack relPath
-          exists <- doesFileExist fullPath
-          if not exists
-            then pure $ ToolResult "" "" ("File not found: " <> relPath) Nothing
-            else do
-              fileContent <- TIO.readFile fullPath
-              let allLines = T.lines fileContent
-                  totalLines = length allLines
-                  sIdx = maybe 0 (\s -> max 0 (s - 1)) mStart
-                  cCount = maybe (totalLines - sIdx) (max 0) mCount
-                  selectedLines = take cCount (drop sIdx allLines)
-                  numbered = zipWith (\n l -> T.pack (show n) <> ": " <> l) [sIdx + 1 ..] selectedLines
-              pure $ ToolResult "" (T.unlines numbered) "" Nothing
+          isFile <- doesFileExist fullPath
+          isDir <- doesDirectoryExist fullPath
+          if isDir
+            then do
+              entries <- listDirectory fullPath
+              let out = "Specified path is a directory. Directory contents:\n" <> T.unlines (map T.pack entries)
+              pure $ ToolResult "" out "" Nothing
+            else if not isFile
+              then pure $ ToolResult "" "" ("File not found: " <> relPath) Nothing
+              else do
+                fileContent <- TIO.readFile fullPath
+                let allLines = T.lines fileContent
+                    totalLines = length allLines
+                    sIdx = maybe 0 (\s -> max 0 (s - 1)) mStart
+                    cCount = maybe (totalLines - sIdx) (max 0) mCount
+                    selectedLines = take cCount (drop sIdx allLines)
+                    numbered = zipWith (\n l -> T.pack (show n) <> ": " <> l) [sIdx + 1 ..] selectedLines
+                pure $ ToolResult "" (T.unlines numbered) "" Nothing
   }
 
 -- | File writing tool
@@ -208,3 +256,72 @@ editFileTool wsRoot = ToolDefinition
                   TIO.writeFile fullPath updated
                   pure $ ToolResult "" ("Successfully edited file: " <> relPath) "" Nothing
   }
+
+-- | Web URL fetching tool with HTML stripping and OOB artifact spooling
+fetchUrlTool :: FilePath -> ToolDefinition
+fetchUrlTool artDir = ToolDefinition
+  { toolName = "fetch_url"
+  , toolDescription = "Fetch web page or API content via HTTP/HTTPS GET. Cleans HTML markup into text, and spools large responses to disk."
+  , toolParameters = Aeson.object
+      [ "type" .= ("object" :: Text)
+      , "properties" .= Aeson.object
+          [ "url" .= Aeson.object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("The absolute HTTP or HTTPS URL to fetch." :: Text)
+              ]
+          ]
+      , "required" .= (["url"] :: [Text])
+      ]
+  , toolCapability = ReadOnly
+  , toolExecute = \_caller args -> do
+      case parseEither (Aeson.withObject "fetch_url" (.: "url")) args of
+        Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
+        Right rawUrl -> do
+          res <- try $ do
+            manager <- newTlsManager
+            req <- parseRequest (T.unpack rawUrl)
+            let req' = req
+                  { requestHeaders =
+                      [ (hUserAgent, "lambdA/0.1 (+https://github.com/dhruv/lambdA)")
+                      , (hAccept, "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8")
+                      ]
+                  , responseTimeout = responseTimeoutMicro (30 * 1000000)
+                  }
+            response <- httpLbs req' manager
+            let bodyBs = responseBody response
+                bodyText = TE.decodeUtf8Lenient (BL.toStrict bodyBs)
+                cleanedText = stripHtmlTags bodyText
+            pure cleanedText
+          case res of
+            Left (ex :: SomeException) ->
+              pure $ ToolResult "" "" ("Failed to fetch URL: " <> T.pack (show ex)) Nothing
+            Right content -> do
+              (compact, mArtifact) <- spooDiagnosticArtifact artDir "fetch_url" content
+              pure $ ToolResult "" compact "" mArtifact
+  }
+
+-- | Simple HTML tag stripper that eliminates script/style blocks and tags
+stripHtmlTags :: Text -> Text
+stripHtmlTags input =
+  let withoutScript = dropTags "script" input
+      withoutStyle  = dropTags "style" withoutScript
+      stripped      = removeAngleTags withoutStyle
+  in T.unwords (T.words stripped)
+  where
+    dropTags tag txt =
+      let openTag = "<" <> tag
+          closeTag = "</" <> tag <> ">"
+      in case T.breakOn openTag txt of
+           (before, rest)
+             | T.null rest -> before
+             | otherwise ->
+                 case T.breakOn closeTag (T.drop (T.length openTag) rest) of
+                   (_, after) -> before <> dropTags tag (T.drop (T.length closeTag) after)
+
+    removeAngleTags t =
+      case T.breakOn "<" t of
+        (before, rest)
+          | T.null rest -> before
+          | otherwise ->
+              case T.breakOn ">" (T.drop 1 rest) of
+                (_, after) -> before <> " " <> removeAngleTags (T.drop 1 after)

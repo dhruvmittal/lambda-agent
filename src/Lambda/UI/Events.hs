@@ -9,12 +9,17 @@ import Brick
 import qualified Brick.Widgets.Edit as E
 import Control.Concurrent.STM (atomically, writeTBQueue)
 import Control.Monad.IO.Class (liftIO)
+import Data.Char (isSpace)
 import qualified Data.Map.Strict as Map
 import Data.Sequence (Seq(..), (|>))
 import qualified Data.Sequence as Seq
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import qualified Data.Text.Zipper as Z
+import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import qualified Graphics.Vty as V
+import System.Posix.Signals (raiseSignal, sigTSTP)
 
 import Lambda.Core.EngineInterface (EngineChannels(..))
 import Lambda.Engine.Security (resolvePrompt)
@@ -29,7 +34,7 @@ handleAppEvent (AppEvent engineEv) = do
       vScrollToEnd (viewportScroll ChatView)
     EvTurnUpdated turn -> do
       modify $ \s ->
-        s { uiTurns = map (\t -> if turnId t == turnId turn then turn else t) (uiTurns s) }
+        s { uiTurns = updateMatchingTurn turn (uiTurns s) }
       vScrollToEnd (viewportScroll ChatView)
     EvSubAgentUpdate task -> modify $ \s ->
       s { uiSubAgents = Map.insert (subAgentId task) task (uiSubAgents s) }
@@ -41,18 +46,93 @@ handleAppEvent (AppEvent engineEv) = do
         Just _  -> s { uiPendingPrompts = uiPendingPrompts s |> prompt }
     EvPermissionResolved _ _ -> pure ()
     EvError err -> do
-      tId <- gets (succ . length . uiTurns)
+      tId <- gets (\s -> negate (1000 + length (uiTurns s)))
       modify $ \s -> s { uiTurns = uiTurns s ++ [Turn tId SystemRole [TextBlock ("⚠️ Error: " <> err)]] }
       vScrollToEnd (viewportScroll ChatView)
     EvStreamChunk _ -> pure ()
+  where
+    updateMatchingTurn updatedTurn turns =
+      let rev = reverse turns
+          go [] = []
+          go (t:rest)
+            | turnId t == turnId updatedTurn = updatedTurn : rest
+            | otherwise                      = t : go rest
+      in reverse (go rev)
 
--- Keystrokes when permission modal is open
+-- =========================================================================
+-- Terminal Conventions & Signal Controls
+-- =========================================================================
+
+-- ^C: Immediate clean exit from TUI
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'c') [V.MCtrl])) = do
+  st <- get
+  liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) CmdQuit
+  halt
+
+-- ^Z: Background process to shell (SIGTSTP) and restore terminal on fg
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'z') [V.MCtrl])) = do
+  st <- get
+  suspendAndResume $ do
+    raiseSignal sigTSTP
+    pure st
+
+-- Double Esc (within 500ms): Interrupt active turn
+handleAppEvent (VtyEvent (V.EvKey V.KEsc [])) = do
+  now <- liftIO getCurrentTime
+  st <- get
+  case uiLastEscTime st of
+    Just prev | diffUTCTime now prev < 0.5 -> do
+      put st { uiLastEscTime = Nothing }
+      liftIO $ atomically $ do
+        writeTBQueue (cmdQueue (uiChannels st)) CmdInterrupt
+        writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "⚠️ Interrupt dispatched (Esc Esc)...")
+    _ ->
+      put st { uiLastEscTime = Just now }
+
+-- Bracketed Paste: Paste clipboard directly into editor without line splitting
+handleAppEvent (VtyEvent (V.EvPaste bs)) = do
+  let pasted = TE.decodeUtf8Lenient bs
+  modify $ \s -> s { uiEditor = E.applyEdit (Z.insertMany pasted) (uiEditor s) }
+
+-- =========================================================================
+-- Readline Editing Conventions in Input Bar
+-- =========================================================================
+
+-- ^W or ^Backspace or ^H: Delete preceding word
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'w') [V.MCtrl])) =
+  modify $ \s -> s { uiEditor = E.applyEdit deleteWordBackward (uiEditor s) }
+handleAppEvent (VtyEvent (V.EvKey V.KBS [V.MCtrl])) =
+  modify $ \s -> s { uiEditor = E.applyEdit deleteWordBackward (uiEditor s) }
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'h') [V.MCtrl])) =
+  modify $ \s -> s { uiEditor = E.applyEdit deleteWordBackward (uiEditor s) }
+
+-- ^U: Kill line backwards from cursor
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'u') [V.MCtrl])) =
+  modify $ \s -> s { uiEditor = E.applyEdit Z.killToBOL (uiEditor s) }
+
+-- ^K: Kill line forwards from cursor
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'k') [V.MCtrl])) =
+  modify $ \s -> s { uiEditor = E.applyEdit Z.killToEOL (uiEditor s) }
+
+-- ^A: Jump to beginning of line
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'a') [V.MCtrl])) =
+  modify $ \s -> s { uiEditor = E.applyEdit Z.gotoBOL (uiEditor s) }
+
+-- ^E: Jump to end of line
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'e') [V.MCtrl])) =
+  modify $ \s -> s { uiEditor = E.applyEdit Z.gotoEOL (uiEditor s) }
+
+-- ^T: Toggle thinking accordions
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 't') [V.MCtrl])) =
+  modify $ \s -> s { uiTurns = map toggleThinkingAll (uiTurns s) }
+
+-- Keystrokes when permission modal is open (Keys 1-4)
 handleAppEvent (VtyEvent (V.EvKey (V.KChar '1') [])) = resolveActiveModal PermAlways
 handleAppEvent (VtyEvent (V.EvKey (V.KChar '2') [])) = resolveActiveModal PermOnce
 handleAppEvent (VtyEvent (V.EvKey (V.KChar '3') [])) = resolveActiveModal PermNo
 handleAppEvent (VtyEvent (V.EvKey (V.KChar '4') [])) = resolveActiveModal PermNever
 
--- Mouse clicks on modal buttons
+-- Mouse clicks on modal buttons (if mouse events are enabled/passed)
 handleAppEvent (MouseDown ButtonAlways V.BLeft _ _) = resolveActiveModal PermAlways
 handleAppEvent (MouseDown ButtonOnce   V.BLeft _ _) = resolveActiveModal PermOnce
 handleAppEvent (MouseDown ButtonNo     V.BLeft _ _) = resolveActiveModal PermNo
@@ -68,15 +148,78 @@ handleAppEvent (MouseDown (ThinkingFold tId) V.BLeft _ _) =
       | i == targetId = ThinkingBlock i b (if vis == Visible then Collapsed else Visible)
     flipVis _ other = other
 
--- Mouse wheel scrolling
-handleAppEvent (MouseDown ChatView V.BScrollUp _ _) =
-  vScrollBy (viewportScroll ChatView) (-3)
-handleAppEvent (MouseDown ChatView V.BScrollDown _ _) =
-  vScrollBy (viewportScroll ChatView) 3
-handleAppEvent (MouseDown SubAgentView V.BScrollUp _ _) =
-  vScrollBy (viewportScroll SubAgentView) (-3)
-handleAppEvent (MouseDown SubAgentView V.BScrollDown _ _) =
-  vScrollBy (viewportScroll SubAgentView) 3
+-- =========================================================================
+-- Keyboard-Centric Viewport Scrolling
+-- =========================================================================
+
+-- PageUp / PageDown: Scroll conversation viewport in large steps
+handleAppEvent (VtyEvent (V.EvKey V.KPageUp _)) =
+  vScrollBy (viewportScroll ChatView) (-12)
+
+handleAppEvent (VtyEvent (V.EvKey V.KPageDown _)) =
+  vScrollBy (viewportScroll ChatView) 12
+
+-- Up / Down Arrow Keys: Scroll conversation viewport line by line
+handleAppEvent (VtyEvent (V.EvKey V.KUp [])) =
+  vScrollBy (viewportScroll ChatView) (-2)
+
+handleAppEvent (VtyEvent (V.EvKey V.KDown [])) =
+  vScrollBy (viewportScroll ChatView) 2
+
+-- Home / End (with Ctrl): Jump to beginning or end of conversation
+handleAppEvent (VtyEvent (V.EvKey V.KHome [V.MCtrl])) =
+  vScrollToBeginning (viewportScroll ChatView)
+
+handleAppEvent (VtyEvent (V.EvKey V.KEnd [V.MCtrl])) =
+  vScrollToEnd (viewportScroll ChatView)
+
+-- =========================================================================
+-- Prompt History Navigation (^P = Previous, ^N = Next)
+-- =========================================================================
+
+-- ^P: Previous prompt in history (older)
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'p') [V.MCtrl])) = do
+  st <- get
+  let hist = uiPromptHistory st
+  if null hist
+    then pure ()
+    else case uiHistoryIndex st of
+      Nothing -> do
+        let currentDraft = T.strip (T.unlines (E.getEditContents (uiEditor st)))
+            firstPrompt = head hist
+        put st
+          { uiSavedDraft   = currentDraft
+          , uiHistoryIndex = Just 0
+          , uiEditor       = setEditorText firstPrompt
+          }
+      Just idx -> do
+        let nextIdx = min (length hist - 1) (idx + 1)
+            recalled = hist !! nextIdx
+        put st
+          { uiHistoryIndex = Just nextIdx
+          , uiEditor       = setEditorText recalled
+          }
+
+-- ^N: Next prompt in history (newer / back to draft)
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'n') [V.MCtrl])) = do
+  st <- get
+  let hist = uiPromptHistory st
+  case uiHistoryIndex st of
+    Nothing -> pure ()
+    Just 0  -> do
+      let draft = uiSavedDraft st
+      put st
+        { uiHistoryIndex = Nothing
+        , uiSavedDraft   = ""
+        , uiEditor       = setEditorText draft
+        }
+    Just idx -> do
+      let prevIdx = idx - 1
+          recalled = hist !! prevIdx
+      put st
+        { uiHistoryIndex = Just prevIdx
+        , uiEditor       = setEditorText recalled
+        }
 
 -- Keyboard Enter: Submit prompt or dispatch slash command
 handleAppEvent (VtyEvent (V.EvKey V.KEnter [])) = do
@@ -86,11 +229,22 @@ handleAppEvent (VtyEvent (V.EvKey V.KEnter [])) = do
   if T.null inputText
     then pure ()
     else do
-      -- Reset input editor
-      put st { uiEditor = E.editor EditorInput (Just 1) "" }
+      -- Record prompt in history (avoiding consecutive duplicates)
+      let currentHist = uiPromptHistory st
+          newHist = case currentHist of
+            (p:_) | p == inputText -> currentHist
+            _                      -> inputText : currentHist
+      -- Reset input editor and history navigation state
+      put st
+        { uiEditor        = E.editor EditorInput (Just 1) ""
+        , uiPromptHistory = newHist
+        , uiHistoryIndex  = Nothing
+        , uiSavedDraft    = ""
+        }
+      vScrollToEnd (viewportScroll ChatView)
       handleCommand inputText
 
--- Default text editor input
+-- Default text editor input (regular typing)
 handleAppEvent (VtyEvent ev) = do
   zoom uiEditorLens (E.handleEditorEvent (VtyEvent ev))
 
@@ -106,29 +260,41 @@ handleCommand cmdText = do
             [ "lambdA Commands & Controls:"
             , "  /plan          - Switch to Plan mode (read-only tools, no mutations)"
             , "  /exec          - Switch to Exec mode (full tools: bash, file writes)"
+            , "  /think         - Toggle thinking/reasoning blocks (or press Ctrl+T)"
             , "  /compact       - Trigger manual context compaction to disk archives"
             , "  /clear         - Clear conversation history"
             , "  /help          - Show this help reference"
             , "  /quit          - Exit application"
             , ""
-            , "Shortcuts & Navigation:"
+            , "Shortcuts & Terminal Conventions:"
+            , "  Ctrl+C         - Exit application immediately"
+            , "  Ctrl+Z         - Suspend/background process to shell (fg to resume)"
+            , "  Esc Esc        - Interrupt active turn / cancel pending tools"
+            , "  Ctrl+W, Ctrl+H - Delete word backward"
+            , "  Ctrl+U, Ctrl+K - Delete line to start / end"
+            , "  Ctrl+A, Ctrl+E - Move cursor to start / end of line"
+            , "  Ctrl+T         - Toggle thinking/reasoning blocks"
             , "  Keys 1,2,3,4   - Resolve authorization prompt (Always, Once, No, Never)"
-            , "  Mouse Left     - Click modal buttons / toggle thinking accordions"
-            , "  Mouse Wheel    - Scroll Chat and SubAgents views"
+            , "  Mouse Drag     - Native text selection & copy (clipboard enabled)"
             ]
-      tId <- gets (succ . length . uiTurns)
-      modify $ \s -> s { uiTurns = uiTurns s ++ [Turn tId SystemRole [TextBlock helpText]] }
-      vScrollToEnd (viewportScroll ChatView)
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSystemMessage helpText)
     "/plan" -> do
       put st { uiMode = PlanMode }
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSetMode PlanMode)
     "/exec" -> do
       put st { uiMode = ExecMode }
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSetMode ExecMode)
+    cmd | cmd `elem` ["/think", "/thinking"] -> do
+      modify $ \s -> s { uiTurns = map toggleThinkingAll (uiTurns s) }
+    cmd | cmd `elem` ["/think on", "/think show", "/thinking on", "/thinking show"] -> do
+      modify $ \s -> s { uiTurns = map (setThinkingVis Visible) (uiTurns s) }
+    cmd | cmd `elem` ["/think off", "/think hide", "/thinking off", "/thinking hide"] -> do
+      modify $ \s -> s { uiTurns = map (setThinkingVis Collapsed) (uiTurns s) }
     "/compact" -> do
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdCompactHistory
     "/clear" -> do
       put st { uiTurns = [] }
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdClearHistory
     "/quit" -> do
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdQuit
       halt
@@ -147,6 +313,38 @@ resolveActiveModal level = do
         Seq.Empty      -> put st { uiCurrentPrompt = Nothing }
     Nothing -> pure ()
 
+-- | Deletes backwards by word respecting whitespace boundaries (like Readline ^W)
+deleteWordBackward :: Z.TextZipper Text -> Z.TextZipper Text
+deleteWordBackward z =
+  let (_, col) = Z.cursorPosition z
+      line = Z.currentLine z
+      before = T.take col line
+  in if T.null before
+       then Z.deletePrevChar z
+       else
+         let trimmed = T.dropWhileEnd isSpace before
+             keep    = T.dropWhileEnd (not . isSpace) trimmed
+             count   = T.length before - T.length keep
+         in iterate Z.deletePrevChar z !! max 1 count
+
 -- Lens helper for editor zooming
 uiEditorLens :: Functor f => (E.Editor Text ResourceName -> f (E.Editor Text ResourceName)) -> UIState -> f UIState
 uiEditorLens f s = (\e -> s { uiEditor = e }) <$> f (uiEditor s)
+
+-- | Helper to populate editor content and place cursor at end of line
+setEditorText :: Text -> E.Editor Text ResourceName
+setEditorText strVal = E.applyEdit Z.gotoEOL (E.editor EditorInput (Just 1) strVal)
+
+-- | Toggles visibility of all thinking blocks in dialogue history
+toggleThinkingAll :: Turn -> Turn
+toggleThinkingAll t@(Turn _ _ blks) = t { turnBlocks = map flipVis blks }
+  where
+    flipVis (ThinkingBlock i b vis) = ThinkingBlock i b (if vis == Visible then Collapsed else Visible)
+    flipVis other = other
+
+-- | Explicitly sets visibility of all thinking blocks across turns
+setThinkingVis :: BlockVisibility -> Turn -> Turn
+setThinkingVis targetVis t@(Turn _ _ blks) = t { turnBlocks = map setVis blks }
+  where
+    setVis (ThinkingBlock i b _) = ThinkingBlock i b targetVis
+    setVis other = other
