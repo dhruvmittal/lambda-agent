@@ -16,6 +16,7 @@ module Lambda.Config
   , isLocalEndpoint
   , isOpenAiEndpoint
   , isOpenRouterEndpoint
+  , formatEndpointBadge
   , lookupModelContextLimit
   , curatedModels
   , resolveEnvTemplates
@@ -202,9 +203,9 @@ instance Aeson.ToJSON Config where
 
 instance Aeson.FromJSON Config where
   parseJSON = Aeson.withObject "Config" $ \obj -> do
-    apiBaseUrl         <- obj .:? "api_base_url" .!= "https://openrouter.ai/api/v1"
+    apiBaseUrl         <- obj .:? "api_base_url" .!= ""
     apiKey             <- obj .:? "api_key" .!= ""
-    modelName          <- obj .:? "model_name" .!= "openrouter/free"
+    modelName          <- obj .:? "model_name" .!= ""
     customHeaders      <- obj .:? "custom_headers" .!= Map.empty
     alwaysAllowGlobs   <- obj .:? "always_allow_globs" .!= defaultAllowGlobs
     alwaysDenyGlobs    <- obj .:? "always_deny_globs" .!= defaultDenyGlobs
@@ -247,9 +248,9 @@ defaultDenyGlobs =
 
 defaultConfig :: Config
 defaultConfig = Config
-  { apiBaseUrl          = "https://openrouter.ai/api/v1"
+  { apiBaseUrl          = ""
   , apiKey              = ""
-  , modelName           = "openrouter/free"
+  , modelName           = ""
   , customHeaders       = Map.empty
   , alwaysAllowGlobs    = defaultAllowGlobs
   , alwaysDenyGlobs     = defaultDenyGlobs
@@ -442,7 +443,6 @@ defaultModelAliases = Map.fromList
   , ("o3",         "openai/o3-mini")
   , ("qwen",       "qwen/qwen-2.5-coder-32b-instruct")
   , ("coder",      "qwen/qwen-2.5-coder-32b-instruct")
-  , ("free",       "openrouter/free")
   ]
 
 -- | Resolve an alias or model name to its canonical identifier
@@ -459,7 +459,6 @@ lookupModelContextLimit modId
   | "gpt-4o" `T.isInfixOf` modId   = 128000
   | "deepseek" `T.isInfixOf` modId = 128000
   | "qwen" `T.isInfixOf` modId     = 128000
-  | "free" `T.isInfixOf` modId     = 32000
   | otherwise                      = 128000
 
 -- | Check if api_base_url points to a local provider (Ollama, vLLM, LM Studio, etc.)
@@ -488,6 +487,15 @@ isOpenRouterEndpoint url =
   let u = T.toLower url
   in "openrouter.ai" `T.isInfixOf` u
 
+-- | Return a concise human-readable badge classifying provider topology
+formatEndpointBadge :: Text -> Text
+formatEndpointBadge url
+  | T.null url                  = "[unconfigured] "
+  | isLocalEndpoint url         = "[local] "
+  | isOpenAiEndpoint url        = "[remote:openai] "
+  | isOpenRouterEndpoint url    = "[remote:openrouter] "
+  | otherwise                   = "[remote] "
+
 -- | Resolve model alias taking active Config into account (user aliases, endpoint type)
 resolveModelWithConfig :: Config -> Text -> Text
 resolveModelWithConfig cfg rawName =
@@ -499,6 +507,8 @@ resolveModelWithConfig cfg rawName =
   in case mUserMatch of
        Just resolved -> resolved
        Nothing
+         -- When unconfigured: pass through raw input without inventing cloud mappings
+         | T.null (apiBaseUrl cfg) -> clean
          -- Direct OpenAI endpoint: use clean IDs without OpenRouter vendor prefixes
          | isOpenAiEndpoint (apiBaseUrl cfg) ->
              case cleanLower of
@@ -516,9 +526,11 @@ resolveModelWithConfig cfg rawName =
              case filter (\m -> T.toLower m == cleanLower) (configuredModels cfg) of
                (matched:_) -> matched
                []          -> clean
-         -- OpenRouter or other OpenAI-compatible routers: use curated OpenRouter map
-         | otherwise ->
+         -- Explicit OpenRouter endpoint: use curated OpenRouter map
+         | isOpenRouterEndpoint (apiBaseUrl cfg) ->
              Map.findWithDefault clean cleanLower defaultModelAliases
+         -- Other generic remote endpoints
+         | otherwise -> clean
 
 -- | Curated list of popular models for auto-completion
 curatedModels :: [Text]
@@ -529,5 +541,4 @@ curatedModels =
   , "openai/gpt-4o"
   , "openai/o3-mini"
   , "qwen/qwen-2.5-coder-32b-instruct"
-  , "openrouter/free"
   ]

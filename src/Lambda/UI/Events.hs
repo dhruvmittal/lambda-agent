@@ -29,6 +29,7 @@ import qualified Graphics.Vty as V
 import System.Posix.Signals (raiseSignal, sigTSTP)
 import Text.Read (readMaybe)
 
+import Lambda.Config (Config(..), isLocalEndpoint, isOpenAiEndpoint, isOpenRouterEndpoint)
 import Lambda.Core.EngineInterface (EngineChannels(..))
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro)
 import Lambda.Engine.Security (resolvePrompt)
@@ -582,8 +583,23 @@ handleCommand cmdText = do
       liftIO $ atomically $ writeTBQueue (cmdQueue channels)
         (CmdSystemMessage $ "Current mode: " <> modeStr <> "\nUse '/mode plan' or '/mode exec' (or press Alt+M) to switch.")
     cmd | cmd `elem` ["/model", "/models"] -> do
+      let baseUrl = apiBaseUrl (uiConfig st)
+          providerStr = case () of
+            _ | T.null baseUrl ->
+                  "⚠️ Provider: Not configured (set api_base_url in .lambda/config.json or export LAMBDA_BASE_URL)"
+            _ | isLocalEndpoint baseUrl ->
+                  "Provider: Local (" <> baseUrl <> ")"
+            _ | isOpenAiEndpoint baseUrl ->
+                  "Provider: Remote OpenAI (" <> baseUrl <> ")"
+            _ | isOpenRouterEndpoint baseUrl ->
+                  "Provider: Remote OpenRouter (" <> baseUrl <> ")"
+            _ ->
+                  "Provider: Remote (" <> baseUrl <> ")"
+          modelStr = if T.null (uiModelName st)
+                       then "Active model: ⚠️ None configured"
+                       else "Active model: " <> uiModelName st <> " (context limit: " <> T.pack (show (uiContextLimit st)) <> " tokens)"
       liftIO $ atomically $ writeTBQueue (cmdQueue channels)
-        (CmdSystemMessage $ "Active model: " <> uiModelName st <> " (context limit: " <> T.pack (show (uiContextLimit st)) <> " tokens)\nUse '/model <name_or_alias>' (or /model <Tab>) to switch.")
+        (CmdSystemMessage $ modelStr <> "\n" <> providerStr <> "\nUse '/model <name_or_alias>' (or /model <Tab>) to switch.")
     cmd | "/model " `T.isPrefixOf` cmd || "/models " `T.isPrefixOf` cmd -> do
       let target = T.strip (if "/models " `T.isPrefixOf` cmd then T.drop 8 cmd else T.drop 7 cmd)
       if T.null target

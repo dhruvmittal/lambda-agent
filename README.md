@@ -17,26 +17,30 @@ A fast, keyboard-driven terminal AI coding and diagnostics agent in Haskell ([Br
 
 ## Configuration
 
-Loaded from `.lambda/config.json` (workspace) or `~/.config/lambdA/config.json` (global). Supports `{ENV:VAR_NAME}` expansion and `.env` files:
+Loaded from `.lambda/config.json` (workspace) or `~/.config/lambdA/config.json` (global). Supports `{ENV:VAR_NAME}` expansion and `.env` files. No provider default is assumed.
 
+### Local (Ollama, vLLM, LM Studio)
+Local endpoints require no API key:
 ```json
 {
-  "api_base_url": "https://openrouter.ai/api/v1",
-  "api_key": "{ENV:OPENROUTER_API_KEY}",
-  "model_name": "anthropic/claude-3.5-sonnet",
-  "context_limit": 200000,
-  "mcp_servers": {
-    "my_server": {
-      "command": "my-mcp-server",
-      "args": ["--stdio"]
-    }
-  }
+  "api_base_url": "http://localhost:11434/v1",
+  "model_name": "qwen2.5-coder:32b",
+  "models": ["qwen2.5-coder:32b", "deepseek-r1:14b"],
+  "model_aliases": { "coder": "qwen2.5-coder:32b" }
 }
 ```
 
-*For local engines (Ollama, vLLM, LM Studio), set `api_base_url` to `http://localhost:11434/v1`.*
+### Remote (OpenAI / Compatible Providers)
+```json
+{
+  "api_base_url": "https://api.openai.com/v1",
+  "api_key": "{ENV:OPENAI_API_KEY}",
+  "model_name": "gpt-4o",
+  "context_limit": 128000
+}
+```
 
-**Environment variables**: `LAMBDA_API_KEY` (or `OPENAI_API_KEY`), `LAMBDA_BASE_URL`, `LAMBDA_MODEL`, `CONTEXT_LIMIT`.
+**Environment variables**: `LAMBDA_BASE_URL` (or `OPENAI_BASE_URL`), `LAMBDA_MODEL`, `LAMBDA_API_KEY` (or `OPENAI_API_KEY`), `CONTEXT_LIMIT`.
 
 ---
 

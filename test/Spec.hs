@@ -10,6 +10,7 @@ import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=))
 import Data.Aeson.Types (parseEither)
 import qualified Data.ByteString.Lazy as BL
+import Data.IORef (newIORef, readIORef, modifyIORef')
 import Data.Maybe (mapMaybe)
 import qualified Data.Sequence as Seq
 import Data.Text (Text)
@@ -22,13 +23,13 @@ import System.Environment (setEnv, unsetEnv)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
 
-import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, lookupModelContextLimit, resolveEnvTemplates)
+import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, resolveEnvTemplates)
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro, expandPromptMacro)
 import Lambda.Core.EngineInterface (initEngineChannels, cmdQueue, startEngineLoop, EngineChannels(..))
 import Lambda.Core.ModelDriver (ModelDriver(..))
 import Lambda.Core.ToolProvider
 import Lambda.Provider.JsonRpc (startRpcClient, stopRpcClient, sendRequest)
-import Lambda.Driver.OpenAI (parseSseChunk, splitThinkingChunks)
+import Lambda.Driver.OpenAI (openAiDynamicDriver, parseSseChunk, splitThinkingChunks)
 import Lambda.Engine.Artifacts
 import Lambda.Engine.Compactor
 import Lambda.Engine.Dispatcher (executeToolDispatch)
@@ -111,6 +112,7 @@ main = do
   testStructuredDiffAndWhitespaceEditing
   testPromptMacrosAndExpansion
   testModelSwitchingDeploymentFixes
+  testNullDefaultsAndProviderTransparency
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -1404,8 +1406,8 @@ testDynamicModelSwitching = do
     (lookupModelContextLimit "anthropic/claude-3.5-sonnet" == 200000)
   assert "DeepSeek R1 model has 128k context limit"
     (lookupModelContextLimit "deepseek/deepseek-r1" == 128000)
-  assert "Free tier model has 32k context limit"
-    (lookupModelContextLimit "openrouter/free" == 32000)
+  assert "Qwen model has 128k context limit"
+    (lookupModelContextLimit "qwen/qwen-2.5-coder-32b-instruct" == 128000)
 
   -- 3. Dynamic Model Switching via Engine Loop
   sec <- initSecurity [] []
@@ -1469,7 +1471,7 @@ testDynamicModelSwitching = do
         , uiShowHud          = False
         , uiCompletion       = Nothing
         , uiIsGenerating     = False
-        , uiConfig           = defaultConfig
+        , uiConfig           = defaultConfig { apiBaseUrl = "https://openrouter.ai/api/v1" }
         }
 
   mModelComp <- completeInput "." dummyUI "/model "
@@ -1816,6 +1818,91 @@ testModelSwitchingDeploymentFixes = do
        Nothing -> False)
 
   putStrLn "  -> OK: Token cycling replaces cleanly in-place, local endpoints exclude cloud models, and aliases resolve endpoint-appropriately."
+
+-- 44. Verify Null Provider Defaults & Explicit Local vs Remote Transparency
+testNullDefaultsAndProviderTransparency :: IO ()
+testNullDefaultsAndProviderTransparency = do
+  putStrLn "\n[Test 44] Null Provider Defaults & Explicit Local vs Remote Transparency"
+
+  -- 1. Verify defaultConfig has null baseUrl and null modelName
+  assert "defaultConfig has empty apiBaseUrl" (T.null (apiBaseUrl defaultConfig))
+  assert "defaultConfig has empty modelName" (T.null (modelName defaultConfig))
+
+  -- 2. Verify formatEndpointBadge returns distinct, unambiguous badges
+  assert "Unconfigured URL returns '[unconfigured] '"
+    (formatEndpointBadge "" == "[unconfigured] ")
+  assert "Localhost URL returns '[local] '"
+    (formatEndpointBadge "http://localhost:11434/v1" == "[local] ")
+  assert "127.0.0.1 URL returns '[local] '"
+    (formatEndpointBadge "http://127.0.0.1:8000/v1" == "[local] ")
+  assert "OpenAI URL returns '[remote:openai] '"
+    (formatEndpointBadge "https://api.openai.com/v1" == "[remote:openai] ")
+  assert "OpenRouter URL returns '[remote:openrouter] '"
+    (formatEndpointBadge "https://openrouter.ai/api/v1" == "[remote:openrouter] ")
+  assert "Generic remote URL returns '[remote] '"
+    (formatEndpointBadge "https://api.customllm.internal/v1" == "[remote] ")
+
+  -- 3. Verify unconfigured endpoint provides 0 cloud candidates in autocomplete
+  evQ <- atomically newTQueue
+  chans <- initEngineChannels evQ
+  let unconfiguredUI = UIState
+        { uiTurns            = []
+        , uiSubAgents        = Map.empty
+        , uiCurrentPrompt    = Nothing
+        , uiPendingPrompts   = Seq.Empty
+        , uiMode             = PlanMode
+        , uiEditor           = E.editor EditorInput (Just 1) ""
+        , uiWorkingState     = ""
+        , uiChannels         = chans
+        , uiLastEscTime      = Nothing
+        , uiContextLimit     = 128000
+        , uiPromptHistory    = []
+        , uiHistoryIndex     = Nothing
+        , uiSavedDraft       = ""
+        , uiModelName        = ""
+        , uiThinkingVisible  = True
+        , uiSelectedSubAgent = Nothing
+        , uiShowHud          = False
+        , uiCompletion       = Nothing
+        , uiIsGenerating     = False
+        , uiConfig           = defaultConfig
+        }
+
+  mUnconfComp <- completeInput "." unconfiguredUI "/model "
+  assert "Unconfigured endpoint /model completion provides NO cloud candidates"
+    (case mUnconfComp of
+       Nothing -> True
+       Just cs ->
+         let inserts = map candInsert (compCandidates cs)
+         in not ("claude" `elem` inserts) && not ("r1" `elem` inserts) && not ("4o" `elem` inserts))
+
+  -- 4. Verify unconfigured resolveModelWithConfig does not map aliases to OpenRouter
+  assert "Unconfigured alias resolution passes through raw name"
+    (resolveModelWithConfig defaultConfig "4o" == "4o")
+  assert "Unconfigured alias resolution passes through custom name"
+    (resolveModelWithConfig defaultConfig "my-local-model" == "my-local-model")
+
+  -- 5. Verify Driver Validation: unconfigured error vs keyless local allowance
+  unconfChunksVar <- newIORef []
+  driverUnconf <- openAiDynamicDriver defaultConfig (pure "")
+  streamCompletion driverUnconf [] [] (\chunk -> modifyIORef' unconfChunksVar (chunk :))
+  unconfChunks <- readIORef unconfChunksVar
+  assert "Driver errors immediately if apiBaseUrl is unconfigured"
+    (any (\case ChunkText t -> "No provider base URL configured" `T.isInfixOf` t; _ -> False) unconfChunks)
+
+  localChunksVar <- newIORef []
+  let localCfgKeyless = defaultConfig
+        { apiBaseUrl = "http://localhost:11434/v1"
+        , modelName  = "qwen2.5-coder:32b"
+        , apiKey     = "" -- Keyless!
+        }
+  driverLocal <- openAiDynamicDriver localCfgKeyless (pure "qwen2.5-coder:32b")
+  streamCompletion driverLocal [] [] (\chunk -> modifyIORef' localChunksVar (chunk :))
+  localChunks <- readIORef localChunksVar
+  assert "Keyless local endpoint does NOT emit missing API key error"
+    (not (any (\case ChunkText t -> "API key is empty" `T.isInfixOf` t; _ -> False) localChunks))
+
+  putStrLn "  -> OK: Provider defaults are strictly null, local vs remote badges are explicit, and local endpoints operate keyless."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

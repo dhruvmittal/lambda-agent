@@ -27,7 +27,7 @@ import Network.HTTP.Client.TLS (newTlsManager)
 import Network.HTTP.Types.Header (hContentType, hAuthorization)
 import Network.HTTP.Types.Status (statusCode, statusMessage)
 
-import Lambda.Config (Config(..))
+import Lambda.Config (Config(..), isLocalEndpoint)
 import Lambda.Core.ModelDriver (ModelDriver(..))
 import Lambda.Engine.Compactor (turnsToOpenAIPayload)
 import Lambda.Types
@@ -41,13 +41,20 @@ openAiDynamicDriver Config{..} getActiveModel = do
   manager <- newTlsManager
   pure ModelDriver
     { streamCompletion = \turns tools callback -> do
-        if T.null apiKey
-          then do
-            callback (ChunkText "\n[Configuration Warning: API key is empty. Set LAMBDA_API_KEY or OPENROUTER_API_KEY in your environment, or configure .lambda/config.json]\n")
-            callback ChunkDone
-          else do
-            curModel <- getActiveModel
-            let endpoint = T.unpack apiBaseUrl <> "/chat/completions"
+        curModel <- getActiveModel
+        case () of
+          _ | T.null apiBaseUrl -> do
+                callback (ChunkText "\n[Configuration Error: No provider base URL configured. Set 'api_base_url' in .lambda/config.json or export LAMBDA_BASE_URL (e.g. http://localhost:11434/v1 for Ollama, https://api.openai.com/v1 for OpenAI).]\n")
+                callback ChunkDone
+          _ | T.null curModel -> do
+                callback (ChunkText "\n[Configuration Error: No active model selected. Set 'model_name' in .lambda/config.json, export LAMBDA_MODEL, or use '/model <model_name>' to switch.]\n")
+                callback ChunkDone
+          _ | T.null apiKey && not (isLocalEndpoint apiBaseUrl) -> do
+                callback (ChunkText "\n[Configuration Error: API key is empty for remote provider. Set 'api_key' in .lambda/config.json or export LAMBDA_API_KEY / OPENAI_API_KEY.]\n")
+                callback ChunkDone
+          _ -> do
+            let cleanBase = T.dropWhileEnd (== '/') apiBaseUrl
+                endpoint = T.unpack cleanBase <> "/chat/completions"
                 messages = turnsToOpenAIPayload turns
                 baseBody =
                   [ "model"    .= curModel
@@ -61,10 +68,8 @@ openAiDynamicDriver Config{..} getActiveModel = do
             res <- try $ do
               initReq <- parseRequest endpoint
               let customHdrs = [ (CI.mk (TE.encodeUtf8 k), TE.encodeUtf8 v) | (k, v) <- Map.toList customHeaders ]
-                  allHdrs =
-                    [ (hContentType, "application/json")
-                    , (hAuthorization, "Bearer " <> TE.encodeUtf8 apiKey)
-                    ] ++ customHdrs
+                  authHdrs = if T.null apiKey then [] else [(hAuthorization, "Bearer " <> TE.encodeUtf8 apiKey)]
+                  allHdrs = [(hContentType, "application/json")] ++ authHdrs ++ customHdrs
                   req = initReq
                     { method = "POST"
                     , requestHeaders = allHdrs

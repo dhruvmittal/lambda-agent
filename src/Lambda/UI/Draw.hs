@@ -22,6 +22,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 
+import Lambda.Config (Config(..), formatEndpointBadge)
 import Lambda.Engine.Compactor (estimateTotalTokens)
 import Lambda.Types
 import Lambda.UI.Completion (slidingCandidateWindow)
@@ -118,7 +119,7 @@ mainLayout :: UIState -> Widget ResourceName
 mainLayout UIState{..} =
   vBox
     [ headerBar uiWorkingState uiSelectedSubAgent
-    , renderMainPane uiSelectedSubAgent currentDisplayTurns uiSubAgents uiCompletion uiMode uiModelName uiContextLimit uiEditor
+    , renderMainPane uiSelectedSubAgent currentDisplayTurns uiSubAgents uiCompletion uiMode uiModelName uiContextLimit uiConfig uiEditor
     ]
   where
     currentDisplayTurns = case uiSelectedSubAgent of
@@ -135,9 +136,10 @@ renderMainPane
   -> AgentMode
   -> Text
   -> Int
+  -> Config
   -> E.Editor Text ResourceName
   -> Widget ResourceName
-renderMainPane Nothing turns subs uiComp mode model ctxLimit editor =
+renderMainPane Nothing turns subs uiComp mode model ctxLimit cfg editor =
   viewport ChatView Vertical $
     padLeftRight 1 $
       vBox
@@ -146,9 +148,9 @@ renderMainPane Nothing turns subs uiComp mode model ctxLimit editor =
             then emptyWidget
             else padTop (Pad 1) $ vBox (map renderInlineSubAgent (Map.elems subs))
         , renderCompletionLine uiComp
-        , visible (renderPowerlinePrompt mode model turns ctxLimit editor)
+        , visible (renderPowerlinePrompt mode model (apiBaseUrl cfg) turns ctxLimit editor)
         ]
-renderMainPane (Just sId) _ subs uiComp mode model ctxLimit editor =
+renderMainPane (Just sId) _ subs uiComp mode model ctxLimit cfg editor =
   case Map.lookup sId subs of
     Just task ->
       let roleUpper = T.unpack (T.toUpper (subAgentRole task))
@@ -164,7 +166,7 @@ renderMainPane (Just sId) _ subs uiComp mode model ctxLimit editor =
                [ C.hCenter banner
                , renderedTurns
                , renderCompletionLine uiComp
-               , visible (renderPowerlinePrompt mode model (subAgentTurns task) ctxLimit editor)
+               , visible (renderPowerlinePrompt mode model (apiBaseUrl cfg) (subAgentTurns task) ctxLimit editor)
                ]
     Nothing ->
       viewport ChatView Vertical (padAll 1 $ withAttr (attrName "toolError") $ str ("SubAgent #" <> show sId <> " not found."))
@@ -311,13 +313,13 @@ renderCompletionLine (Just (CompletionState cands sel))
         then withAttr (attrName "compSelected") (txt ("[" <> candDisplay cand <> "]"))
         else withAttr (attrName "compItem") (txt (candDisplay cand))
 
-renderPowerlinePrompt :: AgentMode -> Text -> [Turn] -> Int -> E.Editor Text ResourceName -> Widget ResourceName
-renderPowerlinePrompt mode model turns ctxLimit editor =
+renderPowerlinePrompt :: AgentMode -> Text -> Text -> [Turn] -> Int -> E.Editor Text ResourceName -> Widget ResourceName
+renderPowerlinePrompt mode model baseUrl turns ctxLimit editor =
   padTop (Pad 1) $
     hBox
       [ withAttr (attrName "promptLogo") (str " λ ")
       , withAttr (attrName "promptDivider") (str " \\ ")
-      , withAttr (attrName "promptModel") (txt (if T.null model then "openrouter" else model))
+      , modelWidget
       , withAttr (attrName "promptDivider") (str " \\ ")
       , withAttr ctxAttr (str (show pct <> "%"))
       , withAttr (attrName "promptDivider") (str " \\ ")
@@ -332,6 +334,14 @@ renderPowerlinePrompt mode model turns ctxLimit editor =
       | pct >= 90 = attrName "ctxHigh"
       | pct >= 70 = attrName "ctxWarn"
       | otherwise = attrName "ctxNormal"
+    badge = formatEndpointBadge baseUrl
+    modelWidget = case () of
+      _ | T.null baseUrl && T.null model ->
+            withAttr (attrName "toolError") (txt "NO PROVIDER CONFIGURED")
+      _ | T.null model ->
+            withAttr (attrName "thinkingDim") (txt (badge <> "NO MODEL"))
+      _ ->
+            withAttr (attrName "promptModel") (txt (badge <> model))
     modeWidget PlanMode = withAttr (attrName "promptPlanMode") (str " plan ")
     modeWidget ExecMode = withAttr (attrName "promptExecMode") (str " exec ")
 
