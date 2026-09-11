@@ -42,8 +42,9 @@ import System.Directory
   , listDirectory
   , removeFile
   , renameFile
+  , getModificationTime
   )
-import System.FilePath ((</>), (<.>), takeExtension)
+import System.FilePath ((</>), (<.>), takeExtension, dropExtension)
 
 import Lambda.Types
   ( AgentMode(..)
@@ -204,11 +205,18 @@ listSessions sessionsDir = do
 -- | Find and load the most recently updated session
 getLatestSession :: FilePath -> IO (Maybe Session)
 getLatestSession sessionsDir = do
-  metas <- listSessions sessionsDir
-  case metas of
-    [] -> pure Nothing
-    (top:_) -> do
-      res <- loadSession sessionsDir (metaId top)
+  exists <- doesDirectoryExist sessionsDir
+  if not exists then pure Nothing else do
+    entries <- listDirectory sessionsDir
+    let jsonFiles = filter (\f -> takeExtension f == ".json" && not (".tmp" `isSuffixOf` f)) entries
+    if null jsonFiles then pure Nothing else do
+      filesWithTime <- forM jsonFiles $ \f -> do
+        let path = sessionsDir </> f
+        mtime <- getModificationTime path
+        pure (mtime, f)
+      let (_, topFile) = head (sortOn (Down . fst) filesWithTime)
+          sid = T.pack (dropExtension topFile)
+      res <- loadSession sessionsDir sid
       case res of
         Left _  -> pure Nothing
         Right s -> pure (Just s)
@@ -222,14 +230,20 @@ pruneSessions sessionsDir keepCount
       if not exists
         then pure 0
         else do
-          metas <- listSessions sessionsDir
-          let total = length metas
+          entries <- listDirectory sessionsDir
+          let jsonFiles = filter (\f -> takeExtension f == ".json" && not (".tmp" `isSuffixOf` f)) entries
+          let total = length jsonFiles
           if total <= keepCount
             then pure 0
             else do
-              let toPrune = drop keepCount metas
-                  filesToRemove = concatMap (\m ->
-                    let base = sessionsDir </> T.unpack (metaId m)
+              filesWithTime <- forM jsonFiles $ \f -> do
+                let path = sessionsDir </> f
+                mtime <- getModificationTime path
+                pure (mtime, f)
+              let sortedFiles = map snd (sortOn (Down . fst) filesWithTime)
+                  toPrune = drop keepCount sortedFiles
+                  filesToRemove = concatMap (\f -> 
+                    let base = sessionsDir </> dropExtension f
                     in [base <.> "json", base <.> "trace.md"]
                     ) toPrune
               forM_ filesToRemove $ \f -> do

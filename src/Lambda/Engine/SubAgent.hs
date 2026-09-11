@@ -6,9 +6,7 @@ module Lambda.Engine.SubAgent
   , SubAgentReport(..)
   , SubAgentResult
   , runEphemeralSubAgent
-  , spawnSubAgentTool
   , spawnSpecialistSubAgentTool
-  , spawnDiagnosticSubAgentTool
   , submitReportTool
   , filterSubAgentRegistry
   , subAgentLoop
@@ -350,59 +348,3 @@ spawnSpecialistSubAgentTool engineState driver = ToolDefinition
       b <- o .:? "budget"
       g <- o .:? "granted_capabilities"
       pure (r, t, b, g)
-
--- | Backward-compatible alias for diagnostic subagents
-spawnDiagnosticSubAgentTool :: AppEngineState -> ModelDriver -> ToolDefinition
-spawnDiagnosticSubAgentTool engineState driver = ToolDefinition
-  { toolName = "spawn_diagnostic_subagent"
-  , toolDescription = "Spawn an ephemeral subagent for codebase surveys, diagnostics, or file inspection."
-  , toolParameters = Aeson.object
-      [ "type" .= ("object" :: Text)
-      , "properties" .= Aeson.object
-          [ "task" .= Aeson.object
-              [ "type" .= ("string" :: Text)
-              , "description" .= ("Hypothesis, survey goal, or diagnostic task for the subagent." :: Text)
-              ]
-          , "budget" .= Aeson.object
-              [ "type" .= ("integer" :: Text)
-              , "description" .= ("Maximum number of turns allowed (default 6)." :: Text)
-              ]
-          , "granted_capabilities" .= Aeson.object
-              [ "type" .= ("array" :: Text)
-              , "items" .= Aeson.object [ "type" .= ("string" :: Text) ]
-              , "description" .= ("List of glob patterns the subagent is authorized to run." :: Text)
-              ]
-          ]
-      , "required" .= (["task"] :: [Text])
-      ]
-  , toolCapability = ReadOnly
-  , toolExecute = \_caller args -> do
-      case parseEither parseDiagArgs args of
-        Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
-        Right (task, mBudget, mGrants) -> do
-          let budget = maybe 6 id mBudget
-              grants = maybe [] id mGrants
-              spec = SubAgentSpec "surveyor" task budget grants
-          res <- runEphemeralSubAgent engineState driver spec
-          case res of
-            Left err -> pure $ ToolResult "" "" ("SubAgent failed: " <> err) Nothing
-            Right SubAgentReport{..} -> do
-              let artifactAttr = maybe "" (\a -> " artifact=\"" <> a <> "\"") reportArtifact
-                  summary = T.unlines
-                    [ "<specialist_report role=\"surveyor\" status=\"" <> reportStatus <> "\"" <> artifactAttr <> ">"
-                    , "  <summary>" <> reportSummary <> "</summary>"
-                    , "  <details>" <> reportDetails <> "</details>"
-                    , "</specialist_report>"
-                    ]
-              pure $ ToolResult "" summary "" (fmap T.unpack reportArtifact)
-  }
-  where
-    parseDiagArgs = Aeson.withObject "spawn_diagnostic" $ \o -> do
-      t <- o .: "task"
-      b <- o .:? "budget"
-      g <- o .:? "granted_capabilities"
-      pure (t, b, g)
-
--- | Primary agent tool definition alias
-spawnSubAgentTool :: AppEngineState -> ModelDriver -> ToolDefinition
-spawnSubAgentTool = spawnSpecialistSubAgentTool

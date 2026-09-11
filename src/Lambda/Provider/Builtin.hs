@@ -126,7 +126,7 @@ listDirectoryTool wsRoot = ToolDefinition
 readFileTool :: FilePath -> ToolDefinition
 readFileTool wsRoot = ToolDefinition
   { toolName = "read_file"
-  , toolDescription = "Read the contents of a file with optional start_line and line_count parameters. For large files (>250 lines), the primary agent should specify start_line/line_count or delegate to 'spawn_diagnostic_subagent'."
+  , toolDescription = "Read the contents of a file with optional start_line and line_count parameters. For large files (>250 lines), the primary agent should specify start_line/line_count or delegate to 'spawn_specialist_subagent'."
   , toolParameters = Aeson.object
       [ "type" .= ("object" :: Text)
       , "properties" .= Aeson.object
@@ -175,7 +175,7 @@ readFileTool wsRoot = ToolDefinition
                     numbered = zipWith (\n l -> T.pack (show n) <> ": " <> l) [sIdx + 1 ..] selectedLines
                 if caller == MainAgent && cCount > 250
                   then pure $ ToolResult "" ""
-                         ("Context Mass Guard: Direct file read of " <> T.pack (show cCount) <> " lines is restricted for the primary agent to prevent context explosion. Please delegate reading/surveying large files to a subagent via 'spawn_diagnostic_subagent', or specify 'start_line' and a 'line_count' (<= 250) for targeted inspection.")
+                         ("Context Mass Guard: Direct file read of " <> T.pack (show cCount) <> " lines is restricted for the primary agent to prevent context explosion. Please delegate reading/surveying large files to a subagent via 'spawn_specialist_subagent', or specify 'start_line' and a 'line_count' (<= 250) for targeted inspection.")
                          Nothing
                   else pure $ ToolResult "" (T.unlines numbered) "" Nothing
   }

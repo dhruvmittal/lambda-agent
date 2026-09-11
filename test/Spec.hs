@@ -288,7 +288,7 @@ testPersistentSystemPrompt = do
   putStrLn "\n[Test 11] Systems Engineering Persistent System Prompt Injection"
   assert "System prompt mentions lambdA" ("lambdA" `T.isInfixOf` defaultAgentSystemPrompt)
   assert "System prompt includes Hypothesis-Driven Problem Solving" ("Hypothesis-Driven" `T.isInfixOf` defaultAgentSystemPrompt)
-  assert "System prompt includes spawn_diagnostic_subagent instruction" ("spawn_diagnostic_subagent" `T.isInfixOf` defaultAgentSystemPrompt)
+  assert "System prompt includes spawn_specialist_subagent instruction" ("spawn_specialist_subagent" `T.isInfixOf` defaultAgentSystemPrompt)
   assert "System prompt includes mode discipline" ("[/plan]" `T.isInfixOf` defaultAgentSystemPrompt)
 
   -- Wire payload stripping of UI banners

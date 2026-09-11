@@ -35,7 +35,7 @@ import Lambda.Engine.Session
   , renderSessionTraceMarkdown
   )
 import Lambda.Engine.State (initEngineStateWithSession, AppEngineState(..))
-import Lambda.Engine.SubAgent (spawnSpecialistSubAgentTool, spawnDiagnosticSubAgentTool)
+import Lambda.Engine.SubAgent (spawnSpecialistSubAgentTool)
 import Lambda.Provider.Builtin (builtinTools)
 import Lambda.Provider.Mcp (startAndLoadMcpServers)
 import Lambda.Types
@@ -193,8 +193,7 @@ main = do
   driver <- openAiDriver cfg
 
   -- 5. Register SubAgent spawning tools (which require engine state & driver)
-  let fullRegistry = registerTool (spawnSpecialistSubAgentTool engineState driver)
-                   $ registerTool (spawnDiagnosticSubAgentTool engineState driver) baseRegistry
+  let fullRegistry = registerTool (spawnSpecialistSubAgentTool engineState driver) baseRegistry
   atomically $ writeTVar (appToolRegistry engineState) fullRegistry
 
   -- 6. Setup frontend/engine communication channels sharing appEventQueue
