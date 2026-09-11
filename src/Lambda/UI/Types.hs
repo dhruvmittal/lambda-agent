@@ -15,6 +15,7 @@ data ResourceName
   = ChatView
   | ThinkingFold !Int
   | SubAgentView
+  | SubAgentItem !Int
   | EditorInput
   | ButtonAlways
   | ButtonOnce
@@ -23,18 +24,20 @@ data ResourceName
   deriving (Eq, Ord, Show)
 
 data UIState = UIState
-  { uiTurns          :: ![Turn]
-  , uiSubAgents      :: !(Map Int SubAgentTask)
-  , uiCurrentPrompt  :: !(Maybe PermissionPrompt)
-  , uiPendingPrompts :: !(Seq PermissionPrompt)
-  , uiMode           :: !AgentMode
-  , uiEditor         :: !(Editor Text ResourceName)
-  , uiWorkingState   :: !Text
-  , uiChannels       :: !EngineChannels
-  , uiLastEscTime    :: !(Maybe UTCTime)
-  , uiContextLimit   :: !Int
-  , uiPromptHistory  :: ![Text]
-  , uiHistoryIndex   :: !(Maybe Int)
-  , uiSavedDraft     :: !Text
-  , uiModelName      :: !Text
+  { uiTurns            :: ![Turn]
+  , uiSubAgents        :: !(Map Int SubAgentTask)
+  , uiCurrentPrompt    :: !(Maybe PermissionPrompt)
+  , uiPendingPrompts   :: !(Seq PermissionPrompt)
+  , uiMode             :: !AgentMode
+  , uiEditor           :: !(Editor Text ResourceName)
+  , uiWorkingState     :: !Text
+  , uiChannels         :: !EngineChannels
+  , uiLastEscTime      :: !(Maybe UTCTime)
+  , uiContextLimit     :: !Int
+  , uiPromptHistory    :: ![Text]
+  , uiHistoryIndex     :: !(Maybe Int)
+  , uiSavedDraft       :: !Text
+  , uiModelName        :: !Text
+  , uiThinkingVisible  :: !Bool
+  , uiSelectedSubAgent :: !(Maybe Int)
   }

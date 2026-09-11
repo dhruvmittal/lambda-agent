@@ -20,7 +20,7 @@ import Lambda.Core.ToolProvider (emptyRegistry, registerTools, registerTool)
 import Lambda.Driver.OpenAI (openAiDriver)
 import Lambda.Engine.Security (initSecurity)
 import Lambda.Engine.State (initEngineState, AppEngineState(..))
-import Lambda.Engine.SubAgent (spawnSubAgentTool)
+import Lambda.Engine.SubAgent (spawnSpecialistSubAgentTool, spawnDiagnosticSubAgentTool)
 import Lambda.Provider.Builtin (builtinTools)
 import Lambda.Provider.Mcp (startAndLoadMcpServers)
 import Lambda.Types
@@ -52,6 +52,8 @@ theApp = App
       , (attrName "subRunning",     fg V.green)
       , (attrName "subSuccess",     fg V.cyan)
       , (attrName "subFailed",      fg V.red)
+      , (attrName "subRole",        fg V.brightMagenta `V.withStyle` V.bold)
+      , (attrName "selectedBadge",  V.black `on` V.brightYellow `V.withStyle` V.bold)
       , (attrName "ctxNormal",      fg V.brightCyan)
       , (attrName "ctxWarn",        fg V.yellow `V.withStyle` V.bold)
       , (attrName "ctxHigh",        fg V.brightRed `V.withStyle` V.bold)
@@ -76,8 +78,9 @@ main = do
   engineState <- initEngineState cfg baseRegistry secState
   driver <- openAiDriver cfg
 
-  -- 5. Register SubAgent spawning tool (which requires engine state & driver)
-  let fullRegistry = registerTool (spawnSubAgentTool engineState driver) baseRegistry
+  -- 5. Register SubAgent spawning tools (which require engine state & driver)
+  let fullRegistry = registerTool (spawnSpecialistSubAgentTool engineState driver)
+                   $ registerTool (spawnDiagnosticSubAgentTool engineState driver) baseRegistry
   atomically $ writeTVar (appToolRegistry engineState) fullRegistry
 
   -- 6. Setup frontend/engine communication channels sharing appEventQueue
@@ -111,8 +114,10 @@ main = do
         , uiContextLimit   = contextWindowLimit cfg
         , uiPromptHistory  = []
         , uiHistoryIndex   = Nothing
-        , uiSavedDraft     = ""
-        , uiModelName      = modelName cfg
+        , uiSavedDraft       = ""
+        , uiModelName        = modelName cfg
+        , uiThinkingVisible  = True
+        , uiSelectedSubAgent = Nothing
         }
 
   -- 10. Run Brick TUI

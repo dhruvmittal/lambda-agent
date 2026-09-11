@@ -8,6 +8,7 @@ module Lambda.Engine.State
   , updateTurnBlocks
   , registerSubAgentTask
   , updateSubAgentStatus
+  , updateSubAgentTurns
   , emitEngineEvent
   ) where
 
@@ -77,11 +78,11 @@ updateTurnBlocks AppEngineState{..} tId blocks = atomically $ do
     (u:_) -> writeTQueue appEventQueue (EvTurnUpdated u)
     []    -> pure ()
 
-registerSubAgentTask :: AppEngineState -> Text -> Int -> IO SubAgentTask
-registerSubAgentTask AppEngineState{..} hypothesis budget = atomically $ do
+registerSubAgentTask :: AppEngineState -> Text -> Text -> Int -> IO SubAgentTask
+registerSubAgentTask AppEngineState{..} role hypothesis budget = atomically $ do
   sId <- readTVar appSubAgentSeq
   writeTVar appSubAgentSeq (sId + 1)
-  let task = SubAgentTask sId hypothesis 0 budget SubAgentRunning Nothing
+  let task = SubAgentTask sId role hypothesis 0 budget SubAgentRunning Nothing []
   modifyTVar' appSubAgents (Map.insert sId task)
   writeTQueue appEventQueue (EvSubAgentUpdate task)
   pure task
@@ -92,6 +93,17 @@ updateSubAgentStatus AppEngineState{..} sId status = atomically $ do
   case Map.lookup sId subs of
     Just task -> do
       let updated = task { subAgentStatus = status }
+      writeTVar appSubAgents (Map.insert sId updated subs)
+      writeTQueue appEventQueue (EvSubAgentUpdate updated)
+    Nothing -> pure ()
+
+updateSubAgentTurns :: AppEngineState -> Int -> [Turn] -> IO ()
+updateSubAgentTurns AppEngineState{..} sId turns = atomically $ do
+  subs <- readTVar appSubAgents
+  case Map.lookup sId subs of
+    Just task -> do
+      let asstCount = length (filter (\t -> turnRole t == AssistantRole) turns)
+          updated = task { subAgentTurns = turns, subAgentTurnCount = asstCount }
       writeTVar appSubAgents (Map.insert sId updated subs)
       writeTQueue appEventQueue (EvSubAgentUpdate updated)
     Nothing -> pure ()

@@ -172,11 +172,13 @@ instance Aeson.FromJSON SubAgentStatus
 -- | Ephemeral SubAgent task tracker descriptor
 data SubAgentTask = SubAgentTask
   { subAgentId         :: !Int
+  , subAgentRole       :: !Text
   , subAgentHypothesis :: !Text
   , subAgentTurnCount  :: !Int
   , subAgentBudget     :: !Int
   , subAgentStatus     :: !SubAgentStatus
   , subAgentArtifact   :: !(Maybe FilePath)
+  , subAgentTurns      :: ![Turn]
   } deriving stock (Eq, Show, Generic)
 
 instance Aeson.ToJSON SubAgentTask

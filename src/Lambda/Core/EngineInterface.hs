@@ -8,6 +8,7 @@ module Lambda.Core.EngineInterface
   ) where
 
 import Control.Concurrent (forkIO)
+import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.STM
 import Control.Exception (try, SomeException)
 import Control.Monad (forever, when, unless)
@@ -197,15 +198,21 @@ runAgentTurnLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
               when stillActive $
                 runAgentTurnLoop engineState driver channels (turnIdx + 1) maxTurns
   where
-    runToolsWithInterrupt _ [] = pure []
-    runToolsWithInterrupt es (tc:tcs) = do
+    runToolsWithInterrupt es tcs = do
       intr <- readTVarIO appInterrupted
       if intr
-        then pure [ToolResult (toolCallId tc) "" "Execution cancelled by user." Nothing]
-        else do
-          res <- executeToolDispatch es MainAgent [] tc
-          rest <- runToolsWithInterrupt es tcs
-          pure (res : rest)
+        then pure [ToolResult (toolCallId tc) "" "Execution cancelled by user." Nothing | tc <- tcs]
+        else mapConcurrently (runSingleToolWithInterrupt es) tcs
+
+    runSingleToolWithInterrupt es tc = do
+      res <- race
+        (atomically $ do
+          intr <- readTVar appInterrupted
+          check intr)
+        (executeToolDispatch es MainAgent [] tc)
+      case res of
+        Left () -> pure $ ToolResult (toolCallId tc) "" "Execution cancelled by user." Nothing
+        Right r -> pure r
 
     appendArgs targetId chunk tcs
       | T.null targetId =

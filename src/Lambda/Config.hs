@@ -7,7 +7,9 @@
 module Lambda.Config
   ( Config(..)
   , McpServerConfig(..)
+  , SpecialistConfig(..)
   , defaultConfig
+  , defaultSpecialists
   , loadConfig
   ) where
 
@@ -44,6 +46,114 @@ instance Aeson.FromJSON McpServerConfig where
     mcpEnv     <- obj .:? "env" .!= Map.empty
     pure McpServerConfig{..}
 
+data SpecialistConfig = SpecialistConfig
+  { specialistDescription  :: !Text
+  , specialistPrompt       :: !Text
+  , specialistBudget       :: !Int
+  , specialistCapabilities :: ![Text]
+  } deriving stock (Eq, Show, Generic)
+
+instance Aeson.ToJSON SpecialistConfig where
+  toJSON SpecialistConfig{..} = Aeson.object
+    [ "description"  .= specialistDescription
+    , "prompt"       .= specialistPrompt
+    , "budget"       .= specialistBudget
+    , "capabilities" .= specialistCapabilities
+    ]
+
+instance Aeson.FromJSON SpecialistConfig where
+  parseJSON = Aeson.withObject "SpecialistConfig" $ \obj -> do
+    specialistDescription  <- obj .:? "description" .!= ""
+    specialistPrompt       <- obj .:? "prompt" .!= ""
+    specialistBudget       <- obj .:? "budget" .!= 6
+    specialistCapabilities <- obj .:? "capabilities" .!= []
+    pure SpecialistConfig{..}
+
+defaultSpecialists :: Map Text SpecialistConfig
+defaultSpecialists = Map.fromList
+  [ ( "surveyor"
+    , SpecialistConfig
+        { specialistDescription  = "Read-only codebase explorer & caller graph mapper"
+        , specialistPrompt       = T.unlines
+            [ "# Role: Codebase Surveyor & Architecture Mapper"
+            , "You are a fastidious, read-only codebase explorer and topological mapping specialist."
+            , "Your mission is to map symbols, locate definitions, trace imports, and verify architectural invariants."
+            , "Operational Invariants:"
+            , "1. STRICT READ-ONLY: Never modify workspace files. Only read-only tools are permitted."
+            , "2. NO PATH HALLUCINATION: Never guess paths or symbols. Always verify via find_by_name, grep_search, or sd_read/sd_recall."
+            , "3. PRECISE REFERENCES: Return exact file paths and line ranges (e.g. src/Foo.hs:L40-L65)."
+            , "When your survey is complete, call `submit_report` with status, summary, details, and any artifact path."
+            ]
+        , specialistBudget       = 4
+        , specialistCapabilities = ["read_file*", "list_directory*", "grep_search*", "find_by_name*", "fetch_url*", "sd_*", "git status*", "git diff*", "git log*"]
+        }
+    )
+  , ( "debugger"
+    , SpecialistConfig
+        { specialistDescription  = "Forensic bug investigator & minimal test reproducer"
+        , specialistPrompt       = T.unlines
+            [ "# Role: Forensic Systems Debugger"
+            , "You are a forensic debugging specialist. Your mission is to isolate the root-cause of crashes, test failures, and regressions."
+            , "Operational Invariants:"
+            , "1. HYPOTHESIS TESTING: Formulate distinct, testable hypotheses for the failure mechanism."
+            , "2. STACK ISOLATION: Locate the exact offending line, frame, or memory violation."
+            , "3. MINIMAL SURGERY: Diagnose the root cause and propose the minimal surgical fix required."
+            , "When your diagnosis is complete, call `submit_report` with status, summary, details, and any artifact path."
+            ]
+        , specialistBudget       = 6
+        , specialistCapabilities = ["read_file*", "grep_search*", "find_by_name*", "cabal test*", "ctest*", "pytest*", "bash*", "sd_*"]
+        }
+    )
+  , ( "profiler"
+    , SpecialistConfig
+        { specialistDescription  = "Systems performance, Valgrind, and hotspot analyzer"
+        , specialistPrompt       = T.unlines
+            [ "# Role: Systems Performance Profiler"
+            , "You are a systems performance profiling specialist. Your mission is to benchmark and identify CPU, memory, and cache bottlenecks."
+            , "Operational Invariants:"
+            , "1. METRIC PRECISION: Run profilers (valgrind callgrind/massif, perf, RTS profiling) and extract instruction/cycle metrics."
+            , "2. HOTSPOT ISOLATION: Identify the top 3 functions consuming the majority of time/allocations."
+            , "3. CONCRETE REMEDY: Recommend specific optimizations (e.g. allocation pre-sizing, unboxed structures, memory reuse)."
+            , "When profiling is complete, call `submit_report` with status, summary, details, and the profile artifact path."
+            ]
+        , specialistBudget       = 6
+        , specialistCapabilities = ["valgrind*", "callgrind_annotate*", "perf*", "read_file*", "bash*", "cabal bench*"]
+        }
+    )
+  , ( "implementer"
+    , SpecialistConfig
+        { specialistDescription  = "Surgical file modifier & refactoring implementer"
+        , specialistPrompt       = T.unlines
+            [ "# Role: Surgical Implementation Specialist"
+            , "You are an implementation specialist. Your mission is to execute clean, minimal file modifications based on approved plans."
+            , "Operational Invariants:"
+            , "1. SURGICAL PRECISION: Make only the targeted changes required. Do not refactor unrelated code."
+            , "2. PRESERVE DOCUMENTATION: Never delete comments, docstrings, or existing architectural conventions."
+            , "3. VERIFY DIFFS: Check your changes for syntax correctness and clean formatting."
+            , "When changes are complete, call `submit_report` with status, summary, details, and the modified file paths."
+            ]
+        , specialistBudget       = 6
+        , specialistCapabilities = ["write_file*", "replace_lines*", "read_file*", "sd_read*"]
+        }
+    )
+  , ( "reviewer"
+    , SpecialistConfig
+        { specialistDescription  = "Adversarial pre-commit invariant and simplicity auditor"
+        , specialistPrompt       = T.unlines
+            [ "# Role: Adversarial Code Reviewer"
+            , "You are an adversarial systems code reviewer. Your mission is to verify safety, correctness, and simplicity before code lands."
+            , "Operational Invariants:"
+            , "1. INVARIANT CHECKING: Inspect git diffs against architectural invariants, concurrency safety, and memory management."
+            , "2. YAGNI & SIMPLICITY: Hunt for over-engineering, unneeded dependencies, speculative abstractions, and dead flexibility."
+            , "3. ACTIONABLE VERDICT: Issue APPROVED or CHANGES_REQUESTED with precise line-by-line feedback."
+            , "When review is complete, call `submit_report` with status, summary, details, and any review artifacts."
+            ]
+        , specialistBudget       = 4
+        , specialistCapabilities = ["git diff*", "git log*", "read_file*", "cabal test*", "ctest*", "sd_recall*"]
+        }
+    )
+  ]
+
 data Config = Config
   { apiBaseUrl          :: !Text
   , apiKey              :: !Text
@@ -56,6 +166,7 @@ data Config = Config
   , maxTurnBudget       :: !Int
   , contextWindowLimit  :: !Int
   , mcpServers          :: !(Map Text McpServerConfig)
+  , specialists         :: !(Map Text SpecialistConfig)
   } deriving stock (Eq, Show, Generic)
 
 instance Aeson.ToJSON Config where
@@ -69,6 +180,7 @@ instance Aeson.ToJSON Config where
     , "max_turn_budget"     .= maxTurnBudget
     , "context_limit"       .= contextWindowLimit
     , "mcp_servers"         .= mcpServers
+    , "specialists"         .= specialists
     ]
 
 instance Aeson.FromJSON Config where
@@ -82,8 +194,11 @@ instance Aeson.FromJSON Config where
     maxTurnBudget      <- obj .:? "max_turn_budget" .!= 30
     contextWindowLimit <- obj .:? "context_limit" .!= 128000
     mcpServers         <- obj .:? "mcp_servers" .!= Map.empty
-    let workspaceRoot = "."
-        artifactDir   = ".lambda/artifacts"
+    userSpecialists    <- obj .:? "specialists" .!= Map.empty
+    userSubagents      <- obj .:? "subagents" .!= Map.empty
+    let specialists = Map.union userSpecialists (Map.union userSubagents defaultSpecialists)
+        workspaceRoot  = "."
+        artifactDir    = ".lambda/artifacts"
     pure Config{..}
 
 defaultAllowGlobs :: [String]
@@ -120,6 +235,7 @@ defaultConfig = Config
   , maxTurnBudget       = 30
   , contextWindowLimit  = 128000
   , mcpServers          = Map.empty
+  , specialists         = defaultSpecialists
   }
 
 loadConfig :: FilePath -> IO Config

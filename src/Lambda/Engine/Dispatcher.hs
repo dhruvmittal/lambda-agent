@@ -47,15 +47,17 @@ executeToolDispatch AppEngineState{..} caller grantedGlobs ToolCall{..} = do
               let cmdStr = case parseEither (Aeson.withObject "args" (Aeson..: "command")) toolCallArgs of
                     Right (cmd :: Text) -> T.unpack cmd
                     _                   -> T.unpack toolCallName
-                  matchesGrant = any (\g -> match (compile $ T.unpack g) cmdStr) grantedGlobs
-              pure matchesGrant
+                  cmdText = T.pack cmdStr
+                  matchesGrant = any (`matchesPattern` cmdStr) grantedGlobs
+              if matchesGrant
+                then pure True
+                else checkAuthorization appSecurity caller cmdText toolCallArgs
             MainAgent -> do
               -- Primary agent checks against SecurityState (globs + modal prompt queue)
               let cmdText = case parseEither (Aeson.withObject "args" (Aeson..: "command")) toolCallArgs of
                     Right (cmd :: Text) -> cmd
                     _                   -> toolCallName
               checkAuthorization appSecurity caller cmdText toolCallArgs
-
           if not authorized
             then pure $ ToolResult toolCallId ""
                    ("Permission Denied: Operation not authorized for " <> T.pack (show caller))
@@ -64,3 +66,14 @@ executeToolDispatch AppEngineState{..} caller grantedGlobs ToolCall{..} = do
               -- Step 3: Execute tool
               res <- toolExecute caller toolCallArgs
               pure res { resultCallIdRef = toolCallId }
+  where
+    matchesPattern globPat str =
+      let patStr = T.unpack globPat
+          starPat = if "*" `T.isSuffixOf` globPat && not ("**" `T.isSuffixOf` globPat)
+                      then T.unpack (globPat <> "*")
+                      else patStr
+      in match (compile patStr) str
+         || match (compile starPat) str
+         || (if "*" `T.isSuffixOf` globPat
+               then T.dropEnd 1 globPat `T.isPrefixOf` T.pack str
+               else globPat == T.pack str)

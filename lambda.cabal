@@ -110,4 +110,6 @@ test-suite lambda-test
         directory,
         filepath,
         bytestring,
-        brick
+        brick,
+        async,
+        time

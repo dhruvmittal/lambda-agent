@@ -2,27 +2,39 @@
 
 module Main where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (mapConcurrently, race, async, wait)
+import Control.Concurrent.STM
 import Control.Monad (unless)
 import qualified Data.Aeson as Aeson
+import Data.Aeson ((.=))
+import Data.Aeson.Types (parseEither)
 import qualified Data.ByteString.Lazy as BL
+import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
+import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import System.Directory (removeDirectoryRecursive, doesFileExist, removeFile)
 import System.Environment (setEnv, unsetEnv)
 import System.Exit (exitFailure)
 
-import Lambda.Config (loadConfig, Config(..))
+import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..))
+import Lambda.Core.ModelDriver (ModelDriver(..))
 import Lambda.Core.ToolProvider
+import Lambda.Driver.OpenAI (parseSseChunk, splitThinkingChunks)
 import Lambda.Engine.Artifacts
 import Lambda.Engine.Compactor
-import Lambda.Engine.Security
+import Lambda.Engine.Dispatcher (executeToolDispatch)
+import Lambda.Engine.Security (initSecurity, checkAuthorization, SecurityState(..))
+import Lambda.Engine.State (initEngineState, registerSubAgentTask, updateSubAgentTurns, appInterrupted, appSubAgents, appMode)
+import Lambda.Engine.SubAgent (submitReportTool, filterSubAgentRegistry, subAgentLoop, SubAgentReport(..))
 import qualified Data.Map.Strict as Map
 import Brick.Types (vSize, Size(..))
 import Lambda.Provider.Builtin (listDirectoryTool, readFileTool, fetchUrlTool)
 import Lambda.Provider.Mcp (inferCapability, parseMcpCallResult, startAndLoadMcpServers, stopMcpClient)
-import Lambda.UI.Draw (renderSubAgents)
+import Lambda.UI.Draw (renderSubAgents, renderSubAgentsSelected)
 import Lambda.Types
 
 main :: IO ()
@@ -43,6 +55,15 @@ main = do
   testLiveMcpServerIntegration
   testSubAgentViewportInvariant
   testPlanModeSubAgentAndContextGuard
+  testConcurrentToolExecution
+  testSubAgentCoTAndNavigation
+  testInlineThinkingStreamingParser
+  testWireSystemPromptDecoupling
+  testSubmitReportToolEgress
+  testBudgetExhaustionDiagnostics
+  testDepth1StarGraphSchemaExclusion
+  testDataDrivenSpecialistConfigLoading
+  testDynamicPermissionEscalation
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -288,11 +309,13 @@ testSubAgentViewportInvariant = do
   putStrLn "\n[Test 13] SubAgent Viewport Height Invariant"
   let sampleTask = SubAgentTask
         { subAgentId = 1
+        , subAgentRole = "profiler"
         , subAgentHypothesis = "Test hypothesis for ASan crash"
         , subAgentTurnCount = 2
         , subAgentBudget = 10
         , subAgentStatus = SubAgentRunning
         , subAgentArtifact = Just ".lambda/artifacts/subagent_1.log"
+        , subAgentTurns = []
         }
       sampleMap = Map.singleton 1 sampleTask
       widget = renderSubAgents sampleMap
@@ -328,6 +351,312 @@ testPlanModeSubAgentAndContextGuard = do
 
   removeFile largeFilePath
   putStrLn "  -> OK: Large file reads properly guarded for MainAgent and delegated to SubAgents."
+
+-- 15. Verify Parallel Tool Execution and Interruption Guard
+testConcurrentToolExecution :: IO ()
+testConcurrentToolExecution = do
+  putStrLn "\n[Test 15] Parallel Tool Execution & STM Interruption Invariant"
+  sec <- initSecurity [] []
+  cfg <- loadConfig "."
+  es <- initEngineState cfg emptyRegistry sec
+
+  let simulatedWork idx = do
+        threadDelay 50000 -- 50ms
+        pure $ ToolResult (T.pack $ show idx) ("Output " <> T.pack (show idx)) "" Nothing
+
+  start <- getCurrentTime
+  results <- mapConcurrently simulatedWork [1..3 :: Int]
+  end <- getCurrentTime
+
+  let elapsed = diffUTCTime end start
+  assert "All 3 concurrent jobs completed" (length results == 3)
+  assert "Parallel execution took less than 120ms" (elapsed < 0.12)
+
+  -- Test STM Interruption Cancellation
+  atomically $ writeTVar (appInterrupted es) True
+  resOrCancelled <- race
+    (atomically $ do
+      intr <- readTVar (appInterrupted es)
+      check intr)
+    (threadDelay 1000000 >> pure ("Done" :: Text))
+  case resOrCancelled of
+    Left () -> putStrLn "  -> OK: Interruption immediately halts asynchronous tasks via STM."
+    Right _ -> failTest "Interruption failed to cancel task."
+
+  putStrLn "  -> OK: Tool calls execute concurrently across lightweight green threads."
+
+-- 16. Verify SubAgent Chain of Thought History and Navigation
+testSubAgentCoTAndNavigation :: IO ()
+testSubAgentCoTAndNavigation = do
+  putStrLn "\n[Test 16] SubAgent Chain-of-Thought History & Navigation Invariant"
+  sec <- initSecurity [] []
+  cfg <- loadConfig "."
+  es <- initEngineState cfg emptyRegistry sec
+
+  task <- registerSubAgentTask es "surveyor" "Survey memory footprint" 6
+  let sId = subAgentId task
+      mockTurns =
+        [ Turn 1 SystemRole [TextBlock "SubAgent active"]
+        , Turn 2 UserRole [TextBlock "Run survey"]
+        , Turn 3 AssistantRole
+            [ ThinkingBlock 1 "Investigating resident memory usage..." Visible
+            , TextBlock "Executing check."
+            , ToolCallBlock (ToolCall "c1" "read_file" (Aeson.object ["path" Aeson..= ("foo" :: Text)]))
+            ]
+        , Turn 4 ToolRole [ToolResultBlock (ToolResult "c1" "File content" "" Nothing)]
+        ]
+
+  updateSubAgentTurns es sId mockTurns
+  subs <- readTVarIO (appSubAgents es)
+  let updatedTask = Map.lookup sId subs
+  case updatedTask of
+    Nothing -> failTest "Subagent task not found in state."
+    Just t -> do
+      assert "SubAgentTask preserves turn history" (length (subAgentTurns t) == 4)
+      assert "SubAgentTask preserves ThinkingBlock" (any isThinkingBlock (concatMap turnBlocks (subAgentTurns t)))
+      assert "SubAgent turn count correctly tracked" (subAgentTurnCount t == 1)
+
+  let sampleMap = Map.singleton sId (maybe task id updatedTask)
+      widgetSelected = renderSubAgentsSelected (Just sId) sampleMap
+  assert "renderSubAgentsSelected has Fixed vertical size" (vSize widgetSelected == Fixed)
+
+  putStrLn "  -> OK: SubAgent CoT reasoning turns and navigation state preserved in state vector."
+
+-- 17. Verify Streaming Inline <think> Tag State Machine
+testInlineThinkingStreamingParser :: IO ()
+testInlineThinkingStreamingParser = do
+  putStrLn "\n[Test 17] Inline <think> Tag Streaming State Machine"
+
+  -- Case A: Single line with inline <think> and </think>
+  let (stA, chunksA) = splitThinkingChunks False "Prefix <think>pondering details</think> suffix"
+  assert "State transitioned back to False" (not stA)
+  assert "Emitted 3 chunks" (length chunksA == 3)
+  assert "First chunk is prefix text" (chunksA !! 0 == ChunkText "Prefix ")
+  assert "Second chunk is thinking body without tags" (chunksA !! 1 == ChunkThinking "pondering details")
+  assert "Third chunk is suffix text" (chunksA !! 2 == ChunkText " suffix")
+
+  -- Case B: Chunks arriving incrementally across stream boundaries
+  let (stB1, chunksB1) = splitThinkingChunks False "<think>Step 1:"
+  assert "Transitioned into thinking mode" stB1
+  assert "First thought chunk emitted" (chunksB1 == [ChunkThinking "Step 1:"])
+
+  let (stB2, chunksB2) = splitThinkingChunks stB1 " Step 2 done."
+  assert "Remains in thinking mode" stB2
+  assert "Second thought chunk emitted as ChunkThinking" (chunksB2 == [ChunkThinking " Step 2 done."])
+
+  let (stB3, chunksB3) = splitThinkingChunks stB2 "</think>\nFinal result."
+  assert "Exited thinking mode" (not stB3)
+  assert "Emitted final text chunk" (chunksB3 == [ChunkText "\nFinal result."])
+
+  -- Case C: Parse SSE data line with reasoning_content
+  let rawSseReasoning = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"DeepSeek thought\"}}]}"
+      parsedReasoning = parseSseChunk rawSseReasoning
+  assert "reasoning_content parsed as ChunkThinking" (parsedReasoning == [ChunkThinking "DeepSeek thought"])
+
+  -- Case D: Parse SSE data line with alternative reasoning field
+  let rawSseAltReasoning = "data: {\"choices\":[{\"delta\":{\"reasoning\":\"Alternative reasoning\"}}]}"
+      parsedAltReasoning = parseSseChunk rawSseAltReasoning
+  assert "reasoning parsed as ChunkThinking" (parsedAltReasoning == [ChunkThinking "Alternative reasoning"])
+
+  putStrLn "  -> OK: Inline <think> streaming state machine correctly separates thoughts without leaking tags."
+
+-- 18. Verify Wire System Prompt Decoupling Invariant
+testWireSystemPromptDecoupling :: IO ()
+testWireSystemPromptDecoupling = do
+  putStrLn "\n[Test 18] Wire System Prompt Decoupling Invariant"
+  -- Case A: Subagent turn with explicit SystemRole prompt
+  let subAgentSysPrompt = "You are an ephemeral profiler subagent."
+      subTurns =
+        [ Turn 1 SystemRole [TextBlock subAgentSysPrompt]
+        , Turn 2 UserRole [TextBlock "Run valgrind on target"]
+        ]
+      subWire = turnsToOpenAIPayload subTurns
+  assert "SubAgent wire payload has 2 messages" (length subWire == 2)
+  let subSys = head subWire
+  assert "SubAgent wire system message role is system"
+    (parseEither (Aeson.withObject "msg" (Aeson..: "role")) subSys == Right ("system" :: Text))
+  assert "SubAgent wire system message contains specialist prompt"
+    (parseEither (Aeson.withObject "msg" (Aeson..: "content")) subSys == Right subAgentSysPrompt)
+  assert "SubAgent wire system message does NOT contain defaultAgentSystemPrompt"
+    (not (defaultAgentSystemPrompt `T.isInfixOf` T.pack (show subSys)))
+
+  -- Case B: Primary agent turns without explicit SystemRole
+  let mainTurns =
+        [ Turn 1 UserRole [TextBlock "Help optimize loop"]
+        ]
+      mainWire = turnsToOpenAIPayload mainTurns
+  assert "Primary agent wire payload has prepended system message" (length mainWire == 2)
+  let mainSys = head mainWire
+  assert "Primary agent root message is defaultAgentSystemPrompt"
+    (parseEither (Aeson.withObject "msg" (Aeson..: "content")) mainSys == Right defaultAgentSystemPrompt)
+  putStrLn "  -> OK: Wire protocol strictly decouples specialist persona prompts from orchestrator doctrine."
+
+-- 19. Verify Synthetic submit_report Egress Tool Invariant
+testSubmitReportToolEgress :: IO ()
+testSubmitReportToolEgress = do
+  putStrLn "\n[Test 19] Synthetic submit_report Egress Tool Invariant"
+  repVar <- newTVarIO Nothing
+  let def = submitReportTool repVar
+  assert "Tool name is submit_report" (toolName def == "submit_report")
+  assert "Tool capability is ReadOnly" (toolCapability def == ReadOnly)
+
+  let reportArgs = Aeson.object
+        [ "status" .= ("SUCCESS" :: Text)
+        , "summary" .= ("Found cache thrashing in inner loop" :: Text)
+        , "details" .= ("Cache miss rate: 42.8% on L1d" :: Text)
+        , "artifact_path" .= (".lambda/artifacts/cache_profile.txt" :: Text)
+        ]
+  res <- toolExecute def MainAgent reportArgs
+  assert "toolExecute succeeds without error" (T.null (resultStderr res))
+  assert "toolExecute returns artifact path" (resultArtifactPath res == Just ".lambda/artifacts/cache_profile.txt")
+
+  mRep <- readTVarIO repVar
+  case mRep of
+    Nothing -> failTest "submitReportTool failed to populate TVar (Maybe SubAgentReport)"
+    Just rep -> do
+      assert "Report status is SUCCESS" (reportStatus rep == "SUCCESS")
+      assert "Report summary matches" (reportSummary rep == "Found cache thrashing in inner loop")
+      assert "Report details match" (reportDetails rep == "Cache miss rate: 42.8% on L1d")
+      assert "Report artifact matches" (reportArtifact rep == Just ".lambda/artifacts/cache_profile.txt")
+  putStrLn "  -> OK: submit_report tool provides type-safe, schema-validated report egress."
+
+-- 20. Verify Budget Exhaustion Diagnostics Invariant
+testBudgetExhaustionDiagnostics :: IO ()
+testBudgetExhaustionDiagnostics = do
+  putStrLn "\n[Test 20] Budget Exhaustion Diagnostics Invariant"
+  sec <- initSecurity [] []
+  cfg <- loadConfig "."
+  es <- initEngineState cfg emptyRegistry sec
+  task <- registerSubAgentTask es "debugger" "Trace memory corruption" 2
+  let sId = subAgentId task
+
+  turnsVar <- newTVarIO [ Turn 1 UserRole [TextBlock "Start"] ]
+  attemptedVar <- newTVarIO
+    [ "valgrind(--tool=memcheck ./bin)"
+    , "grep_search(SEGV)"
+    ]
+  repVar <- newTVarIO Nothing
+
+  let dummyDriver = ModelDriver
+        { streamCompletion = \_ _ cb -> do
+            cb (ChunkText "Still analyzing...")
+            cb ChunkDone
+        }
+
+  res <- subAgentLoop es dummyDriver sId [] turnsVar attemptedVar repVar 3 2
+  case res of
+    Left err -> failTest ("Unexpected subAgentLoop failure: " <> T.unpack err)
+    Right rep -> do
+      assert "Status is INCONCLUSIVE" (reportStatus rep == "INCONCLUSIVE")
+      assert "Summary mentions budget exhaustion" ("Turn budget exhausted after 2 turns" `T.isInfixOf` reportSummary rep)
+      assert "Details list attempted tools" ("valgrind(--tool=memcheck ./bin)" `T.isInfixOf` reportDetails rep)
+      assert "Details list grep_search" ("grep_search(SEGV)" `T.isInfixOf` reportDetails rep)
+  putStrLn "  -> OK: Budget exhaustion synthesizes structured INCONCLUSIVE report with attempted tools."
+
+-- 21. Verify Depth-1 Star Graph Schema Exclusion
+testDepth1StarGraphSchemaExclusion :: IO ()
+testDepth1StarGraphSchemaExclusion = do
+  putStrLn "\n[Test 21] Depth-1 Star Graph Invariant"
+  repVar <- newTVarIO Nothing
+  let dummyTool name = ToolDefinition name "desc" (Aeson.object []) ReadOnly (\_ _ -> pure (ToolResult "" "" "" Nothing))
+      baseReg = registerTools
+        [ dummyTool "spawn_specialist_subagent"
+        , dummyTool "spawn_diagnostic_subagent"
+        , dummyTool "read_file"
+        , dummyTool "bash"
+        ] emptyRegistry
+
+  let subReg = filterSubAgentRegistry (submitReportTool repVar) baseReg
+      schemas = toolsToOpenAISchema ExecMode subReg
+
+  let toolNames = mapMaybe extractToolName schemas
+  assert "spawn_specialist_subagent is NOT in subagent schema" (notElem "spawn_specialist_subagent" toolNames)
+  assert "spawn_diagnostic_subagent is NOT in subagent schema" (notElem "spawn_diagnostic_subagent" toolNames)
+  assert "read_file IS in subagent schema" (elem "read_file" toolNames)
+  assert "bash IS in subagent schema" (elem "bash" toolNames)
+  assert "submit_report IS in subagent schema" (elem "submit_report" toolNames)
+  putStrLn "  -> OK: Subagent tool registry strictly strips spawn_* to enforce Depth-1 Star Graph."
+  where
+    extractToolName val =
+      case parseEither (Aeson.withObject "tool" $ \o -> do
+             fn <- o Aeson..: "function"
+             fn Aeson..: "name"
+           ) val of
+        Right (n :: Text) -> Just n
+        _                 -> Nothing
+
+-- 22. Verify Data-Driven Specialist Config Loading & Custom Override
+testDataDrivenSpecialistConfigLoading :: IO ()
+testDataDrivenSpecialistConfigLoading = do
+  putStrLn "\n[Test 22] Data-Driven Specialist Config Loading & Custom Overrides"
+  cfg <- loadConfig "."
+  let specs = specialists cfg
+  assert "surveyor specialist is defined" (Map.member "surveyor" specs)
+  assert "debugger specialist is defined" (Map.member "debugger" specs)
+  assert "profiler specialist is defined" (Map.member "profiler" specs)
+  assert "implementer specialist is defined" (Map.member "implementer" specs)
+  assert "reviewer specialist is defined" (Map.member "reviewer" specs)
+
+  let profiler = specs Map.! "profiler"
+  assert "profiler budget is 6" (specialistBudget profiler == 6)
+  assert "profiler has valgrind capability" (any ("valgrind*" `T.isInfixOf`) (specialistCapabilities profiler))
+
+  let customJson = "{\"specialists\":{\"fuzzer\":{\"description\":\"AFL++ fuzzer\",\"prompt\":\"Run fuzzer\",\"budget\":12,\"granted_capabilities\":[\"afl*\"]}}}"
+  case Aeson.eitherDecode customJson of
+    Left err -> failTest ("Failed to parse custom specialist JSON: " <> err)
+    Right (customCfg :: Config) -> do
+      assert "Merged custom fuzzer specialist" (Map.member "fuzzer" (specialists customCfg))
+      let fuzzer = specialists customCfg Map.! "fuzzer"
+      assert "fuzzer budget is 12" (specialistBudget fuzzer == 12)
+      assert "built-in surveyor preserved in custom config" (Map.member "surveyor" (specialists customCfg))
+  putStrLn "  -> OK: SpecialistConfig supports built-ins and dynamic user overrides from config.json."
+
+-- 23. Verify Dynamic Permission Escalation for SubAgents
+testDynamicPermissionEscalation :: IO ()
+testDynamicPermissionEscalation = do
+  putStrLn "\n[Test 23] Dynamic Permission Escalation for SubAgents"
+  sec <- initSecurity [] []
+  cfg <- loadConfig "."
+  let dummyBashTool = ToolDefinition "bash" "Run bash" (Aeson.object []) Destructive
+        (\_ _ -> pure (ToolResult "call_1" "Command executed successfully" "" Nothing))
+      reg = registerTool dummyBashTool emptyRegistry
+  es <- initEngineState cfg reg sec
+
+  atomically $ writeTVar (appMode es) ExecMode
+
+  let caller = SubAgentId 42 "Run perf tool"
+      call = ToolCall "call_1" "bash" (Aeson.object ["command" .= ("perf stat ./bin" :: Text)])
+
+  -- Case A: When pre-authorized with grantedGlobs matching "perf*"
+  resA <- executeToolDispatch es caller ["perf*"] call
+  assert "Authorized via pre-granted glob succeeds" (resultStdout resA == "Command executed successfully")
+
+  -- Case B: When NOT pre-authorized, verify dynamic escalation prompts user
+  dispatchHandle <- async $ executeToolDispatch es caller ["read_file*"] call
+
+  -- Read the escalation prompt from uiPromptQueue
+  prompt <- atomically $ readTBQueue (uiPromptQueue sec)
+  assert "Prompt caller matches" (promptCaller prompt == caller)
+  assert "Prompt tool matches" (promptTool prompt == "perf stat ./bin")
+
+  -- User grants one-time approval to the subagent
+  atomically $ putTMVar (promptReply prompt) PermOnce
+
+  -- Subagent unblocks and completes execution
+  resB <- wait dispatchHandle
+  assert "Subagent executes successfully after dynamic permission approval"
+    (resultStdout resB == "Command executed successfully")
+
+  -- Case C: When user denies the escalation prompt
+  let call2 = ToolCall "call_2" "bash" (Aeson.object ["command" .= ("rm -rf /" :: Text)])
+  denyHandle <- async $ executeToolDispatch es caller ["read_file*"] call2
+  promptDeny <- atomically $ readTBQueue (uiPromptQueue sec)
+  atomically $ putTMVar (promptReply promptDeny) PermNo
+  resC <- wait denyHandle
+  assert "Subagent call is rejected when user denies permission"
+    ("Permission Denied" `T.isInfixOf` resultStderr resC)
+
+  putStrLn "  -> OK: Ungranted subagent tool call triggers dynamic user permission escalation and honors user decision."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

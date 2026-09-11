@@ -4,6 +4,7 @@
 module Lambda.UI.Draw
   ( drawApp
   , renderSubAgents
+  , renderSubAgentsSelected
   ) where
 
 import Brick
@@ -53,11 +54,10 @@ modalOverlay _ = emptyWidget
 mainLayout :: UIState -> Widget ResourceName
 mainLayout UIState{..} =
   vBox
-    [ headerBar uiMode uiTurns uiContextLimit uiModelName
+    [ headerBar uiMode currentDisplayTurns uiContextLimit uiModelName uiSelectedSubAgent
     , hBox
-        [ -- Left Pane: Conversation turns (flexibly occupies remaining terminal width)
-          B.borderWithLabel (withAttr (attrName "paneTitle") (str " Conversation ")) $
-            viewport ChatView Vertical (padLeftRight 1 (vBox (map renderTurn uiTurns)))
+        [ -- Left Pane: Conversation turns or SubAgent Dialogue
+          renderLeftPane uiSelectedSubAgent uiTurns uiSubAgents
         , -- Right Pane: Fixed 36-column sidebar for state & subagents
           hLimit 36 $
             vBox
@@ -65,7 +65,7 @@ mainLayout UIState{..} =
                   B.borderWithLabel (withAttr (attrName "paneTitle") (str " State Vector ")) $
                     padLeftRight 1 (renderStateVector uiWorkingState)
               , B.borderWithLabel (withAttr (attrName "paneTitle") (str " SubAgents ")) $
-                  viewport SubAgentView Vertical (renderSubAgents uiSubAgents)
+                  viewport SubAgentView Vertical (renderSubAgentsSelected uiSelectedSubAgent uiSubAgents)
               ]
         ]
     , -- Bottom Pane: Dedicated 3-row command editor
@@ -73,21 +73,50 @@ mainLayout UIState{..} =
         B.borderWithLabel (inputLabel uiMode) $
           E.renderEditor (txt . T.unlines) True uiEditor
     ]
+  where
+    currentDisplayTurns = case uiSelectedSubAgent of
+      Just sId -> case Map.lookup sId uiSubAgents of
+        Just task -> subAgentTurns task
+        Nothing   -> uiTurns
+      Nothing  -> uiTurns
 
-headerBar :: AgentMode -> [Turn] -> Int -> Text -> Widget ResourceName
-headerBar mode turns ctxLimit model =
+renderLeftPane :: Maybe Int -> [Turn] -> Map.Map Int SubAgentTask -> Widget ResourceName
+renderLeftPane Nothing turns _ =
+  B.borderWithLabel (withAttr (attrName "paneTitle") (str " Conversation ")) $
+    viewport ChatView Vertical (padLeftRight 1 (vBox (map renderTurn turns)))
+renderLeftPane (Just sId) _ subs =
+  case Map.lookup sId subs of
+    Just task ->
+      let roleUpper = T.unpack (T.toUpper (subAgentRole task))
+          title = " SubAgent #" <> show sId <> " [" <> roleUpper <> "] Dialogue [Alt+← Main | Alt+→ Next | Esc Exit] "
+          turns = subAgentTurns task
+          renderedContent =
+            if null turns
+              then padAll 1 (withAttr (attrName "thinkingDim") $ str "No dialogue turns recorded for this subagent yet.")
+              else vBox (map renderTurn turns)
+      in B.borderWithLabel (withAttr (attrName "paneTitle") (str title)) $
+           viewport ChatView Vertical (padLeftRight 1 renderedContent)
+    Nothing ->
+      B.borderWithLabel (withAttr (attrName "paneTitle") (str " SubAgent Dialogue ")) $
+        viewport ChatView Vertical (padAll 1 $ withAttr (attrName "toolError") $ str ("SubAgent #" <> show sId <> " not found."))
+
+headerBar :: AgentMode -> [Turn] -> Int -> Text -> Maybe Int -> Widget ResourceName
+headerBar mode turns ctxLimit model mSelected =
   vLimit 1 $
     withAttr (attrName "headerBar") $
       hBox
         [ withAttr (attrName "titleLogo") (str " λ lambdA ")
         , str " │ "
         , modeBadge mode
+        , case mSelected of
+            Just sId -> hBox [ str " │ ", withAttr (attrName "selectedBadge") (str $ " [VIEWING SUBAGENT #" <> show sId <> "] ") ]
+            Nothing  -> emptyWidget
         , str " │ "
         , contextBadge
         , str " │ "
         , withAttr (attrName "modelBadge") (str ("Model: " <> T.unpack model))
         , fill ' '
-        , str "[PgUp/PgDn/↑↓: Scroll]  [^P/^N: History]  [Esc Esc: Stop]  [/help] "
+        , str "[Alt+←/→: SubAgents]  [^P/^N: Hist]  [^T: Think]  [Esc Esc: Stop]  [/help] "
         ]
   where
     currentTokens = estimateTotalTokens turns
@@ -176,24 +205,36 @@ renderStateVector rawText =
       | otherwise                            = l
 
 renderSubAgents :: Map.Map Int SubAgentTask -> Widget ResourceName
-renderSubAgents subs
+renderSubAgents = renderSubAgentsSelected Nothing
+
+renderSubAgentsSelected :: Maybe Int -> Map.Map Int SubAgentTask -> Widget ResourceName
+renderSubAgentsSelected mSelected subs
   | Map.null subs = padAll 1 (withAttr (attrName "thinkingDim") $ str "No active subagents")
   | otherwise = vBox $ map renderTask (Map.elems subs)
   where
     renderTask SubAgentTask{..} =
-      padBottom (Pad 1) $
-        vBox
-          [ vLimit 1 $ hBox
-              [ withAttr (statusAttr subAgentStatus) (str $ "[" <> formatStatus subAgentStatus <> "]")
-              , str $ " #" <> show subAgentId
-              , vLimit 1 (fill ' ')
-              , str $ show subAgentTurnCount <> "/" <> show subAgentBudget <> "t"
-              ]
-          , padLeft (Pad 1) $ txtWrap (T.take 50 subAgentHypothesis)
-          , case subAgentArtifact of
-              Just p  -> padLeft (Pad 1) $ withAttr (attrName "artifact") (str $ "-> " <> take 26 p)
-              Nothing -> emptyWidget
-          ]
+      let isSelected = mSelected == Just subAgentId
+          roleUpper = T.unpack (T.toUpper subAgentRole)
+          taskWidget =
+            padBottom (Pad 1) $
+              vBox
+                [ vLimit 1 $ hBox
+                    [ withAttr (attrName "subRole") (str $ "[" <> roleUpper <> "]")
+                    , str $ " #" <> show subAgentId
+                    , str " "
+                    , withAttr (statusAttr subAgentStatus) (str $ "[" <> formatStatus subAgentStatus <> "]")
+                    , if isSelected
+                        then withAttr (attrName "selectedBadge") (str " [VIEWING]")
+                        else emptyWidget
+                    , vLimit 1 (fill ' ')
+                    , str $ show subAgentTurnCount <> "/" <> show subAgentBudget <> "t"
+                    ]
+                , padLeft (Pad 1) $ txtWrap (T.take 50 subAgentHypothesis)
+                , case subAgentArtifact of
+                    Just p  -> padLeft (Pad 1) $ withAttr (attrName "artifact") (str $ "-> " <> take 26 p)
+                    Nothing -> emptyWidget
+                ]
+      in clickable (SubAgentItem subAgentId) taskWidget
 
     formatStatus SubAgentRunning      = "RUNNING"
     formatStatus (SubAgentSuccess _)  = "SUCCESS"

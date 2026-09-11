@@ -8,6 +8,7 @@ module Lambda.UI.Events
 import Brick
 import qualified Brick.Widgets.Edit as E
 import Control.Concurrent.STM (atomically, writeTBQueue)
+import Control.Monad (unless)
 import Control.Monad.IO.Class (liftIO)
 import Data.Char (isSpace)
 import qualified Data.Map.Strict as Map
@@ -30,14 +31,21 @@ handleAppEvent :: BrickEvent ResourceName EngineEvent -> EventM ResourceName UIS
 handleAppEvent (AppEvent engineEv) = do
   case engineEv of
     EvTurnAdded turn -> do
-      modify $ \s -> s { uiTurns = uiTurns s ++ [turn] }
+      vis <- gets uiThinkingVisible
+      let adjusted = setThinkingVis (if vis then Visible else Collapsed) turn
+      modify $ \s -> s { uiTurns = uiTurns s ++ [adjusted] }
       vScrollToEnd (viewportScroll ChatView)
     EvTurnUpdated turn -> do
+      vis <- gets uiThinkingVisible
+      let adjusted = setThinkingVis (if vis then Visible else Collapsed) turn
       modify $ \s ->
-        s { uiTurns = updateMatchingTurn turn (uiTurns s) }
+        s { uiTurns = updateMatchingTurn adjusted (uiTurns s) }
       vScrollToEnd (viewportScroll ChatView)
     EvSubAgentUpdate task -> modify $ \s ->
-      s { uiSubAgents = Map.insert (subAgentId task) task (uiSubAgents s) }
+      let vis = uiThinkingVisible s
+          adjustedTurns = map (setThinkingVis (if vis then Visible else Collapsed)) (subAgentTurns task)
+          adjustedTask = task { subAgentTurns = adjustedTurns }
+      in s { uiSubAgents = Map.insert (subAgentId task) adjustedTask (uiSubAgents s) }
     EvWorkingStateUpdate ws -> modify $ \s ->
       s { uiWorkingState = ws }
     EvPermissionRequired prompt -> modify $ \s ->
@@ -76,18 +84,46 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 'z') [V.MCtrl])) = do
     raiseSignal sigTSTP
     pure st
 
--- Double Esc (within 500ms): Interrupt active turn
+-- Esc: If viewing a subagent, return to main chat; if on main chat, double Esc interrupts active turn
 handleAppEvent (VtyEvent (V.EvKey V.KEsc [])) = do
-  now <- liftIO getCurrentTime
   st <- get
-  case uiLastEscTime st of
-    Just prev | diffUTCTime now prev < 0.5 -> do
-      put st { uiLastEscTime = Nothing }
-      liftIO $ atomically $ do
-        writeTBQueue (cmdQueue (uiChannels st)) CmdInterrupt
-        writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "⚠️ Interrupt dispatched (Esc Esc)...")
-    _ ->
-      put st { uiLastEscTime = Just now }
+  case uiSelectedSubAgent st of
+    Just _ -> put st { uiSelectedSubAgent = Nothing }
+    Nothing -> do
+      now <- liftIO getCurrentTime
+      case uiLastEscTime st of
+        Just prev | diffUTCTime now prev < 0.5 -> do
+          put st { uiLastEscTime = Nothing }
+          liftIO $ atomically $ do
+            writeTBQueue (cmdQueue (uiChannels st)) CmdInterrupt
+            writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "⚠️ Interrupt dispatched (Esc Esc)...")
+        _ ->
+          put st { uiLastEscTime = Just now }
+
+-- Alt+Left / Meta+Left: Step back in subagents or return to Main Conversation
+handleAppEvent (VtyEvent (V.EvKey V.KLeft mods))
+  | any (`elem` [V.MMeta, V.MAlt]) mods = do
+      st <- get
+      let subIds = Map.keys (uiSubAgents st)
+      case uiSelectedSubAgent st of
+        Nothing -> pure ()
+        Just currId ->
+          case break (== currId) subIds of
+            ([], _) -> put st { uiSelectedSubAgent = Nothing }
+            (prevs, _) -> put st { uiSelectedSubAgent = Just (last prevs) }
+
+-- Alt+Right / Meta+Right: Step forward into next subagent
+handleAppEvent (VtyEvent (V.EvKey V.KRight mods))
+  | any (`elem` [V.MMeta, V.MAlt]) mods = do
+      st <- get
+      let subIds = Map.keys (uiSubAgents st)
+      unless (null subIds) $ do
+        case uiSelectedSubAgent st of
+          Nothing -> put st { uiSelectedSubAgent = Just (head subIds) }
+          Just currId ->
+            case dropWhile (/= currId) subIds of
+              (_ : nextId : _) -> put st { uiSelectedSubAgent = Just nextId }
+              _                -> pure ()
 
 -- Bracketed Paste: Paste clipboard directly into editor without line splitting
 handleAppEvent (VtyEvent (V.EvPaste bs)) = do
@@ -123,8 +159,16 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 'e') [V.MCtrl])) =
   modify $ \s -> s { uiEditor = E.applyEdit Z.gotoEOL (uiEditor s) }
 
 -- ^T: Toggle thinking accordions
-handleAppEvent (VtyEvent (V.EvKey (V.KChar 't') [V.MCtrl])) =
-  modify $ \s -> s { uiTurns = map toggleThinkingAll (uiTurns s) }
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 't') [V.MCtrl])) = do
+  st <- get
+  let newVis = not (uiThinkingVisible st)
+      targetVis = if newVis then Visible else Collapsed
+      updatedSubs = Map.map (\t -> t { subAgentTurns = map (setThinkingVis targetVis) (subAgentTurns t) }) (uiSubAgents st)
+  put st
+    { uiThinkingVisible = newVis
+    , uiTurns = map (setThinkingVis targetVis) (uiTurns st)
+    , uiSubAgents = updatedSubs
+    }
 
 -- Keystrokes when permission modal is open (Keys 1-4)
 handleAppEvent (VtyEvent (V.EvKey (V.KChar '1') [])) = resolveActiveModal PermAlways
@@ -138,9 +182,18 @@ handleAppEvent (MouseDown ButtonOnce   V.BLeft _ _) = resolveActiveModal PermOnc
 handleAppEvent (MouseDown ButtonNo     V.BLeft _ _) = resolveActiveModal PermNo
 handleAppEvent (MouseDown ButtonNever  V.BLeft _ _) = resolveActiveModal PermNever
 
+-- Mouse click on subagent in sidebar
+handleAppEvent (MouseDown (SubAgentItem sId) V.BLeft _ _) =
+  modify $ \s -> s { uiSelectedSubAgent = Just sId }
+
 -- Mouse click on thinking accordion fold header
 handleAppEvent (MouseDown (ThinkingFold tId) V.BLeft _ _) =
-  modify $ \s -> s { uiTurns = map (toggleThinking tId) (uiTurns s) }
+  modify $ \s ->
+    let updateTurns = map (toggleThinking tId)
+        updateSub t = t { subAgentTurns = updateTurns (subAgentTurns t) }
+    in s { uiTurns = updateTurns (uiTurns s)
+         , uiSubAgents = Map.map updateSub (uiSubAgents s)
+         }
   where
     toggleThinking targetId t@(Turn _ _ blks) =
       t { turnBlocks = map (flipVis targetId) blks }
@@ -261,21 +314,31 @@ handleCommand cmdText = do
             , "  /plan          - Switch to Plan mode (read-only tools, no mutations)"
             , "  /exec          - Switch to Exec mode (full tools: bash, file writes)"
             , "  /think         - Toggle thinking/reasoning blocks (or press Ctrl+T)"
+            , "  /sub <id>      - View SubAgent CoT & dialogue (e.g. /sub 1, /sub main)"
             , "  /compact       - Trigger manual context compaction to disk archives"
             , "  /clear         - Clear conversation history"
             , "  /help          - Show this help reference"
             , "  /quit          - Exit application"
             , ""
+            , "Specialist Subagents:"
+            , "  surveyor       - Read-only codebase mapping, AST/greps, architecture surveys"
+            , "  debugger       - Failure analysis, sanitizer traces, compiler error triage"
+            , "  profiler       - Performance diagnostics (Valgrind, perf, flamegraphs, benchmarks)"
+            , "  implementer    - Code refactoring, test cascades, localized edits"
+            , "  reviewer       - Adversarial critique, correctness audits, diff inspection"
+            , ""
             , "Shortcuts & Terminal Conventions:"
             , "  Ctrl+C         - Exit application immediately"
             , "  Ctrl+Z         - Suspend/background process to shell (fg to resume)"
             , "  Esc Esc        - Interrupt active turn / cancel pending tools"
+            , "  Esc            - Exit SubAgent CoT view back to main conversation"
+            , "  Alt+← / Alt+→  - Navigate between Main Chat and SubAgents"
             , "  Ctrl+W, Ctrl+H - Delete word backward"
             , "  Ctrl+U, Ctrl+K - Delete line to start / end"
             , "  Ctrl+A, Ctrl+E - Move cursor to start / end of line"
             , "  Ctrl+T         - Toggle thinking/reasoning blocks"
             , "  Keys 1,2,3,4   - Resolve authorization prompt (Always, Once, No, Never)"
-            , "  Mouse Drag     - Native text selection & copy (clipboard enabled)"
+            , "  Mouse Click    - Click on SubAgent #id in sidebar or thinking folds"
             ]
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSystemMessage helpText)
     "/plan" -> do
@@ -285,11 +348,56 @@ handleCommand cmdText = do
       put st { uiMode = ExecMode }
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSetMode ExecMode)
     cmd | cmd `elem` ["/think", "/thinking"] -> do
-      modify $ \s -> s { uiTurns = map toggleThinkingAll (uiTurns s) }
+      let newVis = not (uiThinkingVisible st)
+          targetVis = if newVis then Visible else Collapsed
+          statusMsg = if newVis then "expanded" else "collapsed"
+          updatedSubs = Map.map (\t -> t { subAgentTurns = map (setThinkingVis targetVis) (subAgentTurns t) }) (uiSubAgents st)
+      put st
+        { uiThinkingVisible = newVis
+        , uiTurns = map (setThinkingVis targetVis) (uiTurns st)
+        , uiSubAgents = updatedSubs
+        }
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+        (CmdSystemMessage $ "Thinking scratchpad: " <> statusMsg)
     cmd | cmd `elem` ["/think on", "/think show", "/thinking on", "/thinking show"] -> do
-      modify $ \s -> s { uiTurns = map (setThinkingVis Visible) (uiTurns s) }
+      let updatedSubs = Map.map (\t -> t { subAgentTurns = map (setThinkingVis Visible) (subAgentTurns t) }) (uiSubAgents st)
+      put st
+        { uiThinkingVisible = True
+        , uiTurns = map (setThinkingVis Visible) (uiTurns st)
+        , uiSubAgents = updatedSubs
+        }
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+        (CmdSystemMessage "Thinking scratchpad: expanded")
     cmd | cmd `elem` ["/think off", "/think hide", "/thinking off", "/thinking hide"] -> do
-      modify $ \s -> s { uiTurns = map (setThinkingVis Collapsed) (uiTurns s) }
+      let updatedSubs = Map.map (\t -> t { subAgentTurns = map (setThinkingVis Collapsed) (subAgentTurns t) }) (uiSubAgents st)
+      put st
+        { uiThinkingVisible = False
+        , uiTurns = map (setThinkingVis Collapsed) (uiTurns st)
+        , uiSubAgents = updatedSubs
+        }
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+        (CmdSystemMessage "Thinking scratchpad: collapsed")
+    cmd | "/sub " `T.isPrefixOf` cmd || "/subagent " `T.isPrefixOf` cmd -> do
+      let arg = T.strip $ if "/sub " `T.isPrefixOf` cmd then T.drop 5 cmd else T.drop 10 cmd
+      if arg `elem` ["main", "back", "chat", "0", "exit"]
+        then do
+          put st { uiSelectedSubAgent = Nothing }
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+            (CmdSystemMessage "Switched to Main Conversation.")
+        else
+          case reads (T.unpack arg) of
+            [(sId, "")] ->
+              if Map.member sId (uiSubAgents st)
+                then do
+                  put st { uiSelectedSubAgent = Just sId }
+                  liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+                    (CmdSystemMessage $ "Viewing SubAgent #" <> T.pack (show sId) <> " Dialogue & CoT. Press Esc or Alt+← to return.")
+                else
+                  liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+                    (CmdSystemMessage $ "⚠️ SubAgent #" <> arg <> " not found.")
+            _ ->
+              liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+                (CmdSystemMessage "Usage: /sub <id> to view subagent CoT, or /sub main to return.")
     "/compact" -> do
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdCompactHistory
     "/clear" -> do
@@ -334,13 +442,6 @@ uiEditorLens f s = (\e -> s { uiEditor = e }) <$> f (uiEditor s)
 -- | Helper to populate editor content and place cursor at end of line
 setEditorText :: Text -> E.Editor Text ResourceName
 setEditorText strVal = E.applyEdit Z.gotoEOL (E.editor EditorInput (Just 1) strVal)
-
--- | Toggles visibility of all thinking blocks in dialogue history
-toggleThinkingAll :: Turn -> Turn
-toggleThinkingAll t@(Turn _ _ blks) = t { turnBlocks = map flipVis blks }
-  where
-    flipVis (ThinkingBlock i b vis) = ThinkingBlock i b (if vis == Visible then Collapsed else Visible)
-    flipVis other = other
 
 -- | Explicitly sets visibility of all thinking blocks across turns
 setThinkingVis :: BlockVisibility -> Turn -> Turn
