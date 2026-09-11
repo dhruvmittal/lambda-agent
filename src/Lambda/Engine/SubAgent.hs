@@ -17,10 +17,12 @@ import Control.Concurrent.STM
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?))
 import Data.Aeson.Types (parseEither)
+import qualified Data.ByteString.Lazy as BL
 import Data.List (nub)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 
 import Lambda.Config (Config(..), SpecialistConfig(..))
 import Lambda.Core.ModelDriver (ModelDriver(..))
@@ -221,14 +223,15 @@ subAgentLoop engineState@AppEngineState{..} driver sId grants turnsVar attempted
         ChunkText txt -> atomically $ modifyTVar' accumTextVar (<> txt)
         ChunkThinking th -> atomically $ modifyTVar' accumThinkingVar (<> th)
         ChunkToolCallStart cid name -> atomically $
-          modifyTVar' toolCallsVar (\tcs -> tcs ++ [ToolCall cid name (Aeson.object [])])
+          modifyTVar' toolCallsVar (\tcs -> tcs ++ [ToolCall cid name (Aeson.String "")])
         ChunkToolCallArgs cid argsChunk -> atomically $
-          modifyTVar' toolCallsVar (\tcs -> map (appendArgs cid argsChunk) tcs)
+          modifyTVar' toolCallsVar (appendArgs cid argsChunk)
         ChunkDone -> pure ()
 
       fullText <- readTVarIO accumTextVar
       fullThinking <- readTVarIO accumThinkingVar
-      toolCalls <- readTVarIO toolCallsVar
+      rawToolCalls <- readTVarIO toolCallsVar
+      let toolCalls = map finalizeToolArgs rawToolCalls
 
       let assistantBlocks =
             [ ThinkingBlock currentTurn fullThinking Visible | not (T.null fullThinking) ]
@@ -284,13 +287,30 @@ subAgentLoop engineState@AppEngineState{..} driver sId grants turnsVar attempted
             Nothing  -> subAgentLoop engineState driver sId grants turnsVar attemptedToolsVar reportVar (currentTurn + 1) budget
   where
     subTaskDescription = "SubAgent #" <> T.pack (show sId)
-    appendArgs targetId chunk tc@ToolCall{..}
-      | toolCallId == targetId =
-          let existing = case toolCallArgs of
+    appendArgs targetId chunk tcs
+      | T.null targetId =
+          if null tcs
+            then []
+            else let (prev, lastTc) = (init tcs, last tcs)
+                 in prev ++ [addChunk chunk lastTc]
+      | otherwise =
+          map (\tc -> if toolCallId tc == targetId then addChunk chunk tc else tc) tcs
+      where
+        addChunk ch tc =
+          let existing = case toolCallArgs tc of
                 Aeson.String s -> s
                 _              -> ""
-          in tc { toolCallArgs = Aeson.String (existing <> chunk) }
-      | otherwise = tc
+          in tc { toolCallArgs = Aeson.String (existing <> ch) }
+
+    finalizeToolArgs tc@ToolCall{..} =
+      case toolCallArgs of
+        Aeson.String s
+          | T.null (T.strip s) -> tc { toolCallArgs = Aeson.object [] }
+          | otherwise ->
+              case Aeson.decode (BL.fromStrict $ TE.encodeUtf8 s) of
+                Just val -> tc { toolCallArgs = val }
+                Nothing  -> tc { toolCallArgs = Aeson.object ["raw" .= s] }
+        _ -> tc
 
 -- | Tool to spawn specialist subagents
 spawnSpecialistSubAgentTool :: AppEngineState -> ModelDriver -> ToolDefinition

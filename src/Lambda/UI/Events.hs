@@ -101,21 +101,29 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 'z') [V.MCtrl])) = do
     raiseSignal sigTSTP
     pure st
 
--- Esc: If viewing a subagent, return to main chat; if on main chat, double Esc interrupts active turn
+-- Esc: If completion active -> dismiss completion
+--      If HUD active -> dismiss HUD
+--      If viewing a subagent -> return to main chat
+--      If on main chat -> double Esc interrupts active turn
 handleAppEvent (VtyEvent (V.EvKey V.KEsc [])) = do
   st <- get
-  case uiSelectedSubAgent st of
-    Just _ -> put st { uiSelectedSubAgent = Nothing }
-    Nothing -> do
-      now <- liftIO getCurrentTime
-      case uiLastEscTime st of
-        Just prev | diffUTCTime now prev < 0.5 -> do
-          put st { uiLastEscTime = Nothing }
-          liftIO $ atomically $ do
-            writeTBQueue (cmdQueue (uiChannels st)) CmdInterrupt
-            writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "⚠️ Interrupt dispatched (Esc Esc)...")
-        _ ->
-          put st { uiLastEscTime = Just now }
+  case uiCompletion st of
+    Just _ -> put st { uiCompletion = Nothing }
+    Nothing ->
+      if uiShowHud st
+        then put st { uiShowHud = False }
+        else case uiSelectedSubAgent st of
+          Just _ -> put st { uiSelectedSubAgent = Nothing }
+          Nothing -> do
+            now <- liftIO getCurrentTime
+            case uiLastEscTime st of
+              Just prev | diffUTCTime now prev < 0.5 -> do
+                put st { uiLastEscTime = Nothing }
+                liftIO $ atomically $ do
+                  writeTBQueue (cmdQueue (uiChannels st)) CmdInterrupt
+                  writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "⚠️ Interrupt dispatched (Esc Esc)...")
+              _ ->
+                put st { uiLastEscTime = Just now }
 
 -- Alt+Left / Meta+Left: Step back in subagents or return to Main Conversation
 handleAppEvent (VtyEvent (V.EvKey V.KLeft mods))
@@ -153,19 +161,53 @@ handleAppEvent (VtyEvent (V.EvPaste bs)) = do
 
 -- ^W or ^Backspace or ^H: Delete preceding word
 handleAppEvent (VtyEvent (V.EvKey (V.KChar 'w') [V.MCtrl])) =
-  modify $ \s -> s { uiEditor = E.applyEdit deleteWordBackward (uiEditor s) }
+  modify (updateCompletionState . (\s -> s { uiEditor = E.applyEdit deleteWordBackward (uiEditor s) }))
 handleAppEvent (VtyEvent (V.EvKey V.KBS [V.MCtrl])) =
-  modify $ \s -> s { uiEditor = E.applyEdit deleteWordBackward (uiEditor s) }
+  modify (updateCompletionState . (\s -> s { uiEditor = E.applyEdit deleteWordBackward (uiEditor s) }))
 handleAppEvent (VtyEvent (V.EvKey (V.KChar 'h') [V.MCtrl])) =
-  modify $ \s -> s { uiEditor = E.applyEdit deleteWordBackward (uiEditor s) }
+  modify (updateCompletionState . (\s -> s { uiEditor = E.applyEdit deleteWordBackward (uiEditor s) }))
 
 -- ^U: Kill line backwards from cursor
 handleAppEvent (VtyEvent (V.EvKey (V.KChar 'u') [V.MCtrl])) =
-  modify $ \s -> s { uiEditor = E.applyEdit Z.killToBOL (uiEditor s) }
+  modify (updateCompletionState . (\s -> s { uiEditor = E.applyEdit Z.killToBOL (uiEditor s) }))
 
--- ^K: Kill line forwards from cursor
+-- ^K or Alt+P: Toggle Intelligence HUD
 handleAppEvent (VtyEvent (V.EvKey (V.KChar 'k') [V.MCtrl])) =
-  modify $ \s -> s { uiEditor = E.applyEdit Z.killToEOL (uiEditor s) }
+  modify $ \s -> s { uiShowHud = not (uiShowHud s) }
+
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'p') [V.MMeta])) =
+  modify $ \s -> s { uiShowHud = not (uiShowHud s) }
+
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'p') [V.MAlt])) =
+  modify $ \s -> s { uiShowHud = not (uiShowHud s) }
+
+-- Tab: Contextual autocomplete or mode toggle
+handleAppEvent (VtyEvent (V.EvKey (V.KChar '\t') [])) = do
+  st <- get
+  let editorLines = E.getEditContents (uiEditor st)
+      rawInput = T.dropWhile (== ' ') (T.filter (\c -> c /= '\n' && c /= '\r') (T.concat editorLines))
+  case uiCompletion st of
+    Just (CompletionState matches sel) | not (null matches) && sel >= 0 && sel < length matches -> do
+      let selectedCmd = matches !! sel
+          newEditor = E.applyEdit Z.gotoEOL (E.editor EditorInput (Just 1) (selectedCmd <> " "))
+      put st { uiEditor = newEditor, uiCompletion = Nothing }
+    _ | "/" `T.isPrefixOf` rawInput && not (" " `T.isInfixOf` rawInput) -> do
+        let matches = filter (rawInput `T.isPrefixOf`) allCommands
+        case matches of
+          (m:_) -> do
+            let newEditor = E.applyEdit Z.gotoEOL (E.editor EditorInput (Just 1) (m <> " "))
+            put st { uiEditor = newEditor, uiCompletion = Nothing }
+          [] -> pure ()
+    _ -> do
+      let nextMode = if uiMode st == PlanMode then ExecMode else PlanMode
+      put st { uiMode = nextMode }
+      liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) (CmdSetMode nextMode)
+
+handleAppEvent (VtyEvent (V.EvKey V.KBackTab [])) = do
+  st <- get
+  let nextMode = if uiMode st == PlanMode then ExecMode else PlanMode
+  put st { uiMode = nextMode }
+  liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) (CmdSetMode nextMode)
 
 -- ^A: Jump to beginning of line
 handleAppEvent (VtyEvent (V.EvKey (V.KChar 'a') [V.MCtrl])) =
@@ -229,12 +271,22 @@ handleAppEvent (VtyEvent (V.EvKey V.KPageUp _)) =
 handleAppEvent (VtyEvent (V.EvKey V.KPageDown _)) =
   vScrollBy (viewportScroll ChatView) 12
 
--- Up / Down Arrow Keys: Scroll conversation viewport line by line
-handleAppEvent (VtyEvent (V.EvKey V.KUp [])) =
-  vScrollBy (viewportScroll ChatView) (-2)
+-- Up / Down Arrow Keys: Navigate autocomplete if active, else scroll conversation
+handleAppEvent (VtyEvent (V.EvKey V.KUp [])) = do
+  st <- get
+  case uiCompletion st of
+    Just (CompletionState matches sel) | not (null matches) -> do
+      let nextSel = if sel <= 0 then length matches - 1 else sel - 1
+      put st { uiCompletion = Just (CompletionState matches nextSel) }
+    _ -> vScrollBy (viewportScroll ChatView) (-2)
 
-handleAppEvent (VtyEvent (V.EvKey V.KDown [])) =
-  vScrollBy (viewportScroll ChatView) 2
+handleAppEvent (VtyEvent (V.EvKey V.KDown [])) = do
+  st <- get
+  case uiCompletion st of
+    Just (CompletionState matches sel) | not (null matches) -> do
+      let nextSel = if sel >= length matches - 1 then 0 else sel + 1
+      put st { uiCompletion = Just (CompletionState matches nextSel) }
+    _ -> vScrollBy (viewportScroll ChatView) 2
 
 -- Home / End (with Ctrl): Jump to beginning or end of conversation
 handleAppEvent (VtyEvent (V.EvKey V.KHome [V.MCtrl])) =
@@ -294,31 +346,77 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 'n') [V.MCtrl])) = do
 -- Keyboard Enter: Submit prompt or dispatch slash command
 handleAppEvent (VtyEvent (V.EvKey V.KEnter [])) = do
   st <- get
-  let rawLines = E.getEditContents (uiEditor st)
-      inputText = T.strip (T.unlines rawLines)
-  if T.null inputText
-    then pure ()
-    else do
-      -- Record prompt in history (avoiding consecutive duplicates)
-      let currentHist = uiPromptHistory st
-          newHist = case currentHist of
-            (p:_) | p == inputText -> currentHist
-            _                      -> inputText : currentHist
-      -- Reset input editor and history navigation state
+  case uiCompletion st of
+    Just (CompletionState matches sel) | not (null matches) && sel >= 0 && sel < length matches -> do
+      let selectedCmd = matches !! sel
       put st
         { uiEditor        = E.editor EditorInput (Just 1) ""
-        , uiPromptHistory = newHist
+        , uiCompletion    = Nothing
         , uiHistoryIndex  = Nothing
         , uiSavedDraft    = ""
         }
       vScrollToEnd (viewportScroll ChatView)
-      handleCommand inputText
+      handleCommand selectedCmd
+    _ -> do
+      let rawLines = E.getEditContents (uiEditor st)
+          inputText = T.strip (T.unlines rawLines)
+      if T.null inputText
+        then pure ()
+        else do
+          -- Record prompt in history (avoiding consecutive duplicates)
+          let currentHist = uiPromptHistory st
+              newHist = case currentHist of
+                (p:_) | p == inputText -> currentHist
+                _                      -> inputText : currentHist
+          -- Reset input editor and history navigation state
+          put st
+            { uiEditor        = E.editor EditorInput (Just 1) ""
+            , uiPromptHistory = newHist
+            , uiHistoryIndex  = Nothing
+            , uiSavedDraft    = ""
+            , uiCompletion    = Nothing
+            }
+          vScrollToEnd (viewportScroll ChatView)
+          handleCommand inputText
 
 -- Default text editor input (regular typing)
 handleAppEvent (VtyEvent ev) = do
   zoom uiEditorLens (E.handleEditorEvent (VtyEvent ev))
+  modify updateCompletionState
 
 handleAppEvent _ = pure ()
+
+updateCompletionState :: UIState -> UIState
+updateCompletionState st =
+  let editorLines = E.getEditContents (uiEditor st)
+      rawInput = T.dropWhile (== ' ') (T.filter (\c -> c /= '\n' && c /= '\r') (T.concat editorLines))
+  in if "/" `T.isPrefixOf` rawInput && not (" " `T.isInfixOf` rawInput)
+       then
+         let matches = filter (rawInput `T.isPrefixOf`) allCommands
+         in if null matches
+              then st { uiCompletion = Nothing }
+              else case uiCompletion st of
+                     Just (CompletionState _ sel) ->
+                       let newSel = if sel >= length matches then 0 else sel
+                       in st { uiCompletion = Just (CompletionState matches newSel) }
+                     Nothing ->
+                       st { uiCompletion = Just (CompletionState matches 0) }
+       else st { uiCompletion = Nothing }
+
+allCommands :: [Text]
+allCommands =
+  [ "/plan"
+  , "/exec"
+  , "/think"
+  , "/session"
+  , "/sub"
+  , "/trace"
+  , "/compact"
+  , "/clear"
+  , "/new"
+  , "/help"
+  , "/quit"
+  ]
 
 handleCommand :: Text -> EventM ResourceName UIState ()
 handleCommand cmdText = do

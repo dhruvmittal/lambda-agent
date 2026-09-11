@@ -5,6 +5,7 @@ module Lambda.UI.Draw
   ( drawApp
   , renderSubAgents
   , renderSubAgentsSelected
+  , renderInlineSubAgent
   ) where
 
 import Brick
@@ -24,7 +25,7 @@ import Lambda.Types
 import Lambda.UI.Types
 
 drawApp :: UIState -> [Widget ResourceName]
-drawApp st = [modalOverlay st, mainLayout st]
+drawApp st = [modalOverlay st, hudOverlay st, mainLayout st]
 
 modalOverlay :: UIState -> Widget ResourceName
 modalOverlay UIState{ uiCurrentPrompt = Just p } =
@@ -51,27 +52,72 @@ modalOverlay UIState{ uiCurrentPrompt = Just p } =
               ]
 modalOverlay _ = emptyWidget
 
+hudOverlay :: UIState -> Widget ResourceName
+hudOverlay UIState{ uiShowHud = True, .. } =
+  C.centerLayer $
+    withBorderStyle BS.unicodeRounded $
+      B.borderWithLabel (withAttr (attrName "hudTitle") (str " lambdA Intelligence HUD [^K / Alt+P or Esc to close] ")) $
+        hLimit 76 $ vLimit 24 $
+          padAll 1 $
+            vBox
+              [ withAttr (attrName "hudSection") (str "◆ ACTIVE GOAL")
+              , padLeft (Pad 2) $ txtWrap (extractGoal uiWorkingState)
+              , padTop (Pad 1) $ withAttr (attrName "hudSection") (str "◆ INVARIANTS")
+              , padLeft (Pad 2) $ renderInvariants uiWorkingState
+              , padTop (Pad 1) $ withAttr (attrName "hudSection") (str "◆ ACTIVE HYPOTHESIS")
+              , padLeft (Pad 2) $ txtWrap (extractHypothesis uiWorkingState)
+              , padTop (Pad 1) $ withAttr (attrName "hudSection") (str "◆ BLOCKED ON")
+              , padLeft (Pad 2) $ txtWrap (extractBlocked uiWorkingState)
+              , padTop (Pad 1) $ withAttr (attrName "hudSection") (str ("◆ SUBAGENTS (" <> show (Map.size uiSubAgents) <> ")"))
+              , padLeft (Pad 2) $ renderSubAgentList uiSubAgents
+              , padTop (Pad 1) $ withAttr (attrName "hudSection") (str "◆ KEYBINDINGS")
+              , padLeft (Pad 2) $
+                  vBox
+                    [ hBox [ withAttr (attrName "hudKey") (str "Tab         "), str "Toggle Plan / Exec mode (or autocomplete '/') " ]
+                    , hBox [ withAttr (attrName "hudKey") (str "^P / ^N     "), str "Previous / Next prompt history" ]
+                    , hBox [ withAttr (attrName "hudKey") (str "^K / Alt+P  "), str "Toggle this Intelligence HUD" ]
+                    , hBox [ withAttr (attrName "hudKey") (str "^T          "), str "Toggle Thinking/Reasoning visibility" ]
+                    , hBox [ withAttr (attrName "hudKey") (str "Esc Esc     "), str "Interrupt active generation or tool dispatch" ]
+                    , hBox [ withAttr (attrName "hudKey") (str "/help       "), str "Show full command reference in chat" ]
+                    ]
+              ]
+  where
+    extractGoal st =
+      case filter ("GOAL:" `T.isPrefixOf`) (T.lines st) of
+        (g:_) -> T.strip (T.drop 5 g)
+        []    -> "Awaiting task"
+    extractHypothesis st =
+      case filter ("ACTIVE_HYPOTHESIS:" `T.isPrefixOf`) (T.lines st) of
+        (h:_) -> T.strip (T.drop 18 h)
+        []    -> "None"
+    extractBlocked st =
+      case filter ("BLOCKED_ON:" `T.isPrefixOf`) (T.lines st) of
+        (b:_) -> T.strip (T.drop 11 b)
+        []    -> "None (Ready)"
+    renderInvariants st =
+      case filter ("INVARIANTS:" `T.isPrefixOf`) (T.lines st) of
+        (inv:_) -> txtWrap (T.strip (T.drop 11 inv))
+        []      -> str "No active invariants specified."
+    renderSubAgentList subs
+      | Map.null subs = withAttr (attrName "thinkingDim") $ str "No active subagents"
+      | otherwise = vBox (map renderSubShort (Map.elems subs))
+    renderSubShort SubAgentTask{..} =
+      hBox
+        [ withAttr (attrName "subRole") (str $ "[" <> T.unpack (T.toUpper subAgentRole) <> "] #" <> show subAgentId)
+        , str " - "
+        , withAttr (statusAttr subAgentStatus) (str $ formatStatus subAgentStatus)
+        , str " "
+        , withAttr (attrName "thinkingDim") (str $ "(" <> show subAgentTurnCount <> "/" <> show subAgentBudget <> "t)")
+        ]
+hudOverlay _ = emptyWidget
+
 mainLayout :: UIState -> Widget ResourceName
 mainLayout UIState{..} =
   vBox
-    [ headerBar uiMode currentDisplayTurns uiContextLimit uiModelName uiSelectedSubAgent
-    , hBox
-        [ -- Left Pane: Conversation turns or SubAgent Dialogue
-          renderLeftPane uiSelectedSubAgent uiTurns uiSubAgents
-        , -- Right Pane: Fixed 36-column sidebar for state & subagents
-          hLimit 36 $
-            vBox
-              [ vLimitPercent 45 $
-                  B.borderWithLabel (withAttr (attrName "paneTitle") (str " State Vector ")) $
-                    padLeftRight 1 (renderStateVector uiWorkingState)
-              , B.borderWithLabel (withAttr (attrName "paneTitle") (str " SubAgents ")) $
-                  viewport SubAgentView Vertical (renderSubAgentsSelected uiSelectedSubAgent uiSubAgents)
-              ]
-        ]
-    , -- Bottom Pane: Dedicated 3-row command editor
-      vLimit 3 $
-        B.borderWithLabel (inputLabel uiMode) $
-          E.renderEditor (txt . T.unlines) True uiEditor
+    [ headerBar uiWorkingState uiSelectedSubAgent
+    , renderMainPane uiSelectedSubAgent currentDisplayTurns uiSubAgents
+    , renderCompletion uiCompletion
+    , renderPowerlinePrompt uiMode uiModelName currentDisplayTurns uiContextLimit uiEditor
     ]
   where
     currentDisplayTurns = case uiSelectedSubAgent of
@@ -80,97 +126,89 @@ mainLayout UIState{..} =
         Nothing   -> uiTurns
       Nothing  -> uiTurns
 
-renderLeftPane :: Maybe Int -> [Turn] -> Map.Map Int SubAgentTask -> Widget ResourceName
-renderLeftPane Nothing turns _ =
-  B.borderWithLabel (withAttr (attrName "paneTitle") (str " Conversation ")) $
-    viewport ChatView Vertical (padLeftRight 1 (vBox (map renderTurn turns)))
-renderLeftPane (Just sId) _ subs =
+renderMainPane :: Maybe Int -> [Turn] -> Map.Map Int SubAgentTask -> Widget ResourceName
+renderMainPane Nothing turns subs =
+  viewport ChatView Vertical $
+    padLeftRight 1 $
+      vBox
+        [ vBox (map renderTurn turns)
+        , if Map.null subs
+            then emptyWidget
+            else padTop (Pad 1) $ vBox (map renderInlineSubAgent (Map.elems subs))
+        ]
+renderMainPane (Just sId) _ subs =
   case Map.lookup sId subs of
     Just task ->
       let roleUpper = T.unpack (T.toUpper (subAgentRole task))
-          title = " SubAgent #" <> show sId <> " [" <> roleUpper <> "] Dialogue [Alt+← Main | Alt+→ Next | Esc Exit] "
-          turns = subAgentTurns task
-          renderedContent =
-            if null turns
+          banner = withAttr (attrName "selectedBadge") $
+            str $ " ◄ SUBAGENT #" <> show sId <> " [" <> roleUpper <> "] DIALOGUE (Press Esc to return to Main Chat) ► "
+          renderedTurns =
+            if null (subAgentTurns task)
               then padAll 1 (withAttr (attrName "thinkingDim") $ str "No dialogue turns recorded for this subagent yet.")
-              else vBox (map renderTurn turns)
-      in B.borderWithLabel (withAttr (attrName "paneTitle") (str title)) $
-           viewport ChatView Vertical (padLeftRight 1 renderedContent)
+              else vBox (map renderTurn (subAgentTurns task))
+      in vBox
+           [ C.hCenter banner
+           , viewport ChatView Vertical (padLeftRight 1 renderedTurns)
+           ]
     Nothing ->
-      B.borderWithLabel (withAttr (attrName "paneTitle") (str " SubAgent Dialogue ")) $
-        viewport ChatView Vertical (padAll 1 $ withAttr (attrName "toolError") $ str ("SubAgent #" <> show sId <> " not found."))
+      viewport ChatView Vertical (padAll 1 $ withAttr (attrName "toolError") $ str ("SubAgent #" <> show sId <> " not found."))
 
-headerBar :: AgentMode -> [Turn] -> Int -> Text -> Maybe Int -> Widget ResourceName
-headerBar mode turns ctxLimit model mSelected =
+headerBar :: Text -> Maybe Int -> Widget ResourceName
+headerBar workingState mSelected =
   vLimit 1 $
     withAttr (attrName "headerBar") $
       hBox
         [ withAttr (attrName "titleLogo") (str " λ lambdA ")
         , str " │ "
-        , modeBadge mode
+        , str "Goal: "
+        , txt (extractGoal workingState)
         , case mSelected of
-            Just sId -> hBox [ str " │ ", withAttr (attrName "selectedBadge") (str $ " [VIEWING SUBAGENT #" <> show sId <> "] ") ]
+            Just sId -> hBox [ str " │ ", withAttr (attrName "selectedBadge") (str $ " [SUBAGENT #" <> show sId <> "] ") ]
             Nothing  -> emptyWidget
-        , str " │ "
-        , contextBadge
-        , str " │ "
-        , withAttr (attrName "modelBadge") (str ("Model: " <> T.unpack model))
         , fill ' '
-        , str "[Alt+←/→: SubAgents]  [^P/^N: Hist]  [^T: Think]  [Esc Esc: Stop]  [/help] "
+        , txt (extractBlocked workingState)
+        , str " "
         ]
   where
-    currentTokens = estimateTotalTokens turns
-    pct = if ctxLimit <= 0 then 0 else (currentTokens * 100) `div` ctxLimit
-    formatK n
-      | n >= 1000 = show (n `div` 1000) <> "." <> show ((n `mod` 1000) `div` 100) <> "k"
-      | otherwise = show n
-    ctxStr = "Ctx: " <> formatK currentTokens <> " / " <> formatK ctxLimit <> " (" <> show pct <> "%)"
-    ctxAttr
-      | pct >= 90 = attrName "ctxHigh"
-      | pct >= 70 = attrName "ctxWarn"
-      | otherwise = attrName "ctxNormal"
-    contextBadge = withAttr ctxAttr (str ctxStr)
-
-inputLabel :: AgentMode -> Widget ResourceName
-inputLabel PlanMode =
-  hBox [ withAttr (attrName "planBadge") (str " PLAN ") , str " [Read-Only] Enter prompt or /help " ]
-inputLabel ExecMode =
-  hBox [ withAttr (attrName "execBadge") (str " EXEC ") , str " [Full-Access] Enter command or /help " ]
-
-modeBadge :: AgentMode -> Widget ResourceName
-modeBadge PlanMode = withAttr (attrName "planBadge") $ str " [PLAN] "
-modeBadge ExecMode = withAttr (attrName "execBadge") $ str " [EXEC] "
+    extractGoal st =
+      case filter ("GOAL:" `T.isPrefixOf`) (T.lines st) of
+        (g:_) -> T.strip (T.drop 5 g)
+        []    -> "Awaiting task"
+    extractBlocked st =
+      case filter ("BLOCKED_ON:" `T.isPrefixOf`) (T.lines st) of
+        (b:_) -> "● " <> T.strip b
+        []    -> "✓ Ready"
 
 renderTurn :: Turn -> Widget ResourceName
+renderTurn (Turn _ UserRole blocks) =
+  padBottom (Pad 1) $
+    hBox
+      [ withAttr (attrName "userAccent") (str "▎ ")
+      , vBox (map renderBlock blocks)
+      ]
 renderTurn (Turn tId role blocks) =
   padBottom (Pad 1) $
     vBox
-      [ withAttr (roleAttr role) (str $ rolePrefix role <> " Turn #" <> show tId)
+      [ if role == SystemRole
+          then withAttr (attrName "systemRole") (str $ "● system (Turn #" <> show tId <> ")")
+          else emptyWidget
       , vBox (map renderBlock blocks)
+      , if role == AssistantRole
+          then padLeft (Pad 2) $ withAttr (attrName "turnFooter") (str "■ Plan · assistant")
+          else emptyWidget
       ]
-  where
-    roleAttr SystemRole    = attrName "systemRole"
-    roleAttr UserRole      = attrName "userRole"
-    roleAttr AssistantRole = attrName "assistantRole"
-    roleAttr ToolRole      = attrName "toolRole"
-
-    rolePrefix SystemRole    = "● system"
-    rolePrefix UserRole      = "● user"
-    rolePrefix AssistantRole = "● lambdA"
-    rolePrefix ToolRole      = "● tool"
 
 renderBlock :: ContentBlock -> Widget ResourceName
 renderBlock (TextBlock t) =
   padLeft (Pad 2) $ txtWrap t
 renderBlock (ThinkingBlock tId body vis) =
-  padLeft (Pad 2) $
-    clickable (ThinkingFold tId) $
+  clickable (ThinkingFold tId) $
+    padLeft (Pad 2) $
       case vis of
-        Collapsed -> withAttr (attrName "thinkingDim") $ str "▶ [Thinking] (press ^T or /think to expand)"
+        Collapsed -> withAttr (attrName "thinkingDim") $ str "▶ Thought (press ^T or click to expand)"
         Visible   ->
-          withBorderStyle BS.unicodeRounded $
-            B.borderWithLabel (str " Reasoning Scratchpad ") $
-              padAll 1 (txtWrap body)
+          withAttr (attrName "thinkingDim") $
+            txtWrap ("Thinking: " <> body)
 renderBlock (ToolCallBlock tc) =
   padLeft (Pad 2) $
     withAttr (attrName "toolCall") $
@@ -193,16 +231,85 @@ renderBlock (ToolResultBlock tr) =
           Nothing -> emptyWidget
       ]
 
-renderStateVector :: Text -> Widget ResourceName
-renderStateVector rawText =
-  vBox $ map (txtWrap . formatStateLine) (T.lines rawText)
+renderInlineSubAgent :: SubAgentTask -> Widget ResourceName
+renderInlineSubAgent SubAgentTask{..} =
+  clickable (SubAgentItem subAgentId) $
+    padBottom (Pad 1) $
+      withBorderStyle BS.unicodeRounded $
+        B.border $
+          padLeftRight 1 $
+            vBox
+              [ vLimit 1 $ hBox
+                  [ withAttr (attrName "subRole") (str $ "◆ SubAgent #" <> show subAgentId <> " [" <> T.unpack (T.toUpper subAgentRole) <> "]")
+                  , str " "
+                  , withAttr (statusAttr subAgentStatus) (str $ "[" <> formatStatus subAgentStatus <> "]")
+                  , vLimit 1 (fill ' ')
+                  , withAttr (attrName "thinkingDim") (str $ show subAgentTurnCount <> "/" <> show subAgentBudget <> "t  [click or /sub " <> show subAgentId <> "]")
+                  ]
+              , padLeft (Pad 2) $ withAttr (attrName "thinkingDim") $ txtWrap (T.take 80 subAgentHypothesis)
+              , case subAgentArtifact of
+                  Just p  -> padLeft (Pad 2) $ withAttr (attrName "artifact") (str $ "-> artifact: " <> take 40 p)
+                  Nothing -> emptyWidget
+              ]
+
+renderCompletion :: Maybe CompletionState -> Widget ResourceName
+renderCompletion Nothing = emptyWidget
+renderCompletion (Just (CompletionState matches sel))
+  | null matches = emptyWidget
+  | otherwise =
+      padLeft (Pad 2) $
+        hLimit 64 $
+          withBorderStyle BS.unicodeRounded $
+            B.borderWithLabel (withAttr (attrName "compBorder") (str " Commands (Tab to complete, Esc to dismiss) ")) $
+              vBox (zipWith renderItem [0..] (take 6 matches))
   where
-    formatStateLine l
-      | "GOAL:" `T.isPrefixOf` l             = "🎯 " <> l
-      | "INVARIANTS:" `T.isPrefixOf` l       = "🛡️  " <> l
-      | "ACTIVE_HYPOTHESIS:" `T.isPrefixOf` l = "💡 " <> l
-      | "BLOCKED_ON:" `T.isPrefixOf` l       = "⏳ " <> l
-      | otherwise                            = l
+    renderItem idx item =
+      let isSel = idx == sel
+          itemAttr = if isSel then attrName "compSelected" else attrName "compItem"
+          prefix = if isSel then "> " else "  "
+          desc = commandDesc item
+      in withAttr itemAttr $
+           padLeftRight 1 $
+             hBox [ txt (prefix <> item), fill ' ', withAttr (attrName "thinkingDim") (txt desc) ]
+
+commandDesc :: Text -> Text
+commandDesc "/plan"     = "Switch to Plan mode (read-only)"
+commandDesc "/exec"     = "Switch to Exec mode (full access)"
+commandDesc "/think"    = "Toggle reasoning visibility"
+commandDesc "/session"  = "List and switch sessions"
+commandDesc "/sub"      = "Inspect SubAgent dialogue (/sub <id>)"
+commandDesc "/trace"    = "Export markdown session trace"
+commandDesc "/compact"  = "Trigger manual context compaction"
+commandDesc "/clear"    = "Clear conversation history"
+commandDesc "/new"      = "Start fresh session"
+commandDesc "/help"     = "Show commands and keybindings"
+commandDesc "/quit"     = "Exit lambdA"
+commandDesc _           = ""
+
+renderPowerlinePrompt :: AgentMode -> Text -> [Turn] -> Int -> E.Editor Text ResourceName -> Widget ResourceName
+renderPowerlinePrompt mode model turns ctxLimit editor =
+  padTop (Pad 1) $
+    hBox
+      [ withAttr (attrName "promptLogo") (str " λ ")
+      , withAttr (attrName "promptDivider") (str " \\ ")
+      , withAttr (attrName "promptModel") (txt (if T.null model then "openrouter" else model))
+      , withAttr (attrName "promptDivider") (str " \\ ")
+      , withAttr ctxAttr (str (show pct <> "%"))
+      , withAttr (attrName "promptDivider") (str " \\ ")
+      , modeWidget mode
+      , withAttr (attrName "promptArrow") (str " > ")
+      , E.renderEditor (txt . T.unlines) True editor
+      ]
+  where
+    currentTokens = estimateTotalTokens turns
+    pct = if ctxLimit <= 0 then 0 else (currentTokens * 100) `div` ctxLimit
+    ctxAttr
+      | pct >= 90 = attrName "ctxHigh"
+      | pct >= 70 = attrName "ctxWarn"
+      | otherwise = attrName "ctxNormal"
+    modeWidget PlanMode = withAttr (attrName "promptPlanMode") (str " plan ")
+    modeWidget ExecMode = withAttr (attrName "promptExecMode") (str " exec ")
+
 
 renderSubAgents :: Map.Map Int SubAgentTask -> Widget ResourceName
 renderSubAgents = renderSubAgentsSelected Nothing
@@ -236,11 +343,13 @@ renderSubAgentsSelected mSelected subs
                 ]
       in clickable (SubAgentItem subAgentId) taskWidget
 
-    formatStatus SubAgentRunning      = "RUNNING"
-    formatStatus (SubAgentSuccess _)  = "SUCCESS"
-    formatStatus (SubAgentBlocked _)  = "BLOCKED"
-    formatStatus (SubAgentFailed _)   = "FAILED"
+formatStatus :: SubAgentStatus -> String
+formatStatus SubAgentRunning      = "RUNNING"
+formatStatus (SubAgentSuccess _)  = "SUCCESS"
+formatStatus (SubAgentBlocked _)  = "BLOCKED"
+formatStatus (SubAgentFailed _)   = "FAILED"
 
-    statusAttr SubAgentRunning     = attrName "subRunning"
-    statusAttr (SubAgentSuccess _) = attrName "subSuccess"
-    statusAttr _                   = attrName "subFailed"
+statusAttr :: SubAgentStatus -> AttrName
+statusAttr SubAgentRunning     = attrName "subRunning"
+statusAttr (SubAgentSuccess _) = attrName "subSuccess"
+statusAttr _                   = attrName "subFailed"

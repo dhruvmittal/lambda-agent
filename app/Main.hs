@@ -73,6 +73,21 @@ theApp = App
       , (attrName "ctxWarn",        fg V.yellow `V.withStyle` V.bold)
       , (attrName "ctxHigh",        fg V.brightRed `V.withStyle` V.bold)
       , (attrName "modelBadge",     fg V.brightMagenta)
+      , (attrName "promptLogo",     fg V.brightWhite `V.withStyle` V.bold)
+      , (attrName "promptModel",    fg V.brightMagenta)
+      , (attrName "promptDivider",  fg V.brightBlack)
+      , (attrName "promptArrow",    fg V.brightCyan `V.withStyle` V.bold)
+      , (attrName "promptPlanMode", V.black `on` V.cyan)
+      , (attrName "promptExecMode", V.black `on` V.yellow)
+      , (attrName "userAccent",     fg V.brightMagenta `V.withStyle` V.bold)
+      , (attrName "turnFooter",     fg V.brightBlack)
+      , (attrName "hudBorder",      fg V.brightCyan)
+      , (attrName "hudTitle",       fg V.brightWhite `V.withStyle` V.bold)
+      , (attrName "hudSection",     fg V.brightYellow `V.withStyle` V.bold)
+      , (attrName "hudKey",         fg V.cyan)
+      , (attrName "compSelected",   V.black `on` V.brightCyan)
+      , (attrName "compItem",       fg V.white)
+      , (attrName "compBorder",     fg V.brightBlack)
       ]
   }
 
@@ -244,6 +259,8 @@ main = do
         , uiModelName      = modelName cfg
         , uiThinkingVisible  = True
         , uiSelectedSubAgent = Nothing
+        , uiShowHud          = False
+        , uiCompletion       = Nothing
         }
 
   -- 10. Run Brick TUI

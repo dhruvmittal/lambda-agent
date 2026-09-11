@@ -21,7 +21,15 @@ data ResourceName
   | ButtonOnce
   | ButtonNo
   | ButtonNever
+  | HudOverlay
+  | HudScroll
+  | CompletionPopup
   deriving (Eq, Ord, Show)
+
+data CompletionState = CompletionState
+  { compMatches  :: ![Text]
+  , compSelected :: !Int
+  } deriving (Eq, Show)
 
 data UIState = UIState
   { uiTurns            :: ![Turn]
@@ -40,4 +48,6 @@ data UIState = UIState
   , uiModelName        :: !Text
   , uiThinkingVisible  :: !Bool
   , uiSelectedSubAgent :: !(Maybe Int)
+  , uiShowHud          :: !Bool
+  , uiCompletion       :: !(Maybe CompletionState)
   }
