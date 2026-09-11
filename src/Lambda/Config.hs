@@ -14,6 +14,7 @@ module Lambda.Config
   , resolveModelAlias
   , lookupModelContextLimit
   , curatedModels
+  , resolveEnvTemplates
   , loadConfig
   ) where
 
@@ -291,16 +292,27 @@ loadConfig wsRoot = do
           Just v | not (null v) -> Just v
           _                     -> Map.lookup name dotEnvMap
 
-  -- Environment variable overrides with fallbacks for OpenRouter & OpenAI
-  mEnvKey <- lookupVar "LAMBDA_API_KEY" >>= \case
+  -- Resolve {ENV:VAR} placeholders in mergedCfg fields
+  cfgKeyResolved  <- resolveEnvTemplates lookupVar (apiKey mergedCfg)
+  cfgUrlResolved  <- resolveEnvTemplates lookupVar (apiBaseUrl mergedCfg)
+  cfgModResolved  <- resolveEnvTemplates lookupVar (modelName mergedCfg)
+  cfgHdrsResolved <- mapM (resolveEnvTemplates lookupVar) (customHeaders mergedCfg)
+
+  mExplicitLambdaKey <- lookupVar "LAMBDA_API_KEY"
+  mFallbackKey <- lookupVar "OPENROUTER_API_KEY" >>= \case
     Just k | not (null k) -> pure (Just k)
-    _ -> lookupVar "OPENROUTER_API_KEY" >>= \case
-      Just k | not (null k) -> pure (Just k)
-      _ -> lookupVar "OPENAI_API_KEY"
+    _ -> lookupVar "OPENAI_API_KEY"
+
+  let finalKey = case mExplicitLambdaKey of
+        Just k | not (null k)           -> T.pack k
+        _ | not (T.null cfgKeyResolved) -> cfgKeyResolved
+        _                               -> maybe "" T.pack mFallbackKey
 
   mEnvUrl <- lookupVar "LAMBDA_BASE_URL" >>= \case
     Just u | not (null u) -> pure (Just u)
     _ -> lookupVar "OPENAI_BASE_URL"
+
+  let finalUrl = maybe cfgUrlResolved T.pack mEnvUrl
 
   mEnvMod <- lookupVar "LAMBDA_MODEL" >>= \case
     Just m | not (null m) -> pure (Just m)
@@ -308,15 +320,14 @@ loadConfig wsRoot = do
       Just m | not (null m) -> pure (Just m)
       _ -> lookupVar "OPENAI_MODEL"
 
+  let finalMod = maybe cfgModResolved T.pack mEnvMod
+
   mEnvLimit <- lookupVar "CONTEXT_LIMIT"
   let finalLimit = case mEnvLimit of
         Just l | [(n, "")] <- reads l, n > 0 -> n
         _ -> contextWindowLimit mergedCfg
 
-  let finalKey = maybe (apiKey mergedCfg) T.pack mEnvKey
-      finalUrl = maybe (apiBaseUrl mergedCfg) T.pack mEnvUrl
-      finalMod = maybe (modelName mergedCfg) T.pack mEnvMod
-      artDir   = wsRoot </> ".lambda" </> "artifacts"
+  let artDir = wsRoot </> ".lambda" </> "artifacts"
 
   createDirectoryIfMissing True artDir
   createDirectoryIfMissing True (home </> ".config" </> "lambdA")
@@ -325,10 +336,34 @@ loadConfig wsRoot = do
     { apiBaseUrl         = finalUrl
     , apiKey             = finalKey
     , modelName          = finalMod
+    , customHeaders      = cfgHdrsResolved
     , workspaceRoot      = wsRoot
     , artifactDir        = artDir
     , contextWindowLimit = finalLimit
     }
+
+-- | Resolve "{ENV:VAR_NAME}" or "{env:VAR_NAME}" placeholders using a lookup function
+resolveEnvTemplates :: (String -> IO (Maybe String)) -> Text -> IO Text
+resolveEnvTemplates lookupFn txt
+  | "{ENV:" `T.isInfixOf` txt || "{env:" `T.isInfixOf` txt = do
+      let (before, rest) = case T.breakOn "{ENV:" txt of
+            (b, r) | not (T.null r) -> (b, r)
+            _                       -> T.breakOn "{env:" txt
+      if T.null rest
+        then pure txt
+        else do
+          let afterPrefix = T.drop 5 rest -- drops "{ENV:" or "{env:"
+              (varName, afterClose) = T.breakOn "}" afterPrefix
+          if T.null afterClose
+            then pure txt
+            else do
+              let cleanVar = T.unpack (T.strip varName)
+              mVal <- lookupFn cleanVar
+              let resolvedVal = maybe "" T.pack mVal
+                  remainder = T.drop 1 afterClose -- drops "}"
+              restResolved <- resolveEnvTemplates lookupFn remainder
+              pure (before <> resolvedVal <> restResolved)
+  | otherwise = pure txt
 
 -- | Simple parser for KEY=VALUE pairs in .env / .env.local files
 parseDotEnv :: Text -> [(String, String)]

@@ -22,7 +22,7 @@ import System.Environment (setEnv, unsetEnv)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
 
-import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), resolveModelAlias, lookupModelContextLimit)
+import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), resolveModelAlias, lookupModelContextLimit, resolveEnvTemplates)
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro, expandPromptMacro)
 import Lambda.Core.EngineInterface (initEngineChannels, cmdQueue, startEngineLoop, EngineChannels(..))
 import Lambda.Core.ModelDriver (ModelDriver(..))
@@ -247,7 +247,42 @@ testConfigFallbacks = do
   assert "OPENROUTER_MODEL populated modelName" (modelName cfg == "meta-llama/llama-3.3-70b-instruct:free")
   unsetEnv "OPENROUTER_API_KEY"
   unsetEnv "OPENROUTER_MODEL"
-  putStrLn "  -> OK: OpenRouter environment variables reliably detected and loaded."
+
+  -- Test {ENV:VAR} template resolution helper
+  let mockLookup "SECRET_OPENAI_KEY" = pure (Just "sk-secret-openai-value")
+      mockLookup "PORT"              = pure (Just "8080")
+      mockLookup _                   = pure Nothing
+
+  res1 <- resolveEnvTemplates mockLookup "{ENV:SECRET_OPENAI_KEY}"
+  assert "resolveEnvTemplates resolves exact {ENV:VAR}" (res1 == "sk-secret-openai-value")
+
+  res2 <- resolveEnvTemplates mockLookup "{env:SECRET_OPENAI_KEY}"
+  assert "resolveEnvTemplates resolves lowercase {env:VAR}" (res2 == "sk-secret-openai-value")
+
+  res3 <- resolveEnvTemplates mockLookup "http://localhost:{ENV:PORT}/v1"
+  assert "resolveEnvTemplates resolves embedded {ENV:VAR}" (res3 == "http://localhost:8080/v1")
+
+  res4 <- resolveEnvTemplates mockLookup "sk-plain-text-key"
+  assert "resolveEnvTemplates preserves plain text keys" (res4 == "sk-plain-text-key")
+
+  -- Test {ENV:...} inside .lambda/config.json via loadConfig
+  let tempCfgDir = "/tmp/lambda_test_env_template_cfg"
+      localLambdaDir = tempCfgDir </> ".lambda"
+  createDirectoryIfMissing True localLambdaDir
+  TIO.writeFile (localLambdaDir </> "config.json")
+    "{\n  \"api_key\": \"{ENV:DYNAMIC_PROVIDER_KEY}\",\n  \"api_base_url\": \"https://api.openai.com/v1\"\n}\n"
+  setEnv "DYNAMIC_PROVIDER_KEY" "sk-dynamic-from-env-var-12345"
+
+  cfgWithTemplate <- loadConfig tempCfgDir
+  assert "loadConfig resolves {ENV:DYNAMIC_PROVIDER_KEY} from config.json"
+    (apiKey cfgWithTemplate == "sk-dynamic-from-env-var-12345")
+  assert "loadConfig preserved api_base_url from config.json"
+    (apiBaseUrl cfgWithTemplate == "https://api.openai.com/v1")
+
+  unsetEnv "DYNAMIC_PROVIDER_KEY"
+  removeDirectoryRecursive tempCfgDir
+
+  putStrLn "  -> OK: OpenRouter environment variables and {ENV:...} template resolution reliably loaded."
 
 -- 7. Verify Directory Listing and Fallback
 testDirectoryTools :: IO ()
