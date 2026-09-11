@@ -124,7 +124,9 @@ executeToolDispatch AppEngineState{..} caller grantedGlobs ToolCall{..} = do
                     pure True
 
             MainAgent -> do
-              checkAuthorization appSecurity caller displayCmd toolCallArgs
+              if toolCallName == "spawn_specialist_subagent" || (toolCapability == ReadOnly && not requiresExplicitPermission)
+                then pure True
+                else checkAuthorization appSecurity caller displayCmd toolCallArgs
 
           if not authorized
             then pure $ ToolResult toolCallId ""

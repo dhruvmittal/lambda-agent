@@ -214,6 +214,7 @@ defaultAllowGlobs =
   , "cat *"
   , "read_file*"
   , "list_directory*"
+  , "spawn_specialist_subagent*"
   , "sd_*"
   ]
 
