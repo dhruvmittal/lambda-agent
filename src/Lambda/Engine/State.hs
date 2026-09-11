@@ -37,6 +37,8 @@ import Lambda.Types
 
 data AppEngineState = AppEngineState
   { appConfig       :: !Config
+  , appActiveModel  :: !(TVar Text)
+  , appContextLimit :: !(TVar Int)
   , appMode         :: !(TVar AgentMode)
   , appTurns        :: !(TVar [Turn])
   , appTurnCounter  :: !(TVar Int)
@@ -49,6 +51,7 @@ data AppEngineState = AppEngineState
   , appInterrupted  :: !(TVar Bool)
   , appSession      :: !(TVar Session)
   , appSessionDir   :: !FilePath
+  , appUndoStack    :: !(TVar [[Turn]])
   }
 
 initEngineState :: Config -> ToolRegistry -> SecurityState -> IO AppEngineState
@@ -79,8 +82,13 @@ initEngineStateWithSession cfg reg sec maybeSess = do
   evQueue   <- newTQueueIO
   intrVar   <- newTVarIO False
   sessVar   <- newTVarIO sess
+  undoVar   <- newTVarIO []
+  activeModVar <- newTVarIO (modelName cfg)
+  ctxLimitVar  <- newTVarIO (contextWindowLimit cfg)
   pure AppEngineState
     { appConfig       = cfg
+    , appActiveModel  = activeModVar
+    , appContextLimit = ctxLimitVar
     , appMode         = modeVar
     , appTurns        = turnsVar
     , appTurnCounter  = tCountVar
@@ -93,6 +101,7 @@ initEngineStateWithSession cfg reg sec maybeSess = do
     , appInterrupted  = intrVar
     , appSession      = sessVar
     , appSessionDir   = sessDir
+    , appUndoStack    = undoVar
     }
 
 addTurn :: AppEngineState -> Role -> [ContentBlock] -> IO Turn

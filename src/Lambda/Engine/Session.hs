@@ -16,6 +16,7 @@ module Lambda.Engine.Session
   , getLatestSession
   , pruneSessions
   , sessionToMeta
+  , forkSession
   , renderSessionTraceMarkdown
   , exportSessionTrace
   ) where
@@ -60,6 +61,7 @@ import Lambda.Types
 -- | Persistent session representation
 data Session = Session
   { sessionId           :: !Text
+  , sessionParentId     :: !(Maybe Text)
   , sessionCreatedAt     :: !UTCTime
   , sessionUpdatedAt     :: !UTCTime
   , sessionTitle         :: !Text
@@ -73,6 +75,7 @@ data Session = Session
 instance Aeson.ToJSON Session where
   toJSON Session{..} = Aeson.object
     [ "session_id"     .= sessionId
+    , "parent_id"      .= sessionParentId
     , "created_at"     .= sessionCreatedAt
     , "updated_at"     .= sessionUpdatedAt
     , "title"          .= sessionTitle
@@ -86,6 +89,7 @@ instance Aeson.ToJSON Session where
 instance Aeson.FromJSON Session where
   parseJSON = Aeson.withObject "Session" $ \obj -> do
     sessionId           <- obj .: "session_id"
+    sessionParentId     <- obj .:? "parent_id"
     sessionCreatedAt    <- obj .: "created_at"
     sessionUpdatedAt    <- obj .: "updated_at"
     sessionTitle        <- obj .: "title"
@@ -99,6 +103,7 @@ instance Aeson.FromJSON Session where
 -- | Lightweight session descriptor for listings and selection menus
 data SessionMeta = SessionMeta
   { metaId            :: !Text
+  , metaParentId      :: !(Maybe Text)
   , metaCreatedAt     :: !UTCTime
   , metaUpdatedAt     :: !UTCTime
   , metaTitle         :: !Text
@@ -114,6 +119,7 @@ instance Aeson.FromJSON SessionMeta
 sessionToMeta :: Session -> SessionMeta
 sessionToMeta Session{..} = SessionMeta
   { metaId            = sessionId
+  , metaParentId      = sessionParentId
   , metaCreatedAt     = sessionCreatedAt
   , metaUpdatedAt     = sessionUpdatedAt
   , metaTitle         = sessionTitle
@@ -137,6 +143,7 @@ newSession = do
   sid <- newSessionId
   pure Session
     { sessionId           = sid
+    , sessionParentId     = Nothing
     , sessionCreatedAt     = now
     , sessionUpdatedAt     = now
     , sessionTitle         = "New Session"
@@ -146,6 +153,24 @@ newSession = do
     , sessionStateVector   = Map.empty
     , sessionPromptHistory = []
     }
+
+-- | Forks an existing session with its current turns into a new child session
+forkSession :: FilePath -> Session -> Maybe Text -> IO Session
+forkSession sessionsDir parentSess mTitle = do
+  newSid <- newSessionId
+  now <- getCurrentTime
+  let childTitle = case mTitle of
+        Just t | not (T.null (T.strip t)) -> T.strip t
+        _                                 -> sessionTitle parentSess <> " (fork)"
+      childSess = parentSess
+        { sessionId           = newSid
+        , sessionParentId     = Just (sessionId parentSess)
+        , sessionCreatedAt     = now
+        , sessionUpdatedAt     = now
+        , sessionTitle         = childTitle
+        }
+  saveSession sessionsDir 0 childSess
+  pure childSess
 
 -- | Derive a clean title from the first prompt (truncated to 60 chars)
 deriveTitle :: Text -> Text

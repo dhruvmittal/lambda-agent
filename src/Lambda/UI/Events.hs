@@ -26,8 +26,10 @@ import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
 import qualified Graphics.Vty as V
 import System.Posix.Signals (raiseSignal, sigTSTP)
+import Text.Read (readMaybe)
 
 import Lambda.Core.EngineInterface (EngineChannels(..))
+import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro)
 import Lambda.Engine.Security (resolvePrompt)
 import Lambda.Engine.Session
   ( SessionMeta(..)
@@ -80,6 +82,9 @@ handleAppEvent (AppEvent engineEv) = do
         Nothing -> s { uiCurrentPrompt = Just prompt }
         Just _  -> s { uiPendingPrompts = uiPendingPrompts s |> prompt }
     EvPermissionResolved _ _ -> pure ()
+    EvModelSwitched newModel newLimit -> do
+      modify $ \s -> s { uiModelName = newModel, uiContextLimit = newLimit }
+      vScrollToEnd (viewportScroll ChatView)
     EvError err -> do
       tId <- gets (\s -> negate (1000 + length (uiTurns s)))
       modify $ \s -> s
@@ -491,8 +496,12 @@ handleCommand cmdText = do
             , "  /plan          - Switch to Plan mode (read-only inspection, destructive tools disabled)"
             , "  /exec          - Switch to Exec mode (full tool execution access)"
             , "  /mode [mode]   - Inspect or switch active mode (/mode plan, /mode exec)"
+            , "  /model [name]  - Inspect or switch active model (/model claude, /model r1, /model 4o)"
             , "  /think         - Toggle reasoning / thinking block visibility"
             , "  /session       - List recent sessions (/session <id> to switch, /session prune <N>)"
+            , "  /fork [title]  - Fork active conversation into a new child session"
+            , "  /rewind [N]    - Rewind conversation by N turn pairs (alias: /undo)"
+            , "  /prompt [name] - Run or list prompt templates from .lambda/prompts/*.md (alias: /p)"
             , "  /sub <id>      - Inspect SubAgent dialogue and thought trace (/sub main to return)"
             , "  /trace         - Export current session to formatted Markdown artifact"
             , "  /compact       - Trigger manual context compaction of earlier conversation turns"
@@ -568,6 +577,48 @@ handleCommand cmdText = do
       let modeStr = if uiMode st == PlanMode then "Plan (read-only)" else "Exec (full access)"
       liftIO $ atomically $ writeTBQueue (cmdQueue channels)
         (CmdSystemMessage $ "Current mode: " <> modeStr <> "\nUse '/mode plan' or '/mode exec' (or press Alt+M) to switch.")
+    "/model" -> do
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+        (CmdSystemMessage $ "Active model: " <> uiModelName st <> " (context limit: " <> T.pack (show (uiContextLimit st)) <> " tokens)\nUse '/model <name_or_alias>' (or /model <Tab>) to switch.")
+    cmd | "/model " `T.isPrefixOf` cmd -> do
+      let target = T.strip (T.drop 7 cmd)
+      if T.null target
+        then liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+               (CmdSystemMessage "Usage: /model <model_id_or_alias>")
+        else liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSetModel target)
+    "/fork" -> do
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdForkSession Nothing)
+    cmd | "/fork " `T.isPrefixOf` cmd -> do
+      let title = T.strip (T.drop 6 cmd)
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdForkSession (if T.null title then Nothing else Just title))
+    "/undo" -> do
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdRewindTurns 1)
+    cmd | cmd `elem` ["/rewind", "/undo"] -> do
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdRewindTurns 1)
+    cmd | "/rewind " `T.isPrefixOf` cmd || "/undo " `T.isPrefixOf` cmd -> do
+      let rawArg = T.strip (if "/rewind " `T.isPrefixOf` cmd then T.drop 8 cmd else T.drop 6 cmd)
+          count = case readMaybe (T.unpack rawArg) of
+                    Just c | c > 0 -> c
+                    _              -> 1
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdRewindTurns count)
+    cmd | cmd `elem` ["/prompt", "/p"] -> do
+      macroNames <- liftIO $ listPromptMacros "."
+      if null macroNames
+        then liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+               (CmdSystemMessage "No prompt templates found in .lambda/prompts/*.md. Create templates with $input to use with /prompt <name> [args].")
+        else do
+          let msg = "Available prompt templates (.lambda/prompts/*.md):\n"
+                    <> T.unlines (map (\n -> "  /p " <> n) macroNames)
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSystemMessage msg)
+    cmd | "/prompt " `T.isPrefixOf` cmd || "/p " `T.isPrefixOf` cmd -> do
+      let rawPromptArg = T.strip (if "/prompt " `T.isPrefixOf` cmd then T.drop 8 cmd else T.drop 3 cmd)
+          (macroName, rawArgs) = T.break (== ' ') rawPromptArg
+      res <- liftIO $ loadPromptMacro "." macroName (T.strip rawArgs)
+      case res of
+        Left err ->
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSystemMessage err)
+        Right expanded -> do
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdUserPrompt expanded)
     cmd | cmd `elem` ["/think", "/thinking"] -> do
       let newVis = not (uiThinkingVisible st)
           targetVis = if newVis then Visible else Collapsed

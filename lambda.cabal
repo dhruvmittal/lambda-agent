@@ -42,6 +42,7 @@ library
         Lambda.Engine.SubAgent
         Lambda.Engine.Artifacts
         Lambda.Engine.Session
+        Lambda.Engine.PromptMacro
         Lambda.UI.Types
         Lambda.UI.Draw
         Lambda.UI.Events

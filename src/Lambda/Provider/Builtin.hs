@@ -9,6 +9,8 @@ module Lambda.Provider.Builtin
   , readFileTool
   , writeFileTool
   , editFileTool
+  , renderDiffBlock
+  , applyWhitespaceTolerantEdit
   ) where
 
 import Control.Exception (SomeException, try)
@@ -260,17 +262,61 @@ editFileTool wsRoot = ToolDefinition
             else do
               content <- TIO.readFile fullPath
               let occurrences = T.count target content
-              if occurrences == 0
-                then pure $ ToolResult "" "" "Target string not found in file. Edit aborted." Nothing
+              if occurrences == 1
+                then do
+                  let updated = T.replace target replacement content
+                  TIO.writeFile fullPath updated
+                  let diff = renderDiffBlock relPath target replacement
+                  pure $ ToolResult "" ("Successfully edited file: " <> relPath <> "\n" <> diff) "" Nothing
                 else if occurrences > 1
                   then pure $ ToolResult "" ""
                          ("Ambiguous target string: found " <> T.pack (show occurrences) <> " occurrences in " <> relPath <> ". Please provide more surrounding context in 'target' to ensure a unique match.")
                          Nothing
-                  else do
-                    let updated = T.replace target replacement content
-                    TIO.writeFile fullPath updated
-                    pure $ ToolResult "" ("Successfully edited file: " <> relPath) "" Nothing
+                else do
+                  -- Fallback to whitespace-tolerant matching
+                  case applyWhitespaceTolerantEdit content target replacement of
+                    Left err -> pure $ ToolResult "" "" err Nothing
+                    Right updated -> do
+                      TIO.writeFile fullPath updated
+                      let diff = renderDiffBlock relPath target replacement
+                      pure $ ToolResult "" ("Successfully edited file (whitespace-tolerant): " <> relPath <> "\n" <> diff) "" Nothing
   }
+
+-- | Render unified diff block representation for target and replacement text
+renderDiffBlock :: Text -> Text -> Text -> Text
+renderDiffBlock path target replacement =
+  let header = [ "--- a/" <> path
+               , "+++ b/" <> path
+               ]
+      delLines = map ("- " <>) (T.lines target)
+      addLines = map ("+ " <>) (T.lines replacement)
+  in T.unlines (header ++ delLines ++ addLines)
+
+-- | Whitespace-tolerant search and replace across lines
+applyWhitespaceTolerantEdit :: Text -> Text -> Text -> Either Text Text
+applyWhitespaceTolerantEdit content target replacement =
+  let cLines = T.lines content
+      tLines = T.lines (T.filter (/= '\r') target)
+      rLines = T.lines (T.filter (/= '\r') replacement)
+      norm l = T.dropWhileEnd (== ' ') (T.filter (/= '\r') l)
+      normTarget = map norm tLines
+      tLen = length tLines
+      matches = [ i
+                | i <- [0 .. length cLines - tLen]
+                , let slice = take tLen (drop i cLines)
+                , map norm slice == normTarget
+                ]
+  in case matches of
+       []  -> Left "Target string not found in file (even with whitespace tolerance). Edit aborted."
+       [i] ->
+         let before = take i cLines
+             after  = drop (i + tLen) cLines
+             newLines = before ++ rLines ++ after
+             resultText = if T.isSuffixOf "\n" content
+                            then T.unlines newLines
+                            else T.intercalate "\n" newLines
+         in Right resultText
+       ms  -> Left $ "Ambiguous target string after whitespace normalization: found " <> T.pack (show (length ms)) <> " occurrences in file. Please provide more surrounding context."
 
 -- | Global connection manager cache for HTTP connection pooling
 globalHttpManager :: IORef (Maybe Manager)

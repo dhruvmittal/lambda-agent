@@ -3,6 +3,7 @@
 
 module Lambda.Driver.OpenAI
   ( openAiDriver
+  , openAiDynamicDriver
   , parseSseChunk
   , splitThinkingChunks
   ) where
@@ -32,7 +33,11 @@ import Lambda.Engine.Compactor (turnsToOpenAIPayload)
 import Lambda.Types
 
 openAiDriver :: Config -> IO ModelDriver
-openAiDriver Config{..} = do
+openAiDriver cfg = openAiDynamicDriver cfg (pure (modelName cfg))
+
+-- | OpenAI driver supporting dynamic model resolution per request
+openAiDynamicDriver :: Config -> IO Text -> IO ModelDriver
+openAiDynamicDriver Config{..} getActiveModel = do
   manager <- newTlsManager
   pure ModelDriver
     { streamCompletion = \turns tools callback -> do
@@ -41,10 +46,11 @@ openAiDriver Config{..} = do
             callback (ChunkText "\n[Configuration Warning: API key is empty. Set LAMBDA_API_KEY or OPENROUTER_API_KEY in your environment, or configure .lambda/config.json]\n")
             callback ChunkDone
           else do
+            curModel <- getActiveModel
             let endpoint = T.unpack apiBaseUrl <> "/chat/completions"
                 messages = turnsToOpenAIPayload turns
                 baseBody =
-                  [ "model"    .= modelName
+                  [ "model"    .= curModel
                   , "messages" .= messages
                   , "stream"   .= True
                   ]

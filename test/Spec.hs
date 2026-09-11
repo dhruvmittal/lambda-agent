@@ -20,8 +20,10 @@ import Data.Time.Clock (getCurrentTime, diffUTCTime, addUTCTime)
 import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive, doesFileExist, removeFile)
 import System.Environment (setEnv, unsetEnv)
 import System.Exit (exitFailure)
+import System.FilePath ((</>))
 
-import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..))
+import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), resolveModelAlias, lookupModelContextLimit)
+import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro, expandPromptMacro)
 import Lambda.Core.EngineInterface (initEngineChannels, cmdQueue, startEngineLoop, EngineChannels(..))
 import Lambda.Core.ModelDriver (ModelDriver(..))
 import Lambda.Core.ToolProvider
@@ -31,7 +33,7 @@ import Lambda.Engine.Artifacts
 import Lambda.Engine.Compactor
 import Lambda.Engine.Dispatcher (executeToolDispatch)
 import Lambda.Engine.Security (initSecurity, checkAuthorization, SecurityState(..))
-import Lambda.Engine.Session
+import Lambda.Engine.Session (exportSessionTrace, loadSession, listSessions, saveSession, getLatestSession, pruneSessions, renderSessionTraceMarkdown, Session(..), SessionMeta(..))
 import Lambda.Engine.State
   ( initEngineState
   , initEngineStateWithSession
@@ -45,12 +47,16 @@ import Lambda.Engine.State
   , appTurnCounter
   , appSubAgentSeq
   , appSessionDir
+  , appEventQueue
+  , appActiveModel
+  , appContextLimit
+  , appUndoStack
   )
 import Lambda.Engine.SubAgent (submitReportTool, filterSubAgentRegistry, subAgentLoop, runEphemeralSubAgent, SubAgentSpec(..), SubAgentReport(..))
 import qualified Data.Map.Strict as Map
 import Brick.Types (vSize, Size(..))
 import qualified Brick.Widgets.Edit as E
-import Lambda.Provider.Builtin (builtinTools, listDirectoryTool, readFileTool, fetchUrlTool)
+import Lambda.Provider.Builtin (builtinTools, listDirectoryTool, readFileTool, fetchUrlTool, editFileTool, renderDiffBlock, applyWhitespaceTolerantEdit)
 import Lambda.Provider.Mcp (inferCapability, parseMcpCallResult, startAndLoadMcpServers, stopMcpClient)
 import Lambda.UI.Completion (completeInput, allCommands, computeCommandCandidates, slidingCandidateWindow)
 import Lambda.UI.Draw (renderSubAgents, renderSubAgentsSelected, renderInlineSubAgent, renderCompletionLine)
@@ -100,6 +106,10 @@ main = do
   testReadlineKeybindingsAndTabDecoupling
   testContextualCompletersAndMruInvariant
   testSlidingCandidateWindowInvariant
+  testDynamicModelSwitching
+  testSessionRewindAndFork
+  testStructuredDiffAndWhitespaceEditing
+  testPromptMacrosAndExpansion
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -730,6 +740,7 @@ testSessionSerialization = do
         , sessionSubAgents     = Map.singleton 1 subTask
         , sessionStateVector   = Map.singleton "state_vector" "GOAL: Inspect repo"
         , sessionPromptHistory = ["Initial prompt to inspect repository"]
+        , sessionParentId      = Nothing
         }
 
   saveSession tempDir 50 sess
@@ -767,6 +778,7 @@ testSessionResumptionAndRestoration = do
         , sessionSubAgents     = Map.singleton 2 subTask
         , sessionStateVector   = Map.singleton "state_vector" "GOAL: Fix bug"
         , sessionPromptHistory = ["debug this crash"]
+        , sessionParentId      = Nothing
         }
 
   es <- initEngineStateWithSession cfg emptyRegistry sec (Just sess)
@@ -802,6 +814,7 @@ testNewSessionIsolation = do
         , sessionSubAgents     = Map.empty
         , sessionStateVector   = Map.empty
         , sessionPromptHistory = []
+        , sessionParentId      = Nothing
         }
   es <- initEngineStateWithSession cfg emptyRegistry sec (Just sess)
   -- Point appSessionDir to tempDir for testing
@@ -844,6 +857,7 @@ testSessionDiscoveryAndRetentionPruning = do
         , sessionSubAgents     = Map.empty
         , sessionStateVector   = Map.empty
         , sessionPromptHistory = []
+        , sessionParentId      = Nothing
         }
 
   mapM_ (\i -> saveSession tempDir 0 (mkSess i)) [1..4 :: Int]
@@ -892,6 +906,7 @@ testOnDemandMarkdownTraceGeneration = do
         , sessionSubAgents     = Map.singleton 1 subTask
         , sessionStateVector   = Map.empty
         , sessionPromptHistory = []
+        , sessionParentId      = Nothing
         }
 
   let md = renderSessionTraceMarkdown sess
@@ -918,8 +933,8 @@ testAutocompleteAndTabInvariant = do
   assert "Typing '/' returns all available slash commands" (length slashMatches == length allCommands)
 
   -- Check unambiguous prefix matching (single match auto-completes immediately in-place)
-  let planMatches = computeCommandMatches "/p"
-  assert "Typing '/p' returns exactly ['/plan'] for immediate in-place auto-fill" (planMatches == ["/plan"])
+  let planMatches = computeCommandMatches "/pl"
+  assert "Typing '/pl' returns exactly ['/plan'] for immediate in-place auto-fill" (planMatches == ["/plan"])
 
   let helpMatches = computeCommandMatches "/h"
   assert "Typing '/h' returns exactly ['/help'] for immediate in-place auto-fill" (helpMatches == ["/help"])
@@ -930,6 +945,9 @@ testAutocompleteAndTabInvariant = do
   -- Check ambiguous prefix matching (triggers candidate preview bar and cycling)
   let cMatches = computeCommandMatches "/c"
   assert "Typing '/c' matches multiple candidates (/compact and /clear)" (cMatches == ["/compact", "/clear"])
+
+  let pMatches = computeCommandMatches "/p"
+  assert "Typing '/p' matches multiple candidates (/plan, /prompt, /p)" ("/plan" `elem` pMatches && "/prompt" `elem` pMatches)
 
   let sessionMatches = computeCommandMatches "/s"
   assert "Typing '/s' matches /session and /sub" (sessionMatches == ["/session", "/sub"])
@@ -1215,6 +1233,7 @@ testContextualCompletersAndMruInvariant = do
         , sessionSubAgents     = Map.empty
         , sessionStateVector   = Map.empty
         , sessionPromptHistory = []
+        , sessionParentId      = Nothing
         }
 
   saveSession testSessionsDir 0 (mkSess "sess_old_123" "Older Session" (-300))
@@ -1325,6 +1344,323 @@ testSlidingCandidateWindowInvariant = do
     (over12_11 == 0)
 
   putStrLn "  -> OK: Sliding candidate window caps ribbon size to 5, tracks cursor position, and displays accurate overflow."
+
+-- 39. Verify Dynamic Model Switching & Alias Resolution Invariant
+testDynamicModelSwitching :: IO ()
+testDynamicModelSwitching = do
+  putStrLn "\n[Test 39] Dynamic Model Switching & Alias Resolution Invariant"
+
+  -- 1. Test Alias Resolution
+  assert "Alias 'claude' resolves to 'anthropic/claude-3.5-sonnet'"
+    (resolveModelAlias "claude" == "anthropic/claude-3.5-sonnet")
+  assert "Alias 'r1' resolves to 'deepseek/deepseek-r1'"
+    (resolveModelAlias "r1" == "deepseek/deepseek-r1")
+  assert "Alias '4o' resolves to 'openai/gpt-4o'"
+    (resolveModelAlias "4o" == "openai/gpt-4o")
+  assert "Alias 'qwen' resolves to 'qwen/qwen-2.5-coder-32b-instruct'"
+    (resolveModelAlias "qwen" == "qwen/qwen-2.5-coder-32b-instruct")
+  assert "Unknown or arbitrary model ID is preserved as-is"
+    (resolveModelAlias "mistralai/codestral-2501" == "mistralai/codestral-2501")
+
+  -- 2. Test Context Limit Lookup
+  assert "Claude model has 200k context limit"
+    (lookupModelContextLimit "anthropic/claude-3.5-sonnet" == 200000)
+  assert "DeepSeek R1 model has 128k context limit"
+    (lookupModelContextLimit "deepseek/deepseek-r1" == 128000)
+  assert "Free tier model has 32k context limit"
+    (lookupModelContextLimit "openrouter/free" == 32000)
+
+  -- 3. Dynamic Model Switching via Engine Loop
+  sec <- initSecurity [] []
+  cfg <- loadConfig "."
+  let tools = builtinTools "." ".lambda/artifacts"
+      reg = registerTools tools emptyRegistry
+  es <- initEngineState cfg reg sec
+  chans <- initEngineChannels (appEventQueue es)
+  let dummyDriver = ModelDriver { streamCompletion = \_ _ cb -> cb ChunkDone }
+  startEngineLoop es dummyDriver chans
+
+  -- Initial active model should be from config
+  initMod <- readTVarIO (appActiveModel es)
+  assert "Initial model equals config model" (initMod == modelName cfg)
+
+  -- Dispatch CmdSetModel "claude"
+  atomically $ writeTBQueue (cmdQueue chans) (CmdSetModel "claude")
+
+  -- Wait for EvModelSwitched event
+  let waitForSwitch (0 :: Int) = do
+        failTest "Timed out waiting for EvModelSwitched"
+        pure ("", 0)
+      waitForSwitch n = do
+        mEv <- atomically $ tryReadTQueue (evQueue chans)
+        case mEv of
+          Just (EvModelSwitched m lim) -> pure (m, lim)
+          _ -> threadDelay 20000 >> waitForSwitch (n - 1)
+
+  (switchedMod, switchedLim) <- waitForSwitch 50
+  assert "EvModelSwitched indicates resolved canonical model"
+    (switchedMod == "anthropic/claude-3.5-sonnet")
+  assert "EvModelSwitched indicates updated 200k context limit"
+    (switchedLim == 200000)
+
+  -- Verify AppEngineState TVars are updated
+  updatedMod <- readTVarIO (appActiveModel es)
+  updatedLim <- readTVarIO (appContextLimit es)
+  assert "appActiveModel is updated in state"
+    (updatedMod == "anthropic/claude-3.5-sonnet")
+  assert "appContextLimit is updated in state"
+    (updatedLim == 200000)
+
+  -- 4. Contextual autocomplete for /model
+  let dummyUI = UIState
+        { uiTurns            = []
+        , uiSubAgents        = Map.empty
+        , uiCurrentPrompt    = Nothing
+        , uiPendingPrompts   = Seq.Empty
+        , uiMode             = PlanMode
+        , uiEditor           = E.editor EditorInput (Just 1) ""
+        , uiWorkingState     = ""
+        , uiChannels         = chans
+        , uiLastEscTime      = Nothing
+        , uiContextLimit     = 8192
+        , uiPromptHistory    = []
+        , uiHistoryIndex     = Nothing
+        , uiSavedDraft       = ""
+        , uiModelName        = "test"
+        , uiThinkingVisible  = True
+        , uiSelectedSubAgent = Nothing
+        , uiShowHud          = False
+        , uiCompletion       = Nothing
+        , uiIsGenerating     = False
+        }
+
+  mModelComp <- completeInput "." dummyUI "/model "
+  assert "/model completion includes 'claude', 'r1', '4o', and 'qwen'"
+    (case mModelComp of
+       Just cs ->
+         let inserts = map candInsert (compCandidates cs)
+         in "claude" `elem` inserts && "r1" `elem` inserts && "4o" `elem` inserts && "qwen" `elem` inserts
+       Nothing -> False)
+
+  putStrLn "  -> OK: Dynamic model switching resolves aliases, updates engine state & context limits, and integrates with autocomplete."
+
+-- 40. Verify Session Rewind and Forking
+testSessionRewindAndFork :: IO ()
+testSessionRewindAndFork = do
+  putStrLn "\n[Test 40] Session Rewind & Forking (Lineage & Undo Stack)"
+  sec <- initSecurity [] []
+  cfg <- loadConfig "."
+  let testSessDir = ".lambda/test_sessions_40"
+  createDirectoryIfMissing True testSessDir
+
+  now <- getCurrentTime
+  let initialTurns =
+        [ Turn 1 UserRole [TextBlock "What is Pi?"]
+        , Turn 2 AssistantRole [TextBlock "Pi is 3.14159..."]
+        , Turn 3 UserRole [TextBlock "Tell me more"]
+        , Turn 4 AssistantRole [TextBlock "It is transcendental."]
+        ]
+      sess = Session
+        { sessionId           = "test_rewind_sess"
+        , sessionCreatedAt     = now
+        , sessionUpdatedAt     = now
+        , sessionTitle         = "Original session"
+        , sessionMode          = PlanMode
+        , sessionTurns         = initialTurns
+        , sessionSubAgents     = Map.empty
+        , sessionStateVector   = Map.empty
+        , sessionPromptHistory = ["What is Pi?", "Tell me more"]
+        , sessionParentId      = Nothing
+        }
+
+  es <- initEngineStateWithSession cfg emptyRegistry sec (Just sess)
+  let es' = es { appSessionDir = testSessDir }
+  chans <- initEngineChannels (appEventQueue es')
+
+  let dummyDriver = ModelDriver { streamCompletion = \_ _ cb -> cb ChunkDone }
+
+  startEngineLoop es' dummyDriver chans
+
+  -- 1. Test /rewind 1 (drops 1 user turn + 1 assistant turn = 2 turns)
+  atomically $ writeTBQueue (cmdQueue chans) (CmdRewindTurns 1)
+  threadDelay 50000
+
+  turnsAfterRewind <- readTVarIO (appTurns es')
+  assert "Rewind 1 dropped exactly 2 turns" (length turnsAfterRewind == 2)
+  assert "Remaining turns match first user and assistant turn"
+    (case turnsAfterRewind of
+       [Turn 1 UserRole [TextBlock u], Turn 2 AssistantRole [TextBlock a]] ->
+         u == "What is Pi?" && a == "Pi is 3.14159..."
+       _ -> False)
+
+  undoStack <- readTVarIO (appUndoStack es')
+  assert "appUndoStack saved popped turns" (length undoStack == 1 && length (head undoStack) == 2)
+
+  -- 2. Test /fork "My Branch"
+  atomically $ writeTBQueue (cmdQueue chans) (CmdForkSession (Just "My Branch"))
+  threadDelay 100000
+
+  turnsAfterFork <- readTVarIO (appTurns es')
+  assert "Fork preserved current turns (2 turns)" (length turnsAfterFork == 2)
+
+  -- Check session saved on disk
+  latestSess <- getLatestSession testSessDir
+  assert "Forked session has sessionParentId pointing to original session"
+    (case latestSess of
+       Just s -> sessionParentId s == Just "test_rewind_sess" && sessionId s /= "test_rewind_sess"
+       Nothing -> False)
+
+  -- 3. Autocomplete recognizes /rewind, /undo, and /fork
+  assert "allCommands contains /rewind, /undo, and /fork"
+    ("/rewind" `elem` allCommands && "/undo" `elem` allCommands && "/fork" `elem` allCommands)
+
+  removeDirectoryRecursive testSessDir
+  putStrLn "  -> OK: Session rewind drops turns & updates undo stack, fork preserves parent lineage & state, commands registered."
+
+-- 41. Verify Structured Diffs and Whitespace-Tolerant File Editing
+testStructuredDiffAndWhitespaceEditing :: IO ()
+testStructuredDiffAndWhitespaceEditing = do
+  putStrLn "\n[Test 41] Structured Diffs & Whitespace-Tolerant File Editing"
+  let tempDir = ".lambda/test_diff_41"
+  createDirectoryIfMissing True tempDir
+
+  -- 1. Test diff block formatting
+  let diff = renderDiffBlock "src/App.hs" "main = putStrLn \"hello\"" "main = putStrLn \"world\""
+  assert "Diff contains standard unified header"
+    ("--- a/src/App.hs\n+++ b/src/App.hs" `T.isInfixOf` diff)
+  assert "Diff prefixes target with '- '"
+    ("- main = putStrLn \"hello\"" `T.isInfixOf` diff)
+  assert "Diff prefixes replacement with '+ '"
+    ("+ main = putStrLn \"world\"" `T.isInfixOf` diff)
+
+  -- 2. Test whitespace-tolerant line-based matching helper
+  let originalCode = "def compute():\n    x = 10   \n    return x\n"
+      targetCode   = "def compute():\n    x = 10\n    return x"
+      newCode      = "def compute():\n    x = 42\n    return x * 2"
+  case applyWhitespaceTolerantEdit originalCode targetCode newCode of
+    Left err -> failTest ("Whitespace-tolerant edit failed unexpectedly: " <> T.unpack err)
+    Right updated -> do
+      assert "Updated code contains replacement value" ("x = 42" `T.isInfixOf` updated)
+      assert "Updated code removed old value" (not ("x = 10" `T.isInfixOf` updated))
+
+  -- 3. Test editFileTool with end-to-end whitespace tolerance and diff output
+  let testFile = tempDir ++ "/service.py"
+  TIO.writeFile testFile "function start() {\n    logger.info(\"starting\")   \n    return true;\n}\n"
+
+  let editTool = editFileTool tempDir
+      args = Aeson.object
+        [ "path" .= ("service.py" :: Text)
+        , "target" .= ("function start() {\n    logger.info(\"starting\")\n    return true;\n}" :: Text)
+        , "replacement" .= ("function start() {\n    logger.info(\"ready\")\n    return true;\n}" :: Text)
+        ]
+
+  res <- toolExecute editTool MainAgent args
+  assert "Tool result indicates whitespace-tolerant success"
+    ("Successfully edited file (whitespace-tolerant): service.py" `T.isInfixOf` resultStdout res)
+  assert "Tool result stdout includes colorable diff block"
+    ("--- a/service.py" `T.isInfixOf` resultStdout res && "- function start()" `T.isInfixOf` resultStdout res)
+
+  -- Verify written file on disk has new content
+  newContent <- TIO.readFile testFile
+  assert "File on disk has updated content" ("\"ready\"" `T.isInfixOf` newContent)
+
+  removeDirectoryRecursive tempDir
+  putStrLn "  -> OK: Structured diffs formatted with unified headers, whitespace-tolerant editing resolves minor variations."
+
+-- 42. Verify User Prompt Macros and $input Expansion
+testPromptMacrosAndExpansion :: IO ()
+testPromptMacrosAndExpansion = do
+  putStrLn "\n[Test 42] Prompt Macros & $input Expansion (.lambda/prompts/*.md)"
+  let tempDir = ".lambda/test_prompts_42"
+      promptsDir = tempDir </> ".lambda" </> "prompts"
+  createDirectoryIfMissing True promptsDir
+
+  -- 1. Create prompt macro templates
+  TIO.writeFile (promptsDir </> "review.md")
+    "Perform a critical code review on $input looking for safety, concurrency bugs, and edge cases."
+  TIO.writeFile (promptsDir </> "refactor.md")
+    "Refactor $ARG to follow standard library idioms and eliminate dead code."
+  TIO.writeFile (promptsDir </> "summarize.md")
+    "Provide an architectural summary of the following components:"
+
+  -- 2. Test listPromptMacros
+  macros <- listPromptMacros tempDir
+  assert "listPromptMacros discovers 'review', 'refactor', and 'summarize'"
+    ("review" `elem` macros && "refactor" `elem` macros && "summarize" `elem` macros)
+
+  -- 3. Test expandPromptMacro with $input
+  let exp1 = expandPromptMacro "Review $input thoroughly." "src/Lambda/Types.hs"
+  assert "expandPromptMacro substitutes $input"
+    (exp1 == "Review src/Lambda/Types.hs thoroughly.")
+
+  -- 4. Test expandPromptMacro with $ARG
+  let exp2 = expandPromptMacro "Benchmark $ARG now." "my_bench"
+  assert "expandPromptMacro substitutes $ARG"
+    (exp2 == "Benchmark my_bench now.")
+
+  -- 5. Test expandPromptMacro appending when no variable
+  let exp3 = expandPromptMacro "Summarize:" "src/App.hs"
+  assert "expandPromptMacro appends trailing args when no placeholder"
+    (exp3 == "Summarize:\n\nsrc/App.hs")
+
+  -- 6. Test loadPromptMacro existing and missing
+  resLoaded <- loadPromptMacro tempDir "review" "src/Lambda/Engine/Session.hs"
+  assert "loadPromptMacro successfully loads and expands existing macro"
+    (case resLoaded of
+       Right text -> "src/Lambda/Engine/Session.hs" `T.isInfixOf` text && not ("$input" `T.isInfixOf` text)
+       Left _     -> False)
+
+  resMissing <- loadPromptMacro tempDir "nonexistent" "args"
+  assert "loadPromptMacro returns Left for nonexistent macro"
+    (case resMissing of
+       Left err -> "not found" `T.isInfixOf` err
+       Right _  -> False)
+
+  -- 7. Contextual autocomplete integration (/prompt <Tab> and /p <Tab>)
+  sec <- initSecurity [] []
+  cfg <- loadConfig "."
+  es <- initEngineState cfg emptyRegistry sec
+  chans <- initEngineChannels (appEventQueue es)
+  let dummyUI = UIState
+        { uiTurns            = []
+        , uiSubAgents        = Map.empty
+        , uiCurrentPrompt    = Nothing
+        , uiPendingPrompts   = Seq.Empty
+        , uiMode             = PlanMode
+        , uiEditor           = E.editor EditorInput (Just 1) ""
+        , uiWorkingState     = ""
+        , uiChannels         = chans
+        , uiLastEscTime      = Nothing
+        , uiContextLimit     = 8192
+        , uiPromptHistory    = []
+        , uiHistoryIndex     = Nothing
+        , uiSavedDraft       = ""
+        , uiModelName        = "test"
+        , uiThinkingVisible  = True
+        , uiSelectedSubAgent = Nothing
+        , uiShowHud          = False
+        , uiCompletion       = Nothing
+        , uiIsGenerating     = False
+        }
+
+  mPromptComp <- completeInput tempDir dummyUI "/prompt "
+  assert "/prompt completion returns 'review', 'refactor', 'summarize'"
+    (case mPromptComp of
+       Just cs ->
+         let inserts = map candInsert (compCandidates cs)
+         in "review" `elem` inserts && "refactor" `elem` inserts && "summarize" `elem` inserts
+       Nothing -> False)
+
+  mPComp <- completeInput tempDir dummyUI "/p rev"
+  assert "/p completion filters candidates with prefix"
+    (case mPComp of
+       Just cs ->
+         let inserts = map candInsert (compCandidates cs)
+         in inserts == ["review"]
+       Nothing -> False)
+
+  removeDirectoryRecursive tempDir
+  putStrLn "  -> OK: Prompt macros discovered from .lambda/prompts/*.md, $input expanded, autocomplete ribbons integrated."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

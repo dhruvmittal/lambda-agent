@@ -10,6 +10,10 @@ module Lambda.Config
   , SpecialistConfig(..)
   , defaultConfig
   , defaultSpecialists
+  , defaultModelAliases
+  , resolveModelAlias
+  , lookupModelContextLimit
+  , curatedModels
   , loadConfig
   ) where
 
@@ -343,3 +347,48 @@ parseDotEnv raw =
       ('"':xs) | not (null xs) && last xs == '"' -> init xs
       ('\'':xs) | not (null xs) && last xs == '\'' -> init xs
       _ -> s
+
+-- | Curated model aliases mapping friendly shorthands to full provider model IDs
+defaultModelAliases :: Map Text Text
+defaultModelAliases = Map.fromList
+  [ ("claude",     "anthropic/claude-3.5-sonnet")
+  , ("sonnet",     "anthropic/claude-3.5-sonnet")
+  , ("claude-3.7", "anthropic/claude-3.7-sonnet")
+  , ("r1",         "deepseek/deepseek-r1")
+  , ("deepseek",   "deepseek/deepseek-r1")
+  , ("4o",         "openai/gpt-4o")
+  , ("gpt4",       "openai/gpt-4o")
+  , ("o3",         "openai/o3-mini")
+  , ("qwen",       "qwen/qwen-2.5-coder-32b-instruct")
+  , ("coder",      "qwen/qwen-2.5-coder-32b-instruct")
+  , ("free",       "openrouter/free")
+  ]
+
+-- | Resolve an alias or model name to its canonical identifier
+resolveModelAlias :: Text -> Text
+resolveModelAlias rawName =
+  let clean = T.strip (T.toLower rawName)
+  in Map.findWithDefault rawName clean defaultModelAliases
+
+-- | Context window limits for known models (defaults to 128000)
+lookupModelContextLimit :: Text -> Int
+lookupModelContextLimit modId
+  | "claude" `T.isInfixOf` modId   = 200000
+  | "o3-mini" `T.isInfixOf` modId  = 200000
+  | "gpt-4o" `T.isInfixOf` modId   = 128000
+  | "deepseek" `T.isInfixOf` modId = 128000
+  | "qwen" `T.isInfixOf` modId     = 128000
+  | "free" `T.isInfixOf` modId     = 32000
+  | otherwise                      = 128000
+
+-- | Curated list of popular models for auto-completion
+curatedModels :: [Text]
+curatedModels =
+  [ "anthropic/claude-3.5-sonnet"
+  , "anthropic/claude-3.7-sonnet"
+  , "deepseek/deepseek-r1"
+  , "openai/gpt-4o"
+  , "openai/o3-mini"
+  , "qwen/qwen-2.5-coder-32b-instruct"
+  , "openrouter/free"
+  ]

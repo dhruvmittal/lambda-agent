@@ -19,6 +19,7 @@ import Data.Time.Format (defaultTimeLocale, formatTime)
 import System.Directory (doesDirectoryExist, listDirectory)
 import System.FilePath ((</>), splitFileName)
 
+import Lambda.Engine.PromptMacro (listPromptMacros)
 import Lambda.Engine.Session (listSessions, SessionMeta(..))
 import Lambda.Types
 import Lambda.UI.Types
@@ -29,8 +30,14 @@ allCommands =
   [ "/plan"
   , "/exec"
   , "/mode"
+  , "/model"
   , "/think"
   , "/session"
+  , "/fork"
+  , "/rewind"
+  , "/undo"
+  , "/prompt"
+  , "/p"
   , "/sub"
   , "/trace"
   , "/compact"
@@ -101,6 +108,27 @@ completeInput baseDir st rawInput = do
             matched = [ c | c <- allModes, modeArg `T.isPrefixOf` candInsert c || T.null modeArg ]
         pure $ toCompletionState matched
 
+    -- 5. /model argument completion
+    _ | "/model " `T.isPrefixOf` clean -> do
+        let modArg = T.drop 7 clean
+            modelCandidates =
+              [ Candidate "claude"     "claude (anthropic/claude-3.5-sonnet, 200k)"
+              , Candidate "claude-3.7" "claude-3.7 (anthropic/claude-3.7-sonnet, 200k)"
+              , Candidate "r1"         "r1 (deepseek/deepseek-r1, 128k)"
+              , Candidate "4o"         "4o (openai/gpt-4o, 128k)"
+              , Candidate "o3"         "o3 (openai/o3-mini, 200k)"
+              , Candidate "qwen"       "qwen (qwen-2.5-coder-32b, 128k)"
+              , Candidate "free"       "free (openrouter/free, 32k)"
+              , Candidate "anthropic/claude-3.5-sonnet" "anthropic/claude-3.5-sonnet"
+              , Candidate "anthropic/claude-3.7-sonnet" "anthropic/claude-3.7-sonnet"
+              , Candidate "deepseek/deepseek-r1" "deepseek/deepseek-r1"
+              , Candidate "openai/gpt-4o" "openai/gpt-4o"
+              , Candidate "openai/o3-mini" "openai/o3-mini"
+              , Candidate "qwen/qwen-2.5-coder-32b-instruct" "qwen/qwen-2.5-coder-32b-instruct"
+              ]
+            matched = [ c | c <- modelCandidates, modArg `T.isPrefixOf` candInsert c || T.null modArg ]
+        pure $ toCompletionState matched
+
     -- 5. /think argument completion
     _ | "/think " `T.isPrefixOf` clean -> do
         let thinkArg = T.drop 7 clean
@@ -112,7 +140,17 @@ completeInput baseDir st rawInput = do
             matched = [ c | c <- thinkOpts, thinkArg `T.isPrefixOf` candInsert c || T.null thinkArg ]
         pure $ toCompletionState matched
 
-    -- 6. Filesystem path completion (words starting with '@' or containing '/')
+    -- 6. /prompt and /p argument completion (templates from .lambda/prompts/*.md)
+    _ | "/prompt " `T.isPrefixOf` clean || "/p " `T.isPrefixOf` clean -> do
+        let pArg = if "/prompt " `T.isPrefixOf` clean then T.drop 8 clean else T.drop 3 clean
+        macroNames <- catch (listPromptMacros baseDir) (\(_ :: SomeException) -> pure [])
+        let matched = [ Candidate m (".lambda/prompts/" <> m <> ".md")
+                      | m <- macroNames
+                      , pArg `T.isPrefixOf` m || T.null pArg
+                      ]
+        pure $ toCompletionState matched
+
+    -- 7. Filesystem path completion (words starting with '@' or containing '/')
     _ -> do
         let lastToken = case T.words clean of
               [] -> ""
@@ -141,8 +179,11 @@ completeInput baseDir st rawInput = do
     formatSessionMeta m =
       let timeStr = T.pack $ formatTime defaultTimeLocale "%H:%M" (metaUpdatedAt m)
           turnsStr = T.pack (show (metaTurnCount m)) <> "t"
+          forkStr = case metaParentId m of
+            Just _  -> " ↳fork"
+            Nothing -> ""
           titleStr = if T.null (metaTitle m) then "" else " · " <> T.take 22 (metaTitle m)
-      in metaId m <> " (" <> timeStr <> ", " <> turnsStr <> titleStr <> ")"
+      in metaId m <> " (" <> timeStr <> ", " <> turnsStr <> forkStr <> titleStr <> ")"
 
     formatStatus SubAgentRunning     = "running"
     formatStatus (SubAgentSuccess _) = "success"

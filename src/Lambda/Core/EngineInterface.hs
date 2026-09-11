@@ -20,13 +20,14 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Text.Read (readMaybe)
 
-import Lambda.Config (Config(..))
+import qualified Data.Map.Strict as Map
+import Lambda.Config (Config(..), resolveModelAlias, lookupModelContextLimit)
 import Lambda.Core.ModelDriver (ModelDriver(..))
 import Lambda.Core.ToolProvider (toolsToOpenAISchema)
 import Lambda.Engine.Compactor (compactHistory, estimateTotalTokens)
 import Lambda.Engine.Dispatcher (executeToolDispatch)
 import Lambda.Engine.Security (SecurityState(..))
-import Lambda.Engine.Session (exportSessionTrace, loadSession)
+import Lambda.Engine.Session (exportSessionTrace, loadSession, forkSession, Session(..))
 import Lambda.Engine.State
 import Lambda.Types
 
@@ -69,6 +70,24 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
     CmdSetMode newMode -> do
       atomically $ writeTVar appMode newMode
       engineWorkerLoop engineState driver channels activeTaskVar
+    CmdSetModel rawModel -> do
+      let targetModel = resolveModelAlias rawModel
+          targetLimit = lookupModelContextLimit targetModel
+      atomically $ do
+        writeTVar appActiveModel targetModel
+        writeTVar appContextLimit targetLimit
+      currentTurns <- readTVarIO appTurns
+      let currentTokens = estimateTotalTokens currentTurns
+      when (currentTokens > (targetLimit * 9 `div` 10)) $ do
+        atomically $ do
+          let compacted = compactHistory 0 4 currentTurns
+          writeTVar appTurns compacted
+        persistCurrentSession engineState
+        emitEngineEvent engineState (EvWorkingStateUpdate "Context compaction auto-triggered on model switch.")
+      persistCurrentSession engineState
+      emitEngineEvent engineState (EvModelSwitched targetModel targetLimit)
+      _ <- addTurn engineState SystemRole [TextBlock ("Switched active model to " <> targetModel <> " (context limit: " <> T.pack (show targetLimit) <> " tokens)")]
+      engineWorkerLoop engineState driver channels activeTaskVar
     CmdCancelSubAgent sId -> do
       updateSubAgentStatus engineState sId (SubAgentBlocked "Cancelled by user")
       engineWorkerLoop engineState driver channels activeTaskVar
@@ -93,6 +112,31 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       engineWorkerLoop engineState driver channels activeTaskVar
     CmdNewSession -> do
       _ <- resetEngineSession engineState
+      engineWorkerLoop engineState driver channels activeTaskVar
+    CmdRewindTurns n -> do
+      ts <- readTVarIO appTurns
+      let dropCount = max 1 (n * 2)
+      if length ts <= 1
+        then emitEngineEvent engineState (EvWorkingStateUpdate "Cannot rewind: already at start of session.")
+        else do
+          let remaining = take (max 1 (length ts - dropCount)) ts
+              popped = drop (length remaining) ts
+          atomically $ do
+            modifyTVar' appUndoStack (\s -> popped : s)
+            writeTVar appTurns remaining
+            subs <- readTVar appSubAgents
+            let updatedSubs = Map.map (\t -> if subAgentStatus t == SubAgentRunning then t { subAgentStatus = SubAgentBlocked "Cancelled on session rewind" } else t) subs
+            writeTVar appSubAgents updatedSubs
+          persistCurrentSession engineState
+          emitEngineEvent engineState (EvWorkingStateUpdate $ "Rewound " <> T.pack (show n) <> " turn(s). Previous turns saved to undo stack.")
+      engineWorkerLoop engineState driver channels activeTaskVar
+    CmdForkSession mTitle -> do
+      currSess <- snapshotSession engineState
+      childSess <- forkSession appSessionDir currSess mTitle
+      restoreEngineSession engineState childSess
+      persistCurrentSession engineState
+      emitEngineEvent engineState (EvSessionSwitched (sessionId childSess) (sessionMode childSess) (sessionTurns childSess) (sessionSubAgents childSess))
+      emitEngineEvent engineState (EvWorkingStateUpdate $ "Forked into session " <> sessionId childSess)
       engineWorkerLoop engineState driver channels activeTaskVar
     CmdSwitchSession sid -> do
       loadRes <- loadSession appSessionDir sid

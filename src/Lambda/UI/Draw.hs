@@ -234,7 +234,7 @@ renderBlock (ToolResultBlock tr) =
   padLeft (Pad 2) $
     vBox
       [ if not (T.null (resultStdout tr))
-          then withAttr (attrName "toolResult") $ txtWrap $ "✓ result: " <> T.take 120 (resultStdout tr)
+          then renderToolResultStdout (resultStdout tr)
           else emptyWidget
       , if not (T.null (resultStderr tr))
           then withAttr (attrName "toolError") $ txtWrap $ "✗ error: " <> T.take 120 (resultStderr tr)
@@ -246,6 +246,25 @@ renderBlock (ToolResultBlock tr) =
           Just p  -> withAttr (attrName "artifact") (txtWrap ("  artifact -> " <> T.pack p))
           Nothing -> emptyWidget
       ]
+
+renderToolResultStdout :: Text -> Widget ResourceName
+renderToolResultStdout txtContent =
+  let ls = T.lines txtContent
+      isDiff = any (\l -> "--- " `T.isPrefixOf` l || "+++ " `T.isPrefixOf` l) ls
+  in if not isDiff
+       then withAttr (attrName "toolResult") $ txtWrap $ "✓ result: " <> T.take 120 txtContent
+       else vBox (map renderDiffLine ls)
+
+renderDiffLine :: Text -> Widget ResourceName
+renderDiffLine l
+  | "--- " `T.isPrefixOf` l || "+++ " `T.isPrefixOf` l =
+      withAttr (attrName "diffHeader") (txt l)
+  | "+" `T.isPrefixOf` l =
+      withAttr (attrName "diffAdd") (txt l)
+  | "-" `T.isPrefixOf` l =
+      withAttr (attrName "diffRemove") (txt l)
+  | otherwise =
+      withAttr (attrName "toolResult") (txt l)
 
 renderInlineSubAgent :: SubAgentTask -> Widget ResourceName
 renderInlineSubAgent SubAgentTask{..} =

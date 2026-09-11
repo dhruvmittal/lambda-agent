@@ -195,6 +195,7 @@ data EngineEvent
   | EvSubAgentUpdate !SubAgentTask
   | EvWorkingStateUpdate !Text
   | EvSessionSwitched !Text !AgentMode ![Turn] !(Map Int SubAgentTask)
+  | EvModelSwitched !Text !Int
   | EvError !Text
 
 -- | Frontend to Engine dispatch commands
@@ -203,8 +204,11 @@ data FrontendCommand
   | CmdSystemMessage !Text
   | CmdClearHistory
   | CmdSetMode !AgentMode
+  | CmdSetModel !Text
   | CmdCancelSubAgent !Int
   | CmdCompactHistory
+  | CmdRewindTurns !Int
+  | CmdForkSession !(Maybe Text)
   | CmdNewSession
   | CmdSwitchSession !Text
   | CmdExportTrace

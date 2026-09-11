@@ -7,7 +7,7 @@ import Brick
 import Brick.BChan (newBChan, writeBChan)
 import qualified Brick.Widgets.Edit as E
 import Control.Concurrent (forkIO)
-import Control.Concurrent.STM (atomically, readTQueue, writeTVar)
+import Control.Concurrent.STM (atomically, readTQueue, writeTVar, readTVarIO)
 import Control.Monad (forever)
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
@@ -23,7 +23,7 @@ import System.FilePath ((</>))
 import Lambda.Config (loadConfig, Config(..))
 import Lambda.Core.EngineInterface (initEngineChannels, startEngineLoop, EngineChannels(..))
 import Lambda.Core.ToolProvider (emptyRegistry, registerTools, registerTool)
-import Lambda.Driver.OpenAI (openAiDriver)
+import Lambda.Driver.OpenAI (openAiDynamicDriver)
 import Lambda.Engine.Security (initSecurity)
 import Lambda.Engine.Session
   ( Session(..)
@@ -62,6 +62,9 @@ theApp = App
       , (attrName "toolCall",       fg V.yellow)
       , (attrName "toolResult",     fg V.white)
       , (attrName "toolError",      fg V.brightRed)
+      , (attrName "diffAdd",        fg V.brightGreen)
+      , (attrName "diffRemove",     fg V.brightRed)
+      , (attrName "diffHeader",     fg V.brightYellow `V.withStyle` V.bold)
       , (attrName "artifact",       fg V.brightCyan)
       , (attrName "thinkingDim",    fg V.brightBlack)
       , (attrName "subRunning",     fg V.green)
@@ -205,7 +208,7 @@ main = do
 
   -- 4. Initialize engine state and model driver
   engineState <- initEngineStateWithSession cfg baseRegistry secState loadedSession
-  driver <- openAiDriver cfg
+  driver <- openAiDynamicDriver cfg (readTVarIO (appActiveModel engineState))
 
   -- 5. Register SubAgent spawning tools (which require engine state & driver)
   let fullRegistry = registerTool (spawnSpecialistSubAgentTool engineState driver) baseRegistry
