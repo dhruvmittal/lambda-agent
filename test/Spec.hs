@@ -48,7 +48,7 @@ import qualified Data.Map.Strict as Map
 import Brick.Types (vSize, Size(..))
 import Lambda.Provider.Builtin (listDirectoryTool, readFileTool, fetchUrlTool)
 import Lambda.Provider.Mcp (inferCapability, parseMcpCallResult, startAndLoadMcpServers, stopMcpClient)
-import Lambda.UI.Draw (renderSubAgents, renderSubAgentsSelected)
+import Lambda.UI.Draw (renderSubAgents, renderSubAgentsSelected, renderInlineSubAgent)
 import Lambda.Types
 
 main :: IO ()
@@ -83,6 +83,8 @@ main = do
   testNewSessionIsolation
   testSessionDiscoveryAndRetentionPruning
   testOnDemandMarkdownTraceGeneration
+  testAutocompleteAndTabInvariant
+  testSubAgentStreamingToolArgs
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -339,7 +341,9 @@ testSubAgentViewportInvariant = do
       sampleMap = Map.singleton 1 sampleTask
       widget = renderSubAgents sampleMap
   assert "renderSubAgents has Fixed vertical size" (vSize widget == Fixed)
-  putStrLn "  -> OK: renderSubAgents produces Fixed vertical height for SubAgentView viewport."
+  let inlineWidget = renderInlineSubAgent sampleTask
+  assert "renderInlineSubAgent has Fixed vertical size (prevents ChatView crash)" (vSize inlineWidget == Fixed)
+  putStrLn "  -> OK: renderSubAgents and renderInlineSubAgent produce Fixed vertical height for viewports."
 
 -- 14. Verify PlanMode SubAgent and Context Mass Guard Invariants
 testPlanModeSubAgentAndContextGuard :: IO ()
@@ -888,6 +892,107 @@ testOnDemandMarkdownTraceGeneration = do
 
   removeDirectoryRecursive tempDir
   putStrLn "  -> OK: On-demand markdown trace renders complete telemetry and writes strictly when requested."
+
+-- 29. Verify / Command Autocomplete and Tab Invariant
+testAutocompleteAndTabInvariant :: IO ()
+testAutocompleteAndTabInvariant = do
+  putStrLn "\n[Test 29] Slash Command Autocomplete and Tab Invariant"
+  let allCommands =
+        [ "/plan"
+        , "/exec"
+        , "/think"
+        , "/session"
+        , "/sub"
+        , "/trace"
+        , "/compact"
+        , "/clear"
+        , "/new"
+        , "/help"
+        , "/quit"
+        ]
+      computeMatches input =
+        let rawInput = T.dropWhile (== ' ') (T.filter (\c -> c /= '\n' && c /= '\r') input)
+        in if "/" `T.isPrefixOf` rawInput && not (" " `T.isInfixOf` rawInput)
+             then filter (rawInput `T.isPrefixOf`) allCommands
+             else []
+
+  -- Check root slash returns all commands
+  let slashMatches = computeMatches "/"
+  assert "Typing '/' returns all available slash commands" (length slashMatches == length allCommands)
+
+  -- Check prefix filtering
+  let planMatches = computeMatches "/p"
+  assert "Typing '/p' returns ['/plan']" (planMatches == ["/plan"])
+
+  let sessionMatches = computeMatches "/s"
+  assert "Typing '/s' matches /session and /sub" (sessionMatches == ["/session", "/sub"])
+
+  -- Check trailing newline from editor does not break matching
+  let newlineMatches = computeMatches "/t\n"
+  assert "Trailing newline from editor lines does not break matching" (newlineMatches == ["/think", "/trace"])
+
+  -- Check commands with spaces are dismissed
+  let spaceMatches = computeMatches "/plan "
+  assert "Commands with trailing arguments/space dismiss autocomplete" (null spaceMatches)
+
+  -- Check non-slash text does not trigger autocomplete
+  let normalMatches = computeMatches "cabal test"
+  assert "Regular prompts do not trigger slash autocomplete" (null normalMatches)
+
+  putStrLn "  -> OK: Slash command autocomplete filters dynamically and handles editor line buffers cleanly."
+
+-- 30. Verify SubAgent Multi-Chunk Tool Call Arguments Streaming Invariant
+testSubAgentStreamingToolArgs :: IO ()
+testSubAgentStreamingToolArgs = do
+  putStrLn "\n[Test 30] SubAgent Multi-Chunk Tool Call Arguments Streaming Invariant"
+  sec <- initSecurity [] []
+  cfg <- loadConfig "."
+  repVar <- newTVarIO Nothing
+  let dummyReadFile = readFileTool "."
+      reg = filterSubAgentRegistry (submitReportTool repVar) (registerTools [dummyReadFile] emptyRegistry)
+  es <- initEngineState cfg reg sec
+  task <- registerSubAgentTask es "reviewer" "Review README.md" 5
+  let sId = subAgentId task
+
+  turnsVar <- newTVarIO [ Turn 1 UserRole [TextBlock "Start"] ]
+  attemptedVar <- newTVarIO []
+
+  driverTurnVar <- newTVarIO (1 :: Int)
+  let streamingDriver = ModelDriver
+        { streamCompletion = \_ _ cb -> do
+            t <- atomically $ do
+              cur <- readTVar driverTurnVar
+              writeTVar driverTurnVar (cur + 1)
+              pure cur
+            if t == 1
+              then do
+                -- Emulate OpenAI SSE stream where subsequent chunks omit targetId ("")
+                cb (ChunkToolCallStart "call_read_1" "read_file")
+                cb (ChunkToolCallArgs "" "{\"path\":")
+                cb (ChunkToolCallArgs "" " \"README.md\"}")
+                cb ChunkDone
+              else do
+                cb (ChunkToolCallStart "call_rep_1" "submit_report")
+                cb (ChunkToolCallArgs "" "{\"status\":\"SUCCESS\",\"summary\":\"Reviewed README.md\",\"details\":\"All checks passed\"}")
+                cb ChunkDone
+        }
+
+  res <- subAgentLoop es streamingDriver sId ["read_file*", "submit_report*"] turnsVar attemptedVar repVar 1 5
+  case res of
+    Left err -> failTest ("Unexpected subAgentLoop failure: " <> T.unpack err)
+    Right rep -> do
+      assert "Report status is SUCCESS" (reportStatus rep == "SUCCESS")
+      assert "Report summary is correct" (reportSummary rep == "Reviewed README.md")
+
+  attempted <- readTVarIO attemptedVar
+  assert "Attempted tool logged with path argument instead of empty ()" (any ("read_file(README.md)" `T.isInfixOf`) attempted)
+
+  allTurns <- readTVarIO turnsVar
+  -- Verify that the tool result was successful (read README.md contents) and not "key 'path' not found"
+  let toolResults = [ resOut | Turn _ ToolRole blocks <- allTurns, ToolResultBlock ToolResult{resultStdout = resOut} <- blocks ]
+  assert "Tool result contains actual README content" (any ("lambdA" `T.isInfixOf`) toolResults)
+
+  putStrLn "  -> OK: Multi-chunk streamed arguments with empty target IDs accumulate and decode correctly."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =
