@@ -8,6 +8,7 @@ import Data.Sequence (Seq)
 import Data.Text (Text)
 import Data.Time.Clock (UTCTime)
 
+import Lambda.Config (Config)
 import Lambda.Core.EngineInterface (EngineChannels)
 import Lambda.Types
 
@@ -62,4 +63,5 @@ data UIState = UIState
   , uiShowHud          :: !Bool
   , uiCompletion       :: !(Maybe CompletionState)
   , uiIsGenerating     :: !Bool
+  , uiConfig           :: !Config
   }

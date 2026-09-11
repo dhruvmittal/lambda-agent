@@ -21,7 +21,7 @@ import qualified Data.Text.Encoding as TE
 import Text.Read (readMaybe)
 
 import qualified Data.Map.Strict as Map
-import Lambda.Config (Config(..), resolveModelAlias, lookupModelContextLimit)
+import Lambda.Config (Config(..), resolveModelWithConfig, lookupModelContextLimit)
 import Lambda.Core.ModelDriver (ModelDriver(..))
 import Lambda.Core.ToolProvider (toolsToOpenAISchema)
 import Lambda.Engine.Compactor (compactHistory, estimateTotalTokens)
@@ -71,7 +71,7 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       atomically $ writeTVar appMode newMode
       engineWorkerLoop engineState driver channels activeTaskVar
     CmdSetModel rawModel -> do
-      let targetModel = resolveModelAlias rawModel
+      let targetModel = resolveModelWithConfig appConfig rawModel
           targetLimit = lookupModelContextLimit targetModel
       atomically $ do
         writeTVar appActiveModel targetModel

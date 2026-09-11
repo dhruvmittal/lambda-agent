@@ -265,6 +265,7 @@ main = do
         , uiShowHud          = False
         , uiCompletion       = Nothing
         , uiIsGenerating     = False
+        , uiConfig           = cfg
         }
 
   -- 10. Run Brick TUI

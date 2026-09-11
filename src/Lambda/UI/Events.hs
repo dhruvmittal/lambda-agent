@@ -6,6 +6,7 @@ module Lambda.UI.Events
   , allCommands
   , computeCommandMatches
   , replaceCurrentToken
+  , cycleCompletedToken
   ) where
 
 import Brick
@@ -254,9 +255,10 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar '\t') [])) = do
     -- If candidates already active, cycle forward in-place
     Just (CompletionState cands sel) | not (null cands) -> do
       let nextSel = (sel + 1) `mod` length cands
-          selected = cands !! nextSel
+          prevSelected = cands !! sel
+          nextSelected = cands !! nextSel
       put st
-        { uiEditor     = replaceCurrentToken (candInsert selected) (uiEditor st)
+        { uiEditor     = cycleCompletedToken (candInsert prevSelected) (candInsert nextSelected) (uiEditor st)
         , uiCompletion = Just (CompletionState cands nextSel)
         }
     -- Not yet active, trigger contextual completion
@@ -287,9 +289,10 @@ handleAppEvent (VtyEvent (V.EvKey V.KBackTab [])) = do
   case uiCompletion st of
     Just (CompletionState cands sel) | not (null cands) -> do
       let prevSel = if sel <= 0 then length cands - 1 else sel - 1
-          selected = cands !! prevSel
+          prevSelected = cands !! sel
+          nextSelected = cands !! prevSel
       put st
-        { uiEditor     = replaceCurrentToken (candInsert selected) (uiEditor st)
+        { uiEditor     = cycleCompletedToken (candInsert prevSelected) (candInsert nextSelected) (uiEditor st)
         , uiCompletion = Just (CompletionState cands prevSel)
         }
     _ -> pure ()
@@ -362,9 +365,10 @@ handleAppEvent (VtyEvent (V.EvKey V.KUp [])) = do
   case uiCompletion st of
     Just (CompletionState cands sel) | not (null cands) -> do
       let prevSel = if sel <= 0 then length cands - 1 else sel - 1
-          selected = cands !! prevSel
+          prevSelected = cands !! sel
+          nextSelected = cands !! prevSel
       put st
-        { uiEditor     = replaceCurrentToken (candInsert selected) (uiEditor st)
+        { uiEditor     = cycleCompletedToken (candInsert prevSelected) (candInsert nextSelected) (uiEditor st)
         , uiCompletion = Just (CompletionState cands prevSel)
         }
     _ -> vScrollBy (viewportScroll ChatView) (-2)
@@ -374,9 +378,10 @@ handleAppEvent (VtyEvent (V.EvKey V.KDown [])) = do
   case uiCompletion st of
     Just (CompletionState cands sel) | not (null cands) -> do
       let nextSel = if sel >= length cands - 1 then 0 else sel + 1
-          selected = cands !! nextSel
+          prevSelected = cands !! sel
+          nextSelected = cands !! nextSel
       put st
-        { uiEditor     = replaceCurrentToken (candInsert selected) (uiEditor st)
+        { uiEditor     = cycleCompletedToken (candInsert prevSelected) (candInsert nextSelected) (uiEditor st)
         , uiCompletion = Just (CompletionState cands nextSel)
         }
     _ -> vScrollBy (viewportScroll ChatView) 2
@@ -440,9 +445,8 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 'n') [V.MCtrl])) = do
 handleAppEvent (VtyEvent (V.EvKey V.KEnter [])) = do
   st <- get
   case uiCompletion st of
-    Just (CompletionState cands sel) | not (null cands) && sel >= 0 && sel < length cands -> do
-      let selected = cands !! sel
-          fullCmd = T.strip (T.unlines (E.getEditContents (replaceCurrentToken (candInsert selected) (uiEditor st))))
+    Just (CompletionState _ sel) | sel >= 0 -> do
+      let fullCmd = T.strip (T.concat (E.getEditContents (uiEditor st)))
       put st
         { uiEditor        = E.editor EditorInput (Just 1) ""
         , uiCompletion    = Nothing
@@ -577,11 +581,11 @@ handleCommand cmdText = do
       let modeStr = if uiMode st == PlanMode then "Plan (read-only)" else "Exec (full access)"
       liftIO $ atomically $ writeTBQueue (cmdQueue channels)
         (CmdSystemMessage $ "Current mode: " <> modeStr <> "\nUse '/mode plan' or '/mode exec' (or press Alt+M) to switch.")
-    "/model" -> do
+    cmd | cmd `elem` ["/model", "/models"] -> do
       liftIO $ atomically $ writeTBQueue (cmdQueue channels)
         (CmdSystemMessage $ "Active model: " <> uiModelName st <> " (context limit: " <> T.pack (show (uiContextLimit st)) <> " tokens)\nUse '/model <name_or_alias>' (or /model <Tab>) to switch.")
-    cmd | "/model " `T.isPrefixOf` cmd -> do
-      let target = T.strip (T.drop 7 cmd)
+    cmd | "/model " `T.isPrefixOf` cmd || "/models " `T.isPrefixOf` cmd -> do
+      let target = T.strip (if "/models " `T.isPrefixOf` cmd then T.drop 8 cmd else T.drop 7 cmd)
       if T.null target
         then liftIO $ atomically $ writeTBQueue (cmdQueue channels)
                (CmdSystemMessage "Usage: /model <model_id_or_alias>")
@@ -789,3 +793,15 @@ replaceCurrentToken inserted ed =
                     prefixStr = if null prefixTokens then "" else T.unwords prefixTokens <> " "
                     newText = prefixStr <> inserted <> if "/" `T.isSuffixOf` inserted then "" else " "
                 in setEditorText newText
+
+-- | Cycles the completed token in-place, cleanly replacing the previous candidate
+cycleCompletedToken :: Text -> Text -> E.Editor Text ResourceName -> E.Editor Text ResourceName
+cycleCompletedToken prevCand newCand ed =
+  let fullText = T.concat (E.getEditContents ed)
+      prevSuffixWithSpace = prevCand <> " "
+      newSuffix = newCand <> if "/" `T.isSuffixOf` newCand then "" else " "
+  in if prevSuffixWithSpace `T.isSuffixOf` fullText
+       then setEditorText (T.dropEnd (T.length prevSuffixWithSpace) fullText <> newSuffix)
+       else if prevCand `T.isSuffixOf` fullText
+              then setEditorText (T.dropEnd (T.length prevCand) fullText <> newSuffix)
+              else replaceCurrentToken newCand ed

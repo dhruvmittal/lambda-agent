@@ -12,14 +12,20 @@ module Lambda.Config
   , defaultSpecialists
   , defaultModelAliases
   , resolveModelAlias
+  , resolveModelWithConfig
+  , isLocalEndpoint
+  , isOpenAiEndpoint
+  , isOpenRouterEndpoint
   , lookupModelContextLimit
   , curatedModels
   , resolveEnvTemplates
   , loadConfig
   ) where
 
+import Control.Applicative ((<|>))
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:?), (.!=))
+import Data.Aeson.Types (parseMaybe)
 import qualified Data.ByteString.Lazy as BL
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -173,6 +179,8 @@ data Config = Config
   , mcpServers          :: !(Map Text McpServerConfig)
   , specialists         :: !(Map Text SpecialistConfig)
   , maxSavedSessions    :: !Int
+  , modelAliases        :: !(Map Text Text)
+  , configuredModels    :: ![Text]
   } deriving stock (Eq, Show, Generic)
 
 instance Aeson.ToJSON Config where
@@ -188,6 +196,8 @@ instance Aeson.ToJSON Config where
     , "mcp_servers"         .= mcpServers
     , "specialists"         .= specialists
     , "max_saved_sessions"  .= maxSavedSessions
+    , "model_aliases"       .= modelAliases
+    , "models"              .= configuredModels
     ]
 
 instance Aeson.FromJSON Config where
@@ -204,6 +214,11 @@ instance Aeson.FromJSON Config where
     userSpecialists    <- obj .:? "specialists" .!= Map.empty
     userSubagents      <- obj .:? "subagents" .!= Map.empty
     maxSavedSessions   <- obj .:? "max_saved_sessions" .!= 50
+    mUserAliases       <- obj .:? "model_aliases"
+    modelAliases       <- case mUserAliases of
+                            Just a  -> pure a
+                            Nothing -> obj .:? "aliases" .!= Map.empty
+    configuredModels   <- obj .:? "models" .!= []
     let specialists = Map.union userSpecialists (Map.union userSubagents defaultSpecialists)
         workspaceRoot  = "."
         artifactDir    = ".lambda/artifacts"
@@ -245,6 +260,8 @@ defaultConfig = Config
   , mcpServers          = Map.empty
   , specialists         = defaultSpecialists
   , maxSavedSessions    = 50
+  , modelAliases        = Map.empty
+  , configuredModels    = []
   }
 
 loadConfig :: FilePath -> IO Config
@@ -269,8 +286,37 @@ loadConfig wsRoot = do
       then do
         content <- BL.readFile localPath
         pure $ case Aeson.decode content of
-          Just c  -> c
-          Nothing -> baseCfg
+          Just (Aeson.Object o) ->
+            let pick field fallback = case parseMaybe (.:? field) o of
+                  Just (Just v) -> v
+                  _             -> fallback
+                pickMap field fallback = case parseMaybe (.:? field) o of
+                  Just (Just m) -> Map.union m fallback
+                  _             -> fallback
+                mAliases = case parseMaybe (.:? "model_aliases") o of
+                  Just (Just a) -> Map.union a (modelAliases baseCfg)
+                  _             -> case parseMaybe (.:? "aliases") o of
+                    Just (Just a) -> Map.union a (modelAliases baseCfg)
+                    _             -> modelAliases baseCfg
+                specsWithSubs = case parseMaybe (.:? "subagents") o of
+                  Just (Just sub) -> Map.union sub (specialists baseCfg)
+                  _               -> specialists baseCfg
+            in baseCfg
+              { apiBaseUrl         = pick "api_base_url" (apiBaseUrl baseCfg)
+              , apiKey             = pick "api_key" (apiKey baseCfg)
+              , modelName          = pick "model_name" (modelName baseCfg)
+              , customHeaders      = pickMap "custom_headers" (customHeaders baseCfg)
+              , alwaysAllowGlobs   = pick "always_allow_globs" (alwaysAllowGlobs baseCfg)
+              , alwaysDenyGlobs    = pick "always_deny_globs" (alwaysDenyGlobs baseCfg)
+              , maxTurnBudget      = pick "max_turn_budget" (maxTurnBudget baseCfg)
+              , contextWindowLimit = pick "context_limit" (contextWindowLimit baseCfg)
+              , mcpServers         = pickMap "mcp_servers" (mcpServers baseCfg)
+              , specialists        = pickMap "specialists" specsWithSubs
+              , maxSavedSessions   = pick "max_saved_sessions" (maxSavedSessions baseCfg)
+              , modelAliases       = mAliases
+              , configuredModels   = pick "models" (configuredModels baseCfg)
+              }
+          _ -> baseCfg
       else pure baseCfg
 
   -- Load local .env / .env.local variables if present
@@ -415,6 +461,64 @@ lookupModelContextLimit modId
   | "qwen" `T.isInfixOf` modId     = 128000
   | "free" `T.isInfixOf` modId     = 32000
   | otherwise                      = 128000
+
+-- | Check if api_base_url points to a local provider (Ollama, vLLM, LM Studio, etc.)
+isLocalEndpoint :: Text -> Bool
+isLocalEndpoint url =
+  let u = T.toLower url
+  in "localhost" `T.isInfixOf` u
+     || "127.0.0.1" `T.isInfixOf` u
+     || "0.0.0.0" `T.isInfixOf` u
+     || "192.168." `T.isInfixOf` u
+     || "10." `T.isInfixOf` u
+     || ":11434" `T.isInfixOf` u
+     || ":8000" `T.isInfixOf` u
+     || ":1234" `T.isInfixOf` u
+     || ":8080" `T.isInfixOf` u
+
+-- | Check if api_base_url is direct OpenAI API
+isOpenAiEndpoint :: Text -> Bool
+isOpenAiEndpoint url =
+  let u = T.toLower url
+  in "api.openai.com" `T.isInfixOf` u
+
+-- | Check if api_base_url is OpenRouter
+isOpenRouterEndpoint :: Text -> Bool
+isOpenRouterEndpoint url =
+  let u = T.toLower url
+  in "openrouter.ai" `T.isInfixOf` u
+
+-- | Resolve model alias taking active Config into account (user aliases, endpoint type)
+resolveModelWithConfig :: Config -> Text -> Text
+resolveModelWithConfig cfg rawName =
+  let clean = T.strip rawName
+      cleanLower = T.toLower clean
+      userAliases = modelAliases cfg
+      mUserMatch = Map.lookup clean userAliases
+               <|> Map.lookup cleanLower userAliases
+  in case mUserMatch of
+       Just resolved -> resolved
+       Nothing
+         -- Direct OpenAI endpoint: use clean IDs without OpenRouter vendor prefixes
+         | isOpenAiEndpoint (apiBaseUrl cfg) ->
+             case cleanLower of
+               "4o"       -> "gpt-4o"
+               "gpt-4o"   -> "gpt-4o"
+               "4o-mini"  -> "gpt-4o-mini"
+               "gpt4"     -> "gpt-4o"
+               "o3"       -> "o3-mini"
+               "o3-mini"  -> "o3-mini"
+               "o1"       -> "o1"
+               "o1-mini"  -> "o1-mini"
+               _          -> clean
+         -- Local endpoints (Ollama, vLLM, LM Studio): never inject cloud prefixes
+         | isLocalEndpoint (apiBaseUrl cfg) ->
+             case filter (\m -> T.toLower m == cleanLower) (configuredModels cfg) of
+               (matched:_) -> matched
+               []          -> clean
+         -- OpenRouter or other OpenAI-compatible routers: use curated OpenRouter map
+         | otherwise ->
+             Map.findWithDefault clean cleanLower defaultModelAliases
 
 -- | Curated list of popular models for auto-completion
 curatedModels :: [Text]

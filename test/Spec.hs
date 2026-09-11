@@ -22,7 +22,7 @@ import System.Environment (setEnv, unsetEnv)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
 
-import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), resolveModelAlias, lookupModelContextLimit, resolveEnvTemplates)
+import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, lookupModelContextLimit, resolveEnvTemplates)
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro, expandPromptMacro)
 import Lambda.Core.EngineInterface (initEngineChannels, cmdQueue, startEngineLoop, EngineChannels(..))
 import Lambda.Core.ModelDriver (ModelDriver(..))
@@ -60,7 +60,7 @@ import Lambda.Provider.Builtin (builtinTools, listDirectoryTool, readFileTool, f
 import Lambda.Provider.Mcp (inferCapability, parseMcpCallResult, startAndLoadMcpServers, stopMcpClient)
 import Lambda.UI.Completion (completeInput, allCommands, computeCommandCandidates, slidingCandidateWindow)
 import Lambda.UI.Draw (renderSubAgents, renderSubAgentsSelected, renderInlineSubAgent, renderCompletionLine)
-import Lambda.UI.Events (computeCommandMatches, replaceCurrentToken)
+import Lambda.UI.Events (computeCommandMatches, replaceCurrentToken, cycleCompletedToken)
 import Lambda.UI.Types (CompletionState(..), Candidate(..), simpleCandidate, ResourceName(..), UIState(..))
 import Lambda.Types
 
@@ -110,6 +110,7 @@ main = do
   testSessionRewindAndFork
   testStructuredDiffAndWhitespaceEditing
   testPromptMacrosAndExpansion
+  testModelSwitchingDeploymentFixes
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -1304,6 +1305,7 @@ testContextualCompletersAndMruInvariant = do
         , uiShowHud          = False
         , uiCompletion       = Nothing
         , uiIsGenerating     = False
+        , uiConfig           = defaultConfig
         }
 
   -- 2. /mode contextual completion
@@ -1467,6 +1469,7 @@ testDynamicModelSwitching = do
         , uiShowHud          = False
         , uiCompletion       = Nothing
         , uiIsGenerating     = False
+        , uiConfig           = defaultConfig
         }
 
   mModelComp <- completeInput "." dummyUI "/model "
@@ -1676,6 +1679,7 @@ testPromptMacrosAndExpansion = do
         , uiShowHud          = False
         , uiCompletion       = Nothing
         , uiIsGenerating     = False
+        , uiConfig           = cfg
         }
 
   mPromptComp <- completeInput tempDir dummyUI "/prompt "
@@ -1696,6 +1700,122 @@ testPromptMacrosAndExpansion = do
 
   removeDirectoryRecursive tempDir
   putStrLn "  -> OK: Prompt macros discovered from .lambda/prompts/*.md, $input expanded, autocomplete ribbons integrated."
+
+-- 43. Verify Model Switching Deployment Fixes (Token cycling, local/openai candidate filtering, alias resolution)
+testModelSwitchingDeploymentFixes :: IO ()
+testModelSwitchingDeploymentFixes = do
+  putStrLn "\n[Test 43] Model Switching Deployment Fixes (Token Cycling, Local Filtering, Endpoint-Aware Aliases)"
+
+  -- 1. Verify Token Cycling Replacement (Fixes /mode /models concatenation bug)
+  let ed0 = E.editor EditorInput (Just 1) "/mode "
+      ed1 = cycleCompletedToken "/mode" "/model" ed0
+      text1 = T.concat (E.getEditContents ed1)
+  assert "Cycling from /mode to /model produces '/model ' without concatenation"
+    (text1 == "/model ")
+
+  let ed2 = cycleCompletedToken "/model" "/models" ed1
+      text2 = T.concat (E.getEditContents ed2)
+  assert "Cycling from /model to /models produces '/models ' without concatenation"
+    (text2 == "/models ")
+
+  let ed3 = cycleCompletedToken "/models" "/mode" ed2
+      text3 = T.concat (E.getEditContents ed3)
+  assert "Cycling back to /mode wraps cleanly"
+    (text3 == "/mode ")
+
+  -- Cycling with arguments (e.g. /model 4o -> /model o3)
+  let edArg0 = E.editor EditorInput (Just 1) "/model 4o "
+      edArg1 = cycleCompletedToken "4o" "o3" edArg0
+      textArg1 = T.concat (E.getEditContents edArg1)
+  assert "Cycling model argument replaces only the model token"
+    (textArg1 == "/model o3 ")
+
+  -- 2. Verify Endpoint-Aware Model Alias Resolution
+  let openAiCfg = defaultConfig
+        { apiBaseUrl = "https://api.openai.com/v1"
+        , modelAliases = Map.fromList [("fast", "gpt-4o-mini")]
+        }
+  assert "Direct OpenAI endpoint resolves '4o' to 'gpt-4o' (NOT 'openai/gpt-4o')"
+    (resolveModelWithConfig openAiCfg "4o" == "gpt-4o")
+  assert "Direct OpenAI endpoint resolves 'o3' to 'o3-mini'"
+    (resolveModelWithConfig openAiCfg "o3" == "o3-mini")
+  assert "User-configured alias takes priority on OpenAI"
+    (resolveModelWithConfig openAiCfg "fast" == "gpt-4o-mini")
+
+  let localCfg = defaultConfig
+        { apiBaseUrl = "http://localhost:11434/v1"
+        , configuredModels = ["qwen2.5-coder:32b", "deepseek-r1:14b"]
+        , modelAliases = Map.fromList [("coder", "qwen2.5-coder:32b")]
+        }
+  assert "Local endpoint matches configured models directly without vendor prefix"
+    (resolveModelWithConfig localCfg "qwen2.5-coder:32b" == "qwen2.5-coder:32b")
+  assert "Local endpoint user alias resolves correctly"
+    (resolveModelWithConfig localCfg "coder" == "qwen2.5-coder:32b")
+  assert "Local endpoint unknown model passes through without OpenRouter vendor prefix"
+    (resolveModelWithConfig localCfg "llama3.3:70b" == "llama3.3:70b")
+
+  let openRouterCfg = defaultConfig
+        { apiBaseUrl = "https://openrouter.ai/api/v1"
+        }
+  assert "OpenRouter endpoint resolves '4o' to OpenRouter vendor slug 'openai/gpt-4o'"
+    (resolveModelWithConfig openRouterCfg "4o" == "openai/gpt-4o")
+
+  -- 3. Verify Autocomplete Candidate Filtering (Local vs Cloud)
+  evQ <- atomically newTQueue
+  chans <- initEngineChannels evQ
+  let localUI = UIState
+        { uiTurns            = []
+        , uiSubAgents        = Map.empty
+        , uiCurrentPrompt    = Nothing
+        , uiPendingPrompts   = Seq.Empty
+        , uiMode             = PlanMode
+        , uiEditor           = E.editor EditorInput (Just 1) ""
+        , uiWorkingState     = ""
+        , uiChannels         = chans
+        , uiLastEscTime      = Nothing
+        , uiContextLimit     = 128000
+        , uiPromptHistory    = []
+        , uiHistoryIndex     = Nothing
+        , uiSavedDraft       = ""
+        , uiModelName        = "qwen2.5-coder:32b"
+        , uiThinkingVisible  = True
+        , uiSelectedSubAgent = Nothing
+        , uiShowHud          = False
+        , uiCompletion       = Nothing
+        , uiIsGenerating     = False
+        , uiConfig           = localCfg
+        }
+
+  mLocalComp <- completeInput "." localUI "/model "
+  assert "Local endpoint /model autocomplete contains local models and aliases"
+    (case mLocalComp of
+       Just cs ->
+         let inserts = map candInsert (compCandidates cs)
+         in "coder" `elem` inserts && "qwen2.5-coder:32b" `elem` inserts
+       Nothing -> False)
+  assert "Local endpoint /model autocomplete NEVER contains 'claude' or 'anthropic/claude-3.5-sonnet'"
+    (case mLocalComp of
+       Just cs ->
+         let inserts = map candInsert (compCandidates cs)
+         in not ("claude" `elem` inserts) && not ("anthropic/claude-3.5-sonnet" `elem` inserts)
+       Nothing -> False)
+
+  -- Verify /models autocomplete alias works identically to /model
+  mLocalModelsComp <- completeInput "." localUI "/models "
+  assert "/models autocomplete behaves identically to /model"
+    (fmap (map candInsert . compCandidates) mLocalModelsComp == fmap (map candInsert . compCandidates) mLocalComp)
+
+  -- Verify direct OpenAI endpoint completion never contains 'claude'
+  let openAiUI = localUI { uiConfig = openAiCfg, uiModelName = "gpt-4o" }
+  mOpenAiComp <- completeInput "." openAiUI "/model "
+  assert "Direct OpenAI autocomplete contains 'gpt-4o' and '4o' but NEVER 'claude'"
+    (case mOpenAiComp of
+       Just cs ->
+         let inserts = map candInsert (compCandidates cs)
+         in "4o" `elem` inserts && "gpt-4o" `elem` inserts && not ("claude" `elem` inserts)
+       Nothing -> False)
+
+  putStrLn "  -> OK: Token cycling replaces cleanly in-place, local endpoints exclude cloud models, and aliases resolve endpoint-appropriately."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

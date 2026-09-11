@@ -19,6 +19,7 @@ import Data.Time.Format (defaultTimeLocale, formatTime)
 import System.Directory (doesDirectoryExist, listDirectory)
 import System.FilePath ((</>), splitFileName)
 
+import Lambda.Config (Config(..), isLocalEndpoint, isOpenAiEndpoint)
 import Lambda.Engine.PromptMacro (listPromptMacros)
 import Lambda.Engine.Session (listSessions, SessionMeta(..))
 import Lambda.Types
@@ -31,6 +32,7 @@ allCommands =
   , "/exec"
   , "/mode"
   , "/model"
+  , "/models"
   , "/think"
   , "/session"
   , "/fork"
@@ -108,25 +110,49 @@ completeInput baseDir st rawInput = do
             matched = [ c | c <- allModes, modeArg `T.isPrefixOf` candInsert c || T.null modeArg ]
         pure $ toCompletionState matched
 
-    -- 5. /model argument completion
-    _ | "/model " `T.isPrefixOf` clean -> do
-        let modArg = T.drop 7 clean
-            modelCandidates =
-              [ Candidate "claude"     "claude (anthropic/claude-3.5-sonnet, 200k)"
-              , Candidate "claude-3.7" "claude-3.7 (anthropic/claude-3.7-sonnet, 200k)"
-              , Candidate "r1"         "r1 (deepseek/deepseek-r1, 128k)"
-              , Candidate "4o"         "4o (openai/gpt-4o, 128k)"
-              , Candidate "o3"         "o3 (openai/o3-mini, 200k)"
-              , Candidate "qwen"       "qwen (qwen-2.5-coder-32b, 128k)"
-              , Candidate "free"       "free (openrouter/free, 32k)"
-              , Candidate "anthropic/claude-3.5-sonnet" "anthropic/claude-3.5-sonnet"
-              , Candidate "anthropic/claude-3.7-sonnet" "anthropic/claude-3.7-sonnet"
-              , Candidate "deepseek/deepseek-r1" "deepseek/deepseek-r1"
-              , Candidate "openai/gpt-4o" "openai/gpt-4o"
-              , Candidate "openai/o3-mini" "openai/o3-mini"
-              , Candidate "qwen/qwen-2.5-coder-32b-instruct" "qwen/qwen-2.5-coder-32b-instruct"
-              ]
-            matched = [ c | c <- modelCandidates, modArg `T.isPrefixOf` candInsert c || T.null modArg ]
+    -- 5. /model and /models argument completion
+    _ | "/model " `T.isPrefixOf` clean || "/models " `T.isPrefixOf` clean -> do
+        let modArg = if "/models " `T.isPrefixOf` clean then T.drop 8 clean else T.drop 7 clean
+            cfg = uiConfig st
+            baseUrl = apiBaseUrl cfg
+            userAliases = modelAliases cfg
+            userModels = configuredModels cfg
+            activeMod = uiModelName st
+
+            aliasCands = [ Candidate a (a <> " (" <> target <> ")") | (a, target) <- Map.toList userAliases ]
+            userCands = [ Candidate m m | m <- userModels ]
+            activeCand = if T.null activeMod then [] else [ Candidate activeMod (activeMod <> " (active)") ]
+
+            endpointCands
+              | isLocalEndpoint baseUrl = [] -- STRICT INVARIANT: Never show cloud models on local endpoints!
+              | isOpenAiEndpoint baseUrl =
+                  [ Candidate "4o"      "4o (gpt-4o, 128k)"
+                  , Candidate "4o-mini" "4o-mini (gpt-4o-mini, 128k)"
+                  , Candidate "o3"      "o3 (o3-mini, 200k)"
+                  , Candidate "o1"      "o1 (o1, 200k)"
+                  , Candidate "gpt-4o"  "gpt-4o (128k)"
+                  , Candidate "gpt-4o-mini" "gpt-4o-mini (128k)"
+                  , Candidate "o3-mini" "o3-mini (200k)"
+                  ]
+              | otherwise = -- Default / OpenRouter
+                  [ Candidate "claude"     "claude (anthropic/claude-3.5-sonnet, 200k)"
+                  , Candidate "claude-3.7" "claude-3.7 (anthropic/claude-3.7-sonnet, 200k)"
+                  , Candidate "r1"         "r1 (deepseek/deepseek-r1, 128k)"
+                  , Candidate "4o"         "4o (openai/gpt-4o, 128k)"
+                  , Candidate "o3"         "o3 (openai/o3-mini, 200k)"
+                  , Candidate "qwen"       "qwen (qwen-2.5-coder-32b, 128k)"
+                  , Candidate "free"       "free (openrouter/free, 32k)"
+                  , Candidate "anthropic/claude-3.5-sonnet" "anthropic/claude-3.5-sonnet"
+                  , Candidate "anthropic/claude-3.7-sonnet" "anthropic/claude-3.7-sonnet"
+                  , Candidate "deepseek/deepseek-r1" "deepseek/deepseek-r1"
+                  , Candidate "openai/gpt-4o" "openai/gpt-4o"
+                  , Candidate "openai/o3-mini" "openai/o3-mini"
+                  , Candidate "qwen/qwen-2.5-coder-32b-instruct" "qwen/qwen-2.5-coder-32b-instruct"
+                  ]
+
+            dedupCandidates = foldr (\c acc -> if any (\x -> candInsert x == candInsert c) acc then acc else c : acc) []
+            allCandidates = dedupCandidates (aliasCands ++ userCands ++ activeCand ++ endpointCands)
+            matched = [ c | c <- allCandidates, modArg `T.isPrefixOf` candInsert c || T.null modArg ]
         pure $ toCompletionState matched
 
     -- 5. /think argument completion
