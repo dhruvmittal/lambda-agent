@@ -19,11 +19,17 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Zipper as Z
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
+import Data.Time.Format (defaultTimeLocale, formatTime)
 import qualified Graphics.Vty as V
 import System.Posix.Signals (raiseSignal, sigTSTP)
 
 import Lambda.Core.EngineInterface (EngineChannels(..))
 import Lambda.Engine.Security (resolvePrompt)
+import Lambda.Engine.Session
+  ( SessionMeta(..)
+  , listSessions
+  , pruneSessions
+  )
 import Lambda.Types
 import Lambda.UI.Types
 
@@ -40,6 +46,17 @@ handleAppEvent (AppEvent engineEv) = do
       let adjusted = setThinkingVis (if vis then Visible else Collapsed) turn
       modify $ \s ->
         s { uiTurns = updateMatchingTurn adjusted (uiTurns s) }
+      vScrollToEnd (viewportScroll ChatView)
+    EvSessionSwitched _ mode turns subs -> do
+      vis <- gets uiThinkingVisible
+      let adjustedTurns = map (setThinkingVis (if vis then Visible else Collapsed)) turns
+          adjustedSubs = Map.map (\t -> t { subAgentTurns = map (setThinkingVis (if vis then Visible else Collapsed)) (subAgentTurns t) }) subs
+      modify $ \s -> s
+        { uiTurns = adjustedTurns
+        , uiSubAgents = adjustedSubs
+        , uiMode = mode
+        , uiSelectedSubAgent = Nothing
+        }
       vScrollToEnd (viewportScroll ChatView)
     EvSubAgentUpdate task -> modify $ \s ->
       let vis = uiThinkingVisible s
@@ -311,6 +328,9 @@ handleCommand cmdText = do
     "/help" -> do
       let helpText = T.unlines
             [ "lambdA Commands & Controls:"
+            , "  /new           - Start a fresh session (auto-saves current session)"
+            , "  /session       - List recent sessions (/session <id> to switch, /session prune <N>)"
+            , "  /trace         - Export on-demand markdown trace for debugging"
             , "  /plan          - Switch to Plan mode (read-only tools, no mutations)"
             , "  /exec          - Switch to Exec mode (full tools: bash, file writes)"
             , "  /think         - Toggle thinking/reasoning blocks (or press Ctrl+T)"
@@ -341,6 +361,37 @@ handleCommand cmdText = do
             , "  Mouse Click    - Click on SubAgent #id in sidebar or thinking folds"
             ]
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSystemMessage helpText)
+    "/new" -> do
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdNewSession
+    cmd | cmd `elem` ["/session", "/sessions"] -> do
+      metas <- liftIO $ listSessions ".lambda/sessions"
+      let total = length metas
+          recent = take 20 metas
+          header = "Recent Sessions (" <> T.pack (show (length recent)) <> " of " <> T.pack (show total) <> "):\n"
+          formatMeta m =
+            let timeStr = T.pack $ formatTime defaultTimeLocale "%Y-%m-%d %H:%M" (metaUpdatedAt m)
+                turnsStr = T.pack $ show (metaTurnCount m)
+                agentsStr = T.pack $ show (metaSubAgentCount m)
+            in "  " <> metaId m <> " | " <> timeStr <> " | " <> turnsStr <> " turns | " <> agentsStr <> " subagents | " <> metaTitle m
+          msg = if null metas
+                  then "No saved sessions found in .lambda/sessions/"
+                  else header <> T.unlines (map formatMeta recent) <> "\nUse '/session <id>' to switch, or '/session prune <keep>' to clean up."
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSystemMessage msg)
+    cmd | "/session prune " `T.isPrefixOf` cmd -> do
+      let arg = T.strip (T.drop 15 cmd)
+      case reads (T.unpack arg) of
+        [(n, "")] -> do
+          pruned <- liftIO $ pruneSessions ".lambda/sessions" n
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+            (CmdSystemMessage $ "Pruned " <> T.pack (show pruned) <> " old session(s). Keeping " <> T.pack (show (n :: Int)) <> " most recent.")
+        _ ->
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+            (CmdSystemMessage "Usage: /session prune <keep_count> (e.g. /session prune 20)")
+    cmd | "/session " `T.isPrefixOf` cmd -> do
+      let targetId = T.strip (T.drop 9 cmd)
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSwitchSession targetId)
+    cmd | cmd `elem` ["/trace", "/export", "/dump"] -> do
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdExportTrace
     "/plan" -> do
       put st { uiMode = PlanMode }
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSetMode PlanMode)

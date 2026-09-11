@@ -41,6 +41,7 @@ library
         Lambda.Engine.Compactor
         Lambda.Engine.SubAgent
         Lambda.Engine.Artifacts
+        Lambda.Engine.Session
         Lambda.UI.Types
         Lambda.UI.Draw
         Lambda.UI.Events
@@ -89,7 +90,9 @@ executable lambda
         vty-crossplatform,
         text,
         stm,
-        containers
+        containers,
+        time,
+        filepath
 
 test-suite lambda-test
     import:           common-options

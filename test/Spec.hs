@@ -15,8 +15,8 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
-import Data.Time.Clock (getCurrentTime, diffUTCTime)
-import System.Directory (removeDirectoryRecursive, doesFileExist, removeFile)
+import Data.Time.Clock (getCurrentTime, diffUTCTime, addUTCTime)
+import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive, doesFileExist, removeFile)
 import System.Environment (setEnv, unsetEnv)
 import System.Exit (exitFailure)
 
@@ -28,7 +28,21 @@ import Lambda.Engine.Artifacts
 import Lambda.Engine.Compactor
 import Lambda.Engine.Dispatcher (executeToolDispatch)
 import Lambda.Engine.Security (initSecurity, checkAuthorization, SecurityState(..))
-import Lambda.Engine.State (initEngineState, registerSubAgentTask, updateSubAgentTurns, appInterrupted, appSubAgents, appMode)
+import Lambda.Engine.Session
+import Lambda.Engine.State
+  ( initEngineState
+  , initEngineStateWithSession
+  , registerSubAgentTask
+  , updateSubAgentTurns
+  , resetEngineSession
+  , appInterrupted
+  , appSubAgents
+  , appMode
+  , appTurns
+  , appTurnCounter
+  , appSubAgentSeq
+  , appSessionDir
+  )
 import Lambda.Engine.SubAgent (submitReportTool, filterSubAgentRegistry, subAgentLoop, SubAgentReport(..))
 import qualified Data.Map.Strict as Map
 import Brick.Types (vSize, Size(..))
@@ -64,6 +78,11 @@ main = do
   testDepth1StarGraphSchemaExclusion
   testDataDrivenSpecialistConfigLoading
   testDynamicPermissionEscalation
+  testSessionSerialization
+  testSessionResumptionAndRestoration
+  testNewSessionIsolation
+  testSessionDiscoveryAndRetentionPruning
+  testOnDemandMarkdownTraceGeneration
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -598,7 +617,11 @@ testDataDrivenSpecialistConfigLoading = do
   assert "reviewer specialist is defined" (Map.member "reviewer" specs)
 
   let profiler = specs Map.! "profiler"
-  assert "profiler budget is 6" (specialistBudget profiler == 6)
+  assert "profiler budget is 10" (specialistBudget profiler == 10)
+  assert "surveyor budget is 16" (specialistBudget (specs Map.! "surveyor") == 16)
+  assert "debugger budget is 14" (specialistBudget (specs Map.! "debugger") == 14)
+  assert "reviewer budget is 12" (specialistBudget (specs Map.! "reviewer") == 12)
+  assert "implementer budget is 12" (specialistBudget (specs Map.! "implementer") == 12)
   assert "profiler has valgrind capability" (any ("valgrind*" `T.isInfixOf`) (specialistCapabilities profiler))
 
   let customJson = "{\"specialists\":{\"fuzzer\":{\"description\":\"AFL++ fuzzer\",\"prompt\":\"Run fuzzer\",\"budget\":12,\"granted_capabilities\":[\"afl*\"]}}}"
@@ -657,6 +680,214 @@ testDynamicPermissionEscalation = do
     ("Permission Denied" `T.isInfixOf` resultStderr resC)
 
   putStrLn "  -> OK: Ungranted subagent tool call triggers dynamic user permission escalation and honors user decision."
+
+-- 24. Verify Session Serialization & Deserialization Invariant
+testSessionSerialization :: IO ()
+testSessionSerialization = do
+  putStrLn "\n[Test 24] Session Serialization & Deserialization Invariant"
+  now <- getCurrentTime
+  let tempDir = ".lambda/test_sessions_24"
+      toolCall = ToolCall "call_123" "bash" (Aeson.object ["command" .= ("ls -la" :: Text)])
+      toolRes  = ToolResult "call_123" "file1.txt\nfile2.txt" "" Nothing
+      turn1 = Turn 1 UserRole [TextBlock "Initial prompt to inspect repository"]
+      turn2 = Turn 2 AssistantRole
+        [ ThinkingBlock 1 "Must run ls to check directory contents" Collapsed
+        , ToolCallBlock toolCall
+        , ToolResultBlock toolRes
+        , TextBlock "Here are the files."
+        ]
+      subTurns =
+        [ Turn 1 UserRole [TextBlock "Explore files"]
+        , Turn 2 AssistantRole [TextBlock "Files explored successfully"]
+        ]
+      subTask = SubAgentTask 1 "surveyor" "Verify workspace structure" 1 16 (SubAgentSuccess "Structure OK") Nothing subTurns
+      sess = Session
+        { sessionId           = "session_test_24"
+        , sessionCreatedAt     = now
+        , sessionUpdatedAt     = now
+        , sessionTitle         = "Initial prompt to inspect repository"
+        , sessionMode          = ExecMode
+        , sessionTurns         = [turn1, turn2]
+        , sessionSubAgents     = Map.singleton 1 subTask
+        , sessionStateVector   = Map.singleton "state_vector" "GOAL: Inspect repo"
+        , sessionPromptHistory = ["Initial prompt to inspect repository"]
+        }
+
+  saveSession tempDir 50 sess
+  loadRes <- loadSession tempDir "session_test_24"
+  case loadRes of
+    Left err -> failTest ("Failed to load saved session: " <> T.unpack err)
+    Right loaded -> do
+      assert "Session ID matches" (sessionId loaded == "session_test_24")
+      assert "Session Title matches" (sessionTitle loaded == "Initial prompt to inspect repository")
+      assert "Session Mode matches" (sessionMode loaded == ExecMode)
+      assert "Turn count matches" (length (sessionTurns loaded) == 2)
+      assert "SubAgent count matches" (Map.size (sessionSubAgents loaded) == 1)
+      let loadedSub = sessionSubAgents loaded Map.! 1
+      assert "SubAgent role matches" (subAgentRole loadedSub == "surveyor")
+      assert "SubAgent turns match" (length (subAgentTurns loadedSub) == 2)
+      assert "SubAgent status matches" (subAgentStatus loadedSub == SubAgentSuccess "Structure OK")
+  removeDirectoryRecursive tempDir
+  putStrLn "  -> OK: Full session state serialized and deserialized with zero loss."
+
+-- 25. Verify Session Resumption & Engine State Restoration Invariant
+testSessionResumptionAndRestoration :: IO ()
+testSessionResumptionAndRestoration = do
+  putStrLn "\n[Test 25] Session Resumption & Engine State Restoration Invariant"
+  sec <- initSecurity [] []
+  cfg <- loadConfig "."
+  now <- getCurrentTime
+  let subTask = SubAgentTask 2 "debugger" "Investigate crash" 3 14 (SubAgentSuccess "Found bug") Nothing []
+      sess = Session
+        { sessionId           = "session_test_25"
+        , sessionCreatedAt     = now
+        , sessionUpdatedAt     = now
+        , sessionTitle         = "Debug crash"
+        , sessionMode          = ExecMode
+        , sessionTurns         = [Turn 1 UserRole [TextBlock "debug this crash"], Turn 2 AssistantRole [TextBlock "Fixed"]]
+        , sessionSubAgents     = Map.singleton 2 subTask
+        , sessionStateVector   = Map.singleton "state_vector" "GOAL: Fix bug"
+        , sessionPromptHistory = ["debug this crash"]
+        }
+
+  es <- initEngineStateWithSession cfg emptyRegistry sec (Just sess)
+
+  mode <- readTVarIO (appMode es)
+  turns <- readTVarIO (appTurns es)
+  tCount <- readTVarIO (appTurnCounter es)
+  subs <- readTVarIO (appSubAgents es)
+  subSeq <- readTVarIO (appSubAgentSeq es)
+
+  assert "Engine Mode restored to ExecMode" (mode == ExecMode)
+  assert "Engine turns restored" (length turns == 2)
+  assert "Turn counter advanced past max turn ID" (tCount == 3)
+  assert "Subagents restored in engine state" (Map.member 2 subs)
+  assert "SubAgent sequence advanced past max sub ID" (subSeq == 3)
+  putStrLn "  -> OK: AppEngineState initialized completely and faithfully from restored Session."
+
+-- 26. Verify /new Session Isolation Invariant
+testNewSessionIsolation :: IO ()
+testNewSessionIsolation = do
+  putStrLn "\n[Test 26] /new Session Isolation Invariant"
+  sec <- initSecurity [] []
+  cfg <- loadConfig "."
+  let tempDir = ".lambda/test_sessions_26"
+  now <- getCurrentTime
+  let sess = Session
+        { sessionId           = "session_test_26_old"
+        , sessionCreatedAt     = now
+        , sessionUpdatedAt     = now
+        , sessionTitle         = "Old active session"
+        , sessionMode          = ExecMode
+        , sessionTurns         = [Turn 1 UserRole [TextBlock "old task"]]
+        , sessionSubAgents     = Map.empty
+        , sessionStateVector   = Map.empty
+        , sessionPromptHistory = []
+        }
+  es <- initEngineStateWithSession cfg emptyRegistry sec (Just sess)
+  -- Point appSessionDir to tempDir for testing
+  let es' = es { appSessionDir = tempDir }
+
+  freshSess <- resetEngineSession es'
+
+  -- Verify old session was saved to disk
+  oldFileExists <- doesFileExist (tempDir ++ "/session_test_26_old.json")
+  assert "Old session file persisted during /new reset" oldFileExists
+
+  -- Verify engine state is reset to fresh
+  freshTurns <- readTVarIO (appTurns es')
+  freshSubs <- readTVarIO (appSubAgents es')
+  freshMode <- readTVarIO (appMode es')
+  assert "Fresh session has 1 initial welcome turn" (length freshTurns == 1)
+  assert "Fresh session has empty subagent map" (Map.null freshSubs)
+  assert "Fresh session resets to PlanMode" (freshMode == PlanMode)
+  assert "New session has distinct ID" (sessionId freshSess /= "session_test_26_old")
+
+  removeDirectoryRecursive tempDir
+  putStrLn "  -> OK: /new cleanly flushes engine state while persisting old session to disk."
+
+-- 27. Verify CLI --continue Most Recent Discovery & Retention Pruning Invariant
+testSessionDiscoveryAndRetentionPruning :: IO ()
+testSessionDiscoveryAndRetentionPruning = do
+  putStrLn "\n[Test 27] CLI --continue Discovery & Retention Pruning Invariant"
+  let tempDir = ".lambda/test_sessions_27"
+  now <- getCurrentTime
+  createDirectoryIfMissing True tempDir
+
+  -- Create 4 sessions with distinct timestamps 100 seconds apart
+  let mkSess i = Session
+        { sessionId           = "session_item_" <> T.pack (show i)
+        , sessionCreatedAt     = addUTCTime (fromIntegral (i * 100)) now
+        , sessionUpdatedAt     = addUTCTime (fromIntegral (i * 100)) now
+        , sessionTitle         = "Session " <> T.pack (show i)
+        , sessionMode          = PlanMode
+        , sessionTurns         = []
+        , sessionSubAgents     = Map.empty
+        , sessionStateVector   = Map.empty
+        , sessionPromptHistory = []
+        }
+
+  mapM_ (\i -> saveSession tempDir 0 (mkSess i)) [1..4 :: Int]
+
+  -- Verify getLatestSession discovers session 4
+  mTop <- getLatestSession tempDir
+  case mTop of
+    Nothing -> failTest "getLatestSession failed to find any session"
+    Just topSess ->
+      assert "Discovered latest session 4" (sessionId topSess == "session_item_4")
+
+  -- Prune down to 2 sessions
+  prunedCount <- pruneSessions tempDir 2
+  assert "Pruned exactly 2 excess sessions" (prunedCount == 2)
+
+  remaining <- listSessions tempDir
+  assert "Exactly 2 sessions remain" (length remaining == 2)
+  assert "Remaining sessions are the two newest (4 and 3)"
+    (map metaId remaining == ["session_item_4", "session_item_3"])
+
+  removeDirectoryRecursive tempDir
+  putStrLn "  -> OK: getLatestSession accurately discovers latest session and pruneSessions enforces LRU retention."
+
+-- 28. Verify On-Demand Markdown Trace Generation Invariant
+testOnDemandMarkdownTraceGeneration :: IO ()
+testOnDemandMarkdownTraceGeneration = do
+  putStrLn "\n[Test 28] On-Demand Markdown Trace Generation Invariant"
+  now <- getCurrentTime
+  let tempDir = ".lambda/test_sessions_28"
+      subTask = SubAgentTask 1 "profiler" "Analyze hotspots" 4 10 (SubAgentSuccess "Optimized") Nothing
+        [ Turn 1 UserRole [TextBlock "profile hotspot"]
+        , Turn 2 AssistantRole
+            [ ThinkingBlock 1 "Checking valgrind output" Collapsed
+            , ToolCallBlock (ToolCall "c1" "valgrind" (Aeson.object ["args" .= ("--tool=callgrind" :: Text)]))
+            , ToolResultBlock (ToolResult "c1" "1000 instructions" "" Nothing)
+            , TextBlock "Hotspot identified."
+            ]
+        ]
+      sess = Session
+        { sessionId           = "session_test_28"
+        , sessionCreatedAt     = now
+        , sessionUpdatedAt     = now
+        , sessionTitle         = "Profile hotspot"
+        , sessionMode          = PlanMode
+        , sessionTurns         = [Turn 1 UserRole [TextBlock "Run profile"], Turn 2 AssistantRole [TextBlock "Done"]]
+        , sessionSubAgents     = Map.singleton 1 subTask
+        , sessionStateVector   = Map.empty
+        , sessionPromptHistory = []
+        }
+
+  let md = renderSessionTraceMarkdown sess
+  assert "Trace includes Session ID" ("session_test_28" `T.isInfixOf` md)
+  assert "Trace includes SubAgent role" ("profiler" `T.isInfixOf` md)
+  assert "Trace includes tool invocation" ("valgrind" `T.isInfixOf` md)
+  assert "Trace includes thinking block" ("Thinking / Chain-of-Thought" `T.isInfixOf` md)
+
+  -- Verify exportSessionTrace creates the on-demand trace file
+  exportedPath <- exportSessionTrace tempDir sess
+  traceExists <- doesFileExist exportedPath
+  assert "On-demand trace file created on disk" traceExists
+
+  removeDirectoryRecursive tempDir
+  putStrLn "  -> OK: On-demand markdown trace renders complete telemetry and writes strictly when requested."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

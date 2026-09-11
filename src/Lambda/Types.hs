@@ -8,6 +8,7 @@ import Control.Concurrent.STM (TMVar)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:))
 import qualified Data.ByteString.Lazy as BL
+import Data.Map.Strict (Map)
 import Data.Text (Text)
 import qualified Data.Text.Encoding as TE
 import GHC.Generics (Generic)
@@ -193,6 +194,7 @@ data EngineEvent
   | EvPermissionResolved !Int !PermissionLevel
   | EvSubAgentUpdate !SubAgentTask
   | EvWorkingStateUpdate !Text
+  | EvSessionSwitched !Text !AgentMode ![Turn] !(Map Int SubAgentTask)
   | EvError !Text
 
 -- | Frontend to Engine dispatch commands
@@ -204,6 +206,9 @@ data FrontendCommand
   | CmdResolvePermission !Int !PermissionLevel
   | CmdCancelSubAgent !Int
   | CmdCompactHistory
+  | CmdNewSession
+  | CmdSwitchSession !Text
+  | CmdExportTrace
   | CmdInterrupt
   | CmdQuit
   deriving stock (Eq, Show, Generic)

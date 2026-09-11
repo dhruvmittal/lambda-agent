@@ -11,15 +11,30 @@ import Control.Concurrent.STM (atomically, readTQueue, writeTVar)
 import Control.Monad (forever)
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
+import qualified Data.Text as T
+import qualified Data.Text.IO as TIO
+import Data.Time.Format (defaultTimeLocale, formatTime)
 import qualified Graphics.Vty as V
 import qualified Graphics.Vty.CrossPlatform as VCross
+import System.Environment (getArgs)
+import System.Exit (exitFailure, exitSuccess)
+import System.FilePath ((</>))
 
 import Lambda.Config (loadConfig, Config(..))
 import Lambda.Core.EngineInterface (initEngineChannels, startEngineLoop, EngineChannels(..))
 import Lambda.Core.ToolProvider (emptyRegistry, registerTools, registerTool)
 import Lambda.Driver.OpenAI (openAiDriver)
 import Lambda.Engine.Security (initSecurity)
-import Lambda.Engine.State (initEngineState, AppEngineState(..))
+import Lambda.Engine.Session
+  ( Session(..)
+  , SessionMeta(..)
+  , exportSessionTrace
+  , getLatestSession
+  , listSessions
+  , loadSession
+  , renderSessionTraceMarkdown
+  )
+import Lambda.Engine.State (initEngineStateWithSession, AppEngineState(..))
 import Lambda.Engine.SubAgent (spawnSpecialistSubAgentTool, spawnDiagnosticSubAgentTool)
 import Lambda.Provider.Builtin (builtinTools)
 import Lambda.Provider.Mcp (startAndLoadMcpServers)
@@ -65,6 +80,105 @@ main :: IO ()
 main = do
   -- 1. Load configuration and workspace rules
   cfg <- loadConfig "."
+  args <- getArgs
+  let sessDir = workspaceRoot cfg </> ".lambda" </> "sessions"
+
+  -- Handle CLI-only commands
+  case args of
+    ["--list-sessions"] -> do
+      metas <- listSessions sessDir
+      let total = length metas
+          recent = take 20 metas
+          formatMeta m =
+            let timeStr = T.pack $ formatTime defaultTimeLocale "%Y-%m-%d %H:%M" (metaUpdatedAt m)
+                turnsStr = T.pack $ show (metaTurnCount m)
+                agentsStr = T.pack $ show (metaSubAgentCount m)
+            in "  " <> metaId m <> " | " <> timeStr <> " | " <> turnsStr <> " turns | " <> agentsStr <> " subagents | " <> metaTitle m
+      putStrLn $ "Recent Sessions (" ++ show (length recent) ++ " of " ++ show total ++ "):"
+      if null metas
+        then putStrLn "  No saved sessions found in .lambda/sessions/"
+        else mapM_ (TIO.putStrLn . formatMeta) recent
+      exitSuccess
+    ["--inspect"] -> do
+      mTop <- getLatestSession sessDir
+      case mTop of
+        Just s  -> TIO.putStrLn (renderSessionTraceMarkdown s) >> exitSuccess
+        Nothing -> putStrLn "No saved sessions found to inspect." >> exitFailure
+    ["-i"] -> do
+      mTop <- getLatestSession sessDir
+      case mTop of
+        Just s  -> TIO.putStrLn (renderSessionTraceMarkdown s) >> exitSuccess
+        Nothing -> putStrLn "No saved sessions found to inspect." >> exitFailure
+    ["--inspect", sid] -> do
+      loadRes <- loadSession sessDir (T.pack sid)
+      case loadRes of
+        Left err -> TIO.putStrLn ("Error: " <> err) >> exitFailure
+        Right s  -> TIO.putStrLn (renderSessionTraceMarkdown s) >> exitSuccess
+    ["-i", sid] -> do
+      loadRes <- loadSession sessDir (T.pack sid)
+      case loadRes of
+        Left err -> TIO.putStrLn ("Error: " <> err) >> exitFailure
+        Right s  -> TIO.putStrLn (renderSessionTraceMarkdown s) >> exitSuccess
+    ["--export-trace"] -> do
+      mTop <- getLatestSession sessDir
+      case mTop of
+        Just s  -> do
+          p <- exportSessionTrace sessDir s
+          putStrLn $ "Exported trace to: " ++ p
+          exitSuccess
+        Nothing -> putStrLn "No saved sessions found to export." >> exitFailure
+    ["--export-trace", sid] -> do
+      loadRes <- loadSession sessDir (T.pack sid)
+      case loadRes of
+        Left err -> TIO.putStrLn ("Error: " <> err) >> exitFailure
+        Right s  -> do
+          p <- exportSessionTrace sessDir s
+          putStrLn $ "Exported trace to: " ++ p
+          exitSuccess
+    _ -> pure ()
+
+  -- Parse session resumption for TUI launch
+  loadedSession <- case args of
+    ["--continue"] -> do
+      mTop <- getLatestSession sessDir
+      case mTop of
+        Just s -> do
+          putStrLn $ "Resuming session: " ++ T.unpack (sessionId s) ++ " (" ++ T.unpack (sessionTitle s) ++ ")"
+          pure (Just s)
+        Nothing -> do
+          putStrLn "No existing session found in .lambda/sessions/. Starting a fresh session."
+          pure Nothing
+    ["-c"] -> do
+      mTop <- getLatestSession sessDir
+      case mTop of
+        Just s -> do
+          putStrLn $ "Resuming session: " ++ T.unpack (sessionId s) ++ " (" ++ T.unpack (sessionTitle s) ++ ")"
+          pure (Just s)
+        Nothing -> do
+          putStrLn "No existing session found in .lambda/sessions/. Starting a fresh session."
+          pure Nothing
+    ["--session", sid] -> do
+      loadRes <- loadSession sessDir (T.pack sid)
+      case loadRes of
+        Left err -> do
+          putStrLn $ "Error resuming session " ++ sid ++ ": " ++ T.unpack err
+          exitFailure
+        Right s -> do
+          putStrLn $ "Resuming session: " ++ sid ++ " (" ++ T.unpack (sessionTitle s) ++ ")"
+          pure (Just s)
+    ["-s", sid] -> do
+      loadRes <- loadSession sessDir (T.pack sid)
+      case loadRes of
+        Left err -> do
+          putStrLn $ "Error resuming session " ++ sid ++ ": " ++ T.unpack err
+          exitFailure
+        Right s -> do
+          putStrLn $ "Resuming session: " ++ sid ++ " (" ++ T.unpack (sessionTitle s) ++ ")"
+          pure (Just s)
+    [] -> pure Nothing
+    _  -> do
+      putStrLn "Usage: lambda [--continue|-c] [--session|-s <id>] [--list-sessions] [--inspect [id]] [--export-trace [id]]"
+      exitFailure
 
   -- 2. Initialize tool registry with builtins and configured MCP servers
   let builtinReg = registerTools (builtinTools (workspaceRoot cfg) (artifactDir cfg)) emptyRegistry
@@ -75,7 +189,7 @@ main = do
   secState <- initSecurity (alwaysAllowGlobs cfg) (alwaysDenyGlobs cfg)
 
   -- 4. Initialize engine state and model driver
-  engineState <- initEngineState cfg baseRegistry secState
+  engineState <- initEngineStateWithSession cfg baseRegistry secState loadedSession
   driver <- openAiDriver cfg
 
   -- 5. Register SubAgent spawning tools (which require engine state & driver)
@@ -94,28 +208,41 @@ main = do
     writeBChan eventChan ev
 
   -- 8. Setup Vty terminal with bracketed paste enabled (and mouse trap disabled)
-  -- Disabling V.Mouse enables native terminal click-and-drag text selection and copy/paste
   initialVty <- VCross.mkVty V.defaultConfig
   V.setMode (V.outputIface initialVty) V.BracketedPaste True
 
-  -- 9. Initialize UI State
+  -- 9. Initialize UI State from loaded session
+  let initialTurns = case loadedSession of
+        Just s | not (null (sessionTurns s)) -> sessionTurns s
+        _ -> [Turn 1 SystemRole [TextBlock "lambdA initialized. Enter a goal or press /help for commands."]]
+      initialSubs = case loadedSession of
+        Just s  -> sessionSubAgents s
+        Nothing -> Map.empty
+      initialMode = case loadedSession of
+        Just s  -> sessionMode s
+        Nothing -> PlanMode
+      initialStVec = case loadedSession of
+        Just s | Just sv <- Map.lookup "state_vector" (sessionStateVector s) -> sv
+        _ -> "GOAL: Awaiting task\nINVARIANTS: []\nACTIVE_HYPOTHESIS: None\nBLOCKED_ON: User"
+      initialPrompts = case loadedSession of
+        Just s  -> sessionPromptHistory s
+        Nothing -> []
+
   let initialUIState = UIState
-        { uiTurns          =
-            [ Turn 1 SystemRole [TextBlock "lambdA initialized. Enter a goal or press /help for commands."]
-            ]
-        , uiSubAgents      = Map.empty
+        { uiTurns          = initialTurns
+        , uiSubAgents      = initialSubs
         , uiCurrentPrompt  = Nothing
         , uiPendingPrompts = Seq.Empty
-        , uiMode           = PlanMode
+        , uiMode           = initialMode
         , uiEditor         = E.editor EditorInput (Just 1) ""
-        , uiWorkingState   = "GOAL: Awaiting task\nINVARIANTS: []\nACTIVE_HYPOTHESIS: None\nBLOCKED_ON: User"
+        , uiWorkingState   = initialStVec
         , uiChannels       = channels
         , uiLastEscTime    = Nothing
         , uiContextLimit   = contextWindowLimit cfg
-        , uiPromptHistory  = []
+        , uiPromptHistory  = initialPrompts
         , uiHistoryIndex   = Nothing
-        , uiSavedDraft       = ""
-        , uiModelName        = modelName cfg
+        , uiSavedDraft     = ""
+        , uiModelName      = modelName cfg
         , uiThinkingVisible  = True
         , uiSelectedSubAgent = Nothing
         }

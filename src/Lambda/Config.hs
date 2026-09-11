@@ -84,7 +84,7 @@ defaultSpecialists = Map.fromList
             , "3. PRECISE REFERENCES: Return exact file paths and line ranges (e.g. src/Foo.hs:L40-L65)."
             , "When your survey is complete, call `submit_report` with status, summary, details, and any artifact path."
             ]
-        , specialistBudget       = 4
+        , specialistBudget       = 16
         , specialistCapabilities = ["read_file*", "list_directory*", "grep_search*", "find_by_name*", "fetch_url*", "sd_*", "git status*", "git diff*", "git log*"]
         }
     )
@@ -100,7 +100,7 @@ defaultSpecialists = Map.fromList
             , "3. MINIMAL SURGERY: Diagnose the root cause and propose the minimal surgical fix required."
             , "When your diagnosis is complete, call `submit_report` with status, summary, details, and any artifact path."
             ]
-        , specialistBudget       = 6
+        , specialistBudget       = 14
         , specialistCapabilities = ["read_file*", "grep_search*", "find_by_name*", "cabal test*", "ctest*", "pytest*", "bash*", "sd_*"]
         }
     )
@@ -116,7 +116,7 @@ defaultSpecialists = Map.fromList
             , "3. CONCRETE REMEDY: Recommend specific optimizations (e.g. allocation pre-sizing, unboxed structures, memory reuse)."
             , "When profiling is complete, call `submit_report` with status, summary, details, and the profile artifact path."
             ]
-        , specialistBudget       = 6
+        , specialistBudget       = 10
         , specialistCapabilities = ["valgrind*", "callgrind_annotate*", "perf*", "read_file*", "bash*", "cabal bench*"]
         }
     )
@@ -132,7 +132,7 @@ defaultSpecialists = Map.fromList
             , "3. VERIFY DIFFS: Check your changes for syntax correctness and clean formatting."
             , "When changes are complete, call `submit_report` with status, summary, details, and the modified file paths."
             ]
-        , specialistBudget       = 6
+        , specialistBudget       = 12
         , specialistCapabilities = ["write_file*", "replace_lines*", "read_file*", "sd_read*"]
         }
     )
@@ -148,7 +148,7 @@ defaultSpecialists = Map.fromList
             , "3. ACTIONABLE VERDICT: Issue APPROVED or CHANGES_REQUESTED with precise line-by-line feedback."
             , "When review is complete, call `submit_report` with status, summary, details, and any review artifacts."
             ]
-        , specialistBudget       = 4
+        , specialistBudget       = 12
         , specialistCapabilities = ["git diff*", "git log*", "read_file*", "cabal test*", "ctest*", "sd_recall*"]
         }
     )
@@ -167,6 +167,7 @@ data Config = Config
   , contextWindowLimit  :: !Int
   , mcpServers          :: !(Map Text McpServerConfig)
   , specialists         :: !(Map Text SpecialistConfig)
+  , maxSavedSessions    :: !Int
   } deriving stock (Eq, Show, Generic)
 
 instance Aeson.ToJSON Config where
@@ -181,6 +182,7 @@ instance Aeson.ToJSON Config where
     , "context_limit"       .= contextWindowLimit
     , "mcp_servers"         .= mcpServers
     , "specialists"         .= specialists
+    , "max_saved_sessions"  .= maxSavedSessions
     ]
 
 instance Aeson.FromJSON Config where
@@ -196,6 +198,7 @@ instance Aeson.FromJSON Config where
     mcpServers         <- obj .:? "mcp_servers" .!= Map.empty
     userSpecialists    <- obj .:? "specialists" .!= Map.empty
     userSubagents      <- obj .:? "subagents" .!= Map.empty
+    maxSavedSessions   <- obj .:? "max_saved_sessions" .!= 50
     let specialists = Map.union userSpecialists (Map.union userSubagents defaultSpecialists)
         workspaceRoot  = "."
         artifactDir    = ".lambda/artifacts"
@@ -236,6 +239,7 @@ defaultConfig = Config
   , contextWindowLimit  = 128000
   , mcpServers          = Map.empty
   , specialists         = defaultSpecialists
+  , maxSavedSessions    = 50
   }
 
 loadConfig :: FilePath -> IO Config

@@ -23,6 +23,7 @@ import Lambda.Core.ModelDriver (ModelDriver(..))
 import Lambda.Core.ToolProvider (toolsToOpenAISchema)
 import Lambda.Engine.Dispatcher (executeToolDispatch)
 import Lambda.Engine.Security (SecurityState(..))
+import Lambda.Engine.Session (exportSessionTrace, loadSession)
 import Lambda.Engine.State
 import Lambda.Types
 
@@ -76,6 +77,23 @@ engineWorkerLoop engineState@AppEngineState{..} driver EngineChannels{..} = do
         writeTVar appTurns []
         writeTVar appTurnCounter 1
       _ <- addTurn engineState SystemRole [TextBlock "Conversation history cleared."]
+      persistCurrentSession engineState
+      engineWorkerLoop engineState driver EngineChannels{..}
+    CmdNewSession -> do
+      _ <- resetEngineSession engineState
+      engineWorkerLoop engineState driver EngineChannels{..}
+    CmdSwitchSession sid -> do
+      loadRes <- loadSession appSessionDir sid
+      case loadRes of
+        Left err ->
+          emitEngineEvent engineState (EvError $ "Failed to switch session: " <> err)
+        Right sess ->
+          restoreEngineSession engineState sess
+      engineWorkerLoop engineState driver EngineChannels{..}
+    CmdExportTrace -> do
+      snap <- snapshotSession engineState
+      path <- exportSessionTrace appSessionDir snap
+      _ <- addTurn engineState SystemRole [TextBlock $ "Debug execution trace exported to: " <> T.pack path]
       engineWorkerLoop engineState driver EngineChannels{..}
     CmdUserPrompt promptText -> do
       -- 1. Reset interrupt flag, update State Vector, and add user turn
@@ -105,6 +123,9 @@ engineWorkerLoop engineState@AppEngineState{..} driver EngineChannels{..} = do
         let updatedVec = T.unlines $ map (\l -> if "BLOCKED_ON:" `T.isPrefixOf` l then "BLOCKED_ON: User input" else l) (T.lines curVec)
         writeTVar appStateVector updatedVec
         writeTQueue appEventQueue (EvWorkingStateUpdate updatedVec)
+
+      -- Auto-save session state after turn completion
+      persistCurrentSession engineState
 
       engineWorkerLoop engineState driver EngineChannels{..}
 
