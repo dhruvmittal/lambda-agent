@@ -6,6 +6,7 @@ module Lambda.UI.Draw
   , renderSubAgents
   , renderSubAgentsSelected
   , renderInlineSubAgent
+  , renderCompletionLine
   ) where
 
 import Brick
@@ -15,6 +16,7 @@ import qualified Brick.Widgets.Center as C
 import qualified Brick.Widgets.Edit as E
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString.Lazy as BL
+import Data.List (intersperse)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -22,6 +24,7 @@ import qualified Data.Text.Encoding as TE
 
 import Lambda.Engine.Compactor (estimateTotalTokens)
 import Lambda.Types
+import Lambda.UI.Completion (slidingCandidateWindow)
 import Lambda.UI.Types
 
 drawApp :: UIState -> [Widget ResourceName]
@@ -115,9 +118,7 @@ mainLayout :: UIState -> Widget ResourceName
 mainLayout UIState{..} =
   vBox
     [ headerBar uiWorkingState uiSelectedSubAgent
-    , renderMainPane uiSelectedSubAgent currentDisplayTurns uiSubAgents
-    , renderCompletion uiCompletion
-    , renderPowerlinePrompt uiMode uiModelName currentDisplayTurns uiContextLimit uiEditor
+    , renderMainPane uiSelectedSubAgent currentDisplayTurns uiSubAgents uiCompletion uiMode uiModelName uiContextLimit uiEditor
     ]
   where
     currentDisplayTurns = case uiSelectedSubAgent of
@@ -126,8 +127,17 @@ mainLayout UIState{..} =
         Nothing   -> uiTurns
       Nothing  -> uiTurns
 
-renderMainPane :: Maybe Int -> [Turn] -> Map.Map Int SubAgentTask -> Widget ResourceName
-renderMainPane Nothing turns subs =
+renderMainPane
+  :: Maybe Int
+  -> [Turn]
+  -> Map.Map Int SubAgentTask
+  -> Maybe CompletionState
+  -> AgentMode
+  -> Text
+  -> Int
+  -> E.Editor Text ResourceName
+  -> Widget ResourceName
+renderMainPane Nothing turns subs uiComp mode model ctxLimit editor =
   viewport ChatView Vertical $
     padLeftRight 1 $
       vBox
@@ -135,8 +145,10 @@ renderMainPane Nothing turns subs =
         , if Map.null subs
             then emptyWidget
             else padTop (Pad 1) $ vBox (map renderInlineSubAgent (Map.elems subs))
+        , renderCompletionLine uiComp
+        , visible (renderPowerlinePrompt mode model turns ctxLimit editor)
         ]
-renderMainPane (Just sId) _ subs =
+renderMainPane (Just sId) _ subs uiComp mode model ctxLimit editor =
   case Map.lookup sId subs of
     Just task ->
       let roleUpper = T.unpack (T.toUpper (subAgentRole task))
@@ -146,10 +158,14 @@ renderMainPane (Just sId) _ subs =
             if null (subAgentTurns task)
               then padAll 1 (withAttr (attrName "thinkingDim") $ str "No dialogue turns recorded for this subagent yet.")
               else vBox (map renderTurn (subAgentTurns task))
-      in vBox
-           [ C.hCenter banner
-           , viewport ChatView Vertical (padLeftRight 1 renderedTurns)
-           ]
+      in viewport ChatView Vertical $
+           padLeftRight 1 $
+             vBox
+               [ C.hCenter banner
+               , renderedTurns
+               , renderCompletionLine uiComp
+               , visible (renderPowerlinePrompt mode model (subAgentTurns task) ctxLimit editor)
+               ]
     Nothing ->
       viewport ChatView Vertical (padAll 1 $ withAttr (attrName "toolError") $ str ("SubAgent #" <> show sId <> " not found."))
 
@@ -252,39 +268,29 @@ renderInlineSubAgent SubAgentTask{..} =
                   Nothing -> emptyWidget
               ]
 
-renderCompletion :: Maybe CompletionState -> Widget ResourceName
-renderCompletion Nothing = emptyWidget
-renderCompletion (Just (CompletionState matches sel))
-  | null matches = emptyWidget
+renderCompletionLine :: Maybe CompletionState -> Widget ResourceName
+renderCompletionLine Nothing = emptyWidget
+renderCompletionLine (Just (CompletionState cands sel))
+  | null cands = emptyWidget
   | otherwise =
-      padLeft (Pad 2) $
-        hLimit 64 $
-          withBorderStyle BS.unicodeRounded $
-            B.borderWithLabel (withAttr (attrName "compBorder") (str " Commands (Tab to complete, Esc to dismiss) ")) $
-              vBox (zipWith renderItem [0..] (take 6 matches))
+      let (winSel, visibleCands, overflow) = slidingCandidateWindow sel cands
+          renderedItems = zipWith (renderCandidate winSel) [0..] visibleCands
+          overflowWidget =
+            if overflow > 0
+              then [str " ", withAttr (attrName "thinkingDim") (str $ "(+" <> show overflow <> " more)")]
+              else []
+      in padTop (Pad 1) $
+           padLeft (Pad 2) $
+             hBox
+               ( [ withAttr (attrName "thinkingDim") (str "candidates: ")
+                 , hBox (intersperse (str "  ") renderedItems)
+                 ] ++ overflowWidget
+               )
   where
-    renderItem idx item =
-      let isSel = idx == sel
-          itemAttr = if isSel then attrName "compSelected" else attrName "compItem"
-          prefix = if isSel then "> " else "  "
-          desc = commandDesc item
-      in withAttr itemAttr $
-           padLeftRight 1 $
-             hBox [ txt (prefix <> item), fill ' ', withAttr (attrName "thinkingDim") (txt desc) ]
-
-commandDesc :: Text -> Text
-commandDesc "/plan"     = "Switch to Plan mode (read-only)"
-commandDesc "/exec"     = "Switch to Exec mode (full access)"
-commandDesc "/think"    = "Toggle reasoning visibility"
-commandDesc "/session"  = "List and switch sessions"
-commandDesc "/sub"      = "Inspect SubAgent dialogue (/sub <id>)"
-commandDesc "/trace"    = "Export markdown session trace"
-commandDesc "/compact"  = "Trigger manual context compaction"
-commandDesc "/clear"    = "Clear conversation history"
-commandDesc "/new"      = "Start fresh session"
-commandDesc "/help"     = "Show commands and keybindings"
-commandDesc "/quit"     = "Exit lambdA"
-commandDesc _           = ""
+    renderCandidate selIdx idx cand =
+      if idx == selIdx
+        then withAttr (attrName "compSelected") (txt ("[" <> candDisplay cand <> "]"))
+        else withAttr (attrName "compItem") (txt (candDisplay cand))
 
 renderPowerlinePrompt :: AgentMode -> Text -> [Turn] -> Int -> E.Editor Text ResourceName -> Widget ResourceName
 renderPowerlinePrompt mode model turns ctxLimit editor =

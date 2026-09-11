@@ -26,10 +26,21 @@ data ResourceName
   | CompletionPopup
   deriving (Eq, Ord, Show)
 
-data CompletionState = CompletionState
-  { compMatches  :: ![Text]
-  , compSelected :: !Int
+data Candidate = Candidate
+  { candInsert  :: !Text
+  , candDisplay :: !Text
   } deriving (Eq, Show)
+
+simpleCandidate :: Text -> Candidate
+simpleCandidate t = Candidate t t
+
+data CompletionState = CompletionState
+  { compCandidates :: ![Candidate]
+  , compSelected   :: !Int
+  } deriving (Eq, Show)
+
+compMatches :: CompletionState -> [Text]
+compMatches = map candInsert . compCandidates
 
 data UIState = UIState
   { uiTurns            :: ![Turn]
@@ -50,4 +61,5 @@ data UIState = UIState
   , uiSelectedSubAgent :: !(Maybe Int)
   , uiShowHud          :: !Bool
   , uiCompletion       :: !(Maybe CompletionState)
+  , uiIsGenerating     :: !Bool
   }

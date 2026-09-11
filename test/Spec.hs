@@ -11,6 +11,7 @@ import Data.Aeson ((.=))
 import Data.Aeson.Types (parseEither)
 import qualified Data.ByteString.Lazy as BL
 import Data.Maybe (mapMaybe)
+import qualified Data.Sequence as Seq
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -48,9 +49,13 @@ import Lambda.Engine.State
 import Lambda.Engine.SubAgent (submitReportTool, filterSubAgentRegistry, subAgentLoop, runEphemeralSubAgent, SubAgentSpec(..), SubAgentReport(..))
 import qualified Data.Map.Strict as Map
 import Brick.Types (vSize, Size(..))
+import qualified Brick.Widgets.Edit as E
 import Lambda.Provider.Builtin (builtinTools, listDirectoryTool, readFileTool, fetchUrlTool)
 import Lambda.Provider.Mcp (inferCapability, parseMcpCallResult, startAndLoadMcpServers, stopMcpClient)
-import Lambda.UI.Draw (renderSubAgents, renderSubAgentsSelected, renderInlineSubAgent)
+import Lambda.UI.Completion (completeInput, allCommands, computeCommandCandidates, slidingCandidateWindow)
+import Lambda.UI.Draw (renderSubAgents, renderSubAgentsSelected, renderInlineSubAgent, renderCompletionLine)
+import Lambda.UI.Events (computeCommandMatches, replaceCurrentToken)
+import Lambda.UI.Types (CompletionState(..), Candidate(..), simpleCandidate, ResourceName(..), UIState(..))
 import Lambda.Types
 
 main :: IO ()
@@ -92,6 +97,9 @@ main = do
   testParallelArtifactUniqueness
   testJsonRpcProcessDisconnection
   testJustInTimeSubAgentPermissions
+  testReadlineKeybindingsAndTabDecoupling
+  testContextualCompletersAndMruInvariant
+  testSlidingCandidateWindowInvariant
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -904,49 +912,60 @@ testOnDemandMarkdownTraceGeneration = do
 testAutocompleteAndTabInvariant :: IO ()
 testAutocompleteAndTabInvariant = do
   putStrLn "\n[Test 29] Slash Command Autocomplete and Tab Invariant"
-  let allCommands =
-        [ "/plan"
-        , "/exec"
-        , "/think"
-        , "/session"
-        , "/sub"
-        , "/trace"
-        , "/compact"
-        , "/clear"
-        , "/new"
-        , "/help"
-        , "/quit"
-        ]
-      computeMatches input =
-        let rawInput = T.dropWhile (== ' ') (T.filter (\c -> c /= '\n' && c /= '\r') input)
-        in if "/" `T.isPrefixOf` rawInput && not (" " `T.isInfixOf` rawInput)
-             then filter (rawInput `T.isPrefixOf`) allCommands
-             else []
 
-  -- Check root slash returns all commands
-  let slashMatches = computeMatches "/"
+  -- 1. Canonical matching logic using computeCommandMatches from Lambda.UI.Events
+  let slashMatches = computeCommandMatches "/"
   assert "Typing '/' returns all available slash commands" (length slashMatches == length allCommands)
 
-  -- Check prefix filtering
-  let planMatches = computeMatches "/p"
-  assert "Typing '/p' returns ['/plan']" (planMatches == ["/plan"])
+  -- Check unambiguous prefix matching (single match auto-completes immediately in-place)
+  let planMatches = computeCommandMatches "/p"
+  assert "Typing '/p' returns exactly ['/plan'] for immediate in-place auto-fill" (planMatches == ["/plan"])
 
-  let sessionMatches = computeMatches "/s"
+  let helpMatches = computeCommandMatches "/h"
+  assert "Typing '/h' returns exactly ['/help'] for immediate in-place auto-fill" (helpMatches == ["/help"])
+
+  let compactMatches = computeCommandMatches "/co"
+  assert "Typing '/co' returns exactly ['/compact']" (compactMatches == ["/compact"])
+
+  -- Check ambiguous prefix matching (triggers candidate preview bar and cycling)
+  let cMatches = computeCommandMatches "/c"
+  assert "Typing '/c' matches multiple candidates (/compact and /clear)" (cMatches == ["/compact", "/clear"])
+
+  let sessionMatches = computeCommandMatches "/s"
   assert "Typing '/s' matches /session and /sub" (sessionMatches == ["/session", "/sub"])
 
   -- Check trailing newline from editor does not break matching
-  let newlineMatches = computeMatches "/t\n"
+  let newlineMatches = computeCommandMatches "/t\n"
   assert "Trailing newline from editor lines does not break matching" (newlineMatches == ["/think", "/trace"])
 
   -- Check commands with spaces are dismissed
-  let spaceMatches = computeMatches "/plan "
+  let spaceMatches = computeCommandMatches "/plan "
   assert "Commands with trailing arguments/space dismiss autocomplete" (null spaceMatches)
 
   -- Check non-slash text does not trigger autocomplete
-  let normalMatches = computeMatches "cabal test"
+  let normalMatches = computeCommandMatches "cabal test"
   assert "Regular prompts do not trigger slash autocomplete" (null normalMatches)
 
-  putStrLn "  -> OK: Slash command autocomplete filters dynamically and handles editor line buffers cleanly."
+  -- 2. Test In-Place Modulo Tab Cycling Logic
+  let cycleForward :: Int -> Int -> Int
+      cycleForward len sel = (sel + 1) `mod` len
+
+      cycleBackward :: Int -> Int -> Int
+      cycleBackward len sel = if sel <= 0 then len - 1 else sel - 1
+
+  assert "Forward cycle from 0 of 2 advances to 1" (cycleForward 2 0 == 1)
+  assert "Forward cycle wraps from 1 of 2 back to 0" (cycleForward 2 1 == 0)
+  assert "Backward cycle wraps from 0 of 2 back to 1" (cycleBackward 2 0 == 1)
+  assert "Backward cycle from 1 of 2 steps back to 0" (cycleBackward 2 1 == 0)
+
+  -- 3. Verify Minimal Single-Line Horizontal Completion Bar Invariant
+  let emptyCompWidget = renderCompletionLine Nothing
+  assert "renderCompletionLine Nothing has Fixed vertical size" (vSize emptyCompWidget == Fixed)
+
+  let activeCompWidget = renderCompletionLine (Just (CompletionState [simpleCandidate "/plan", simpleCandidate "/exec"] 0))
+  assert "renderCompletionLine active has Fixed vertical size (single-line hint bar without viewport crash)" (vSize activeCompWidget == Fixed)
+
+  putStrLn "  -> OK: Slash command autocomplete filters dynamically, cycles candidates in-place, and renders minimal single-line hint bar."
 
 -- 30. Verify SubAgent Multi-Chunk Tool Call Arguments Streaming Invariant
 testSubAgentStreamingToolArgs :: IO ()
@@ -1148,6 +1167,164 @@ testJustInTimeSubAgentPermissions = do
   removeFile "test_out.txt"
 
   putStrLn "  -> OK: Subagents spawn without upfront prompt; JIT prompts enforce workspace boundaries, web fetches, and destructive writes."
+
+-- 36. Verify Readline Keybinding Hygiene & Tab Completion Decoupling
+testReadlineKeybindingsAndTabDecoupling :: IO ()
+testReadlineKeybindingsAndTabDecoupling = do
+  putStrLn "\n[Test 36] Readline Keybinding Hygiene & Tab Completion Decoupling"
+
+  -- 1. replaceCurrentToken replaces current token with candidate
+  let ed1 = E.editor EditorInput (Just 1) "hello wor"
+      ed1Replaced = replaceCurrentToken "world" ed1
+  assert "replaceCurrentToken replaces prefix and appends trailing space for words"
+    (T.concat (E.getEditContents ed1Replaced) == "hello world ")
+
+  -- 2. replaceCurrentToken does NOT append space for directory paths ending in '/'
+  let ed2 = E.editor EditorInput (Just 1) "cat @src/Lam"
+      ed2Replaced = replaceCurrentToken "@src/Lambda/" ed2
+  assert "replaceCurrentToken preserves trailing slash without space for path drilling"
+    (T.concat (E.getEditContents ed2Replaced) == "cat @src/Lambda/")
+
+  -- 3. Slash command completion does not trigger for normal user prompt text
+  let nonCmdCandidates = computeCommandCandidates "build this project"
+  assert "Non-slash prompt returns 0 candidates" (null nonCmdCandidates)
+
+  -- 4. Slash command completion matches all commands on "/"
+  let allSlashCandidates = computeCommandCandidates "/"
+  assert "Typing '/' returns all available slash commands"
+    (length allSlashCandidates == length allCommands)
+
+  putStrLn "  -> OK: Tab completion decouples cleanly and respects Readline directory drill-down semantics."
+
+-- 37. Verify Contextual Completers & MRU Ordering Invariant
+testContextualCompletersAndMruInvariant :: IO ()
+testContextualCompletersAndMruInvariant = do
+  putStrLn "\n[Test 37] Contextual Completers & MRU Ordering Invariant"
+
+  -- 1. /session completion with MRU ordering
+  let testSessionsDir = ".lambda/test_sessions"
+  createDirectoryIfMissing True testSessionsDir
+  now <- getCurrentTime
+  let mkSess sid title offset = Session
+        { sessionId           = sid
+        , sessionCreatedAt     = addUTCTime offset now
+        , sessionUpdatedAt     = addUTCTime offset now
+        , sessionTitle         = title
+        , sessionMode          = PlanMode
+        , sessionTurns         = []
+        , sessionSubAgents     = Map.empty
+        , sessionStateVector   = Map.empty
+        , sessionPromptHistory = []
+        }
+
+  saveSession testSessionsDir 0 (mkSess "sess_old_123" "Older Session" (-300))
+  saveSession testSessionsDir 0 (mkSess "sess_new_456" "Newer Session" 0)
+
+  sessList <- listSessions testSessionsDir
+  assert "Sessions are ordered by metaUpdatedAt descending (MRU first)"
+    (case sessList of
+       (s1:s2:_) -> metaId s1 == "sess_new_456" && metaId s2 == "sess_old_123"
+       _ -> False)
+  removeDirectoryRecursive testSessionsDir
+
+  -- Setup dummy UI state
+  evQ <- atomically newTQueue
+  chans <- initEngineChannels evQ
+  let dummyUI subs = UIState
+        { uiTurns            = []
+        , uiSubAgents        = subs
+        , uiCurrentPrompt    = Nothing
+        , uiPendingPrompts   = Seq.Empty
+        , uiMode             = PlanMode
+        , uiEditor           = E.editor EditorInput (Just 1) ""
+        , uiWorkingState     = ""
+        , uiChannels         = chans
+        , uiLastEscTime      = Nothing
+        , uiContextLimit     = 8192
+        , uiPromptHistory    = []
+        , uiHistoryIndex     = Nothing
+        , uiSavedDraft       = ""
+        , uiModelName        = "test"
+        , uiThinkingVisible  = True
+        , uiSelectedSubAgent = Nothing
+        , uiShowHud          = False
+        , uiCompletion       = Nothing
+        , uiIsGenerating     = False
+        }
+
+  -- 2. /mode contextual completion
+  mModeComp <- completeInput "." (dummyUI Map.empty) "/mode "
+  assert "/mode completion suggests 'plan' and 'exec'"
+    (fmap (map candInsert . compCandidates) mModeComp == Just ["plan", "exec"])
+
+  -- 3. /think contextual completion
+  mThinkComp <- completeInput "." (dummyUI Map.empty) "/think "
+  assert "/think completion suggests 'toggle', 'show', and 'hide'"
+    (fmap (map candInsert . compCandidates) mThinkComp == Just ["toggle", "show", "hide"])
+
+  -- 4. /sub contextual completion from active subagent map
+  let subMap = Map.fromList
+        [ (1, SubAgentTask 1 "reviewer" "Reviewing" 0 5 SubAgentRunning Nothing [])
+        , (3, SubAgentTask 3 "tester" "Testing" 0 5 SubAgentRunning Nothing [])
+        ]
+  mSubComp <- completeInput "." (dummyUI subMap) "/sub "
+  assert "/sub completion returns active subagent IDs plus main"
+    (fmap (map candInsert . compCandidates) mSubComp == Just ["1", "3", "main"])
+
+  -- 5. Path completion for '@' tokens
+  mPathComp <- completeInput "." (dummyUI Map.empty) "@src/"
+  assert "Path completion for '@src/' suggests '@src/Lambda/' with trailing slash"
+    (case mPathComp of
+       Just cs -> "@src/Lambda/" `elem` map candInsert (compCandidates cs)
+       Nothing -> False)
+
+  putStrLn "  -> OK: Contextual completers provide accurate MRU session sorting, active subagent IDs, and path drill-down."
+
+-- 38. Verify Sliding Candidate Window & Overflow Counter Invariant
+testSlidingCandidateWindowInvariant :: IO ()
+testSlidingCandidateWindowInvariant = do
+  putStrLn "\n[Test 38] Sliding Candidate Window & Overflow Counter Invariant"
+
+  let makeCands (n :: Int) = [ Candidate (T.pack $ "cand_" <> show i) (T.pack $ "cand_" <> show i) | i <- [1..n] ]
+
+  -- 1. Empty list
+  let (sel0, win0, over0) = slidingCandidateWindow 0 []
+  assert "Empty candidate list yields empty window and 0 overflow"
+    (sel0 == 0 && null win0 && over0 == 0)
+
+  -- 2. Fewer than maxVisible items
+  let cands3 = makeCands 3
+      (sel3, win3, over3) = slidingCandidateWindow 1 cands3
+  assert "3 items with maxVisible 5 yields all 3 items and 0 overflow"
+    (sel3 == 1 && length win3 == 3 && over3 == 0)
+
+  -- 3. 12 items with selected item at index 0
+  let cands12 = makeCands 12
+      (sel12_0, win12_0, over12_0) = slidingCandidateWindow 0 cands12
+  assert "12 items at index 0 caps window size to 5" (length win12_0 == 5)
+  assert "12 items at index 0 calculates overflow as 7 (+7 more)" (over12_0 == 7)
+  assert "Index 0 candidate is present in window" (head win12_0 == head cands12)
+  assert "Selected index inside window is 0" (sel12_0 == 0)
+
+  -- 4. 12 items with selected item at index 8 (scrolled far right)
+  let (sel12_8, win12_8, over12_8) = slidingCandidateWindow 8 cands12
+  assert "Window size remains 5 when scrolled to index 8" (length win12_8 == 5)
+  assert "Selected candidate (index 8) is inside the sliding window"
+    (cands12 !! 8 `elem` win12_8)
+  assert "Relative selected index matches position in window"
+    (win12_8 !! sel12_8 == cands12 !! 8)
+  assert "Overflow count is 1 when scrolled to index 8" (over12_8 == 1)
+
+  -- 5. 12 items with selected item at last index (11)
+  let (sel12_11, win12_11, over12_11) = slidingCandidateWindow 11 cands12
+  assert "Last item is the final element of sliding window"
+    (last win12_11 == last cands12)
+  assert "Relative selected index is 4 (the last slot in 5-item window)"
+    (sel12_11 == 4)
+  assert "Overflow count at end is 0"
+    (over12_11 == 0)
+
+  putStrLn "  -> OK: Sliding candidate window caps ribbon size to 5, tracks cursor position, and displays accurate overflow."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

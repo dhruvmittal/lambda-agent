@@ -45,6 +45,7 @@ library
         Lambda.UI.Types
         Lambda.UI.Draw
         Lambda.UI.Events
+        Lambda.UI.Completion
     build-depends:
         base >= 4.17 && < 5,
         text,

@@ -261,6 +261,7 @@ main = do
         , uiSelectedSubAgent = Nothing
         , uiShowHud          = False
         , uiCompletion       = Nothing
+        , uiIsGenerating     = False
         }
 
   -- 10. Run Brick TUI
