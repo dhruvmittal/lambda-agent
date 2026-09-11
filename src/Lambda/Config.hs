@@ -214,7 +214,6 @@ defaultAllowGlobs =
   , "cat *"
   , "read_file*"
   , "list_directory*"
-  , "fetch_url*"
   , "sd_*"
   ]
 

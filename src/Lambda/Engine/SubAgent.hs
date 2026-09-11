@@ -29,7 +29,6 @@ import Lambda.Config (Config(..), SpecialistConfig(..))
 import Lambda.Core.ModelDriver (ModelDriver(..))
 import Lambda.Core.ToolProvider (ToolDefinition(..), ToolRegistry(..), toolsToOpenAISchema)
 import Lambda.Engine.Dispatcher (executeToolDispatch)
-import Lambda.Engine.Security (requestGrantApproval)
 import Lambda.Engine.State
 import Lambda.Types
 
@@ -123,63 +122,49 @@ runEphemeralSubAgent engineState@AppEngineState{..} driver SubAgentSpec{..} = do
       effectiveBudget = if subTurnBudget > 0 then subTurnBudget else defaultBud
       combinedGlobs = if null subGrantedGlobs then defaultCaps else nub (defaultCaps ++ subGrantedGlobs)
 
-  -- Step 1: Upfront capability authorization
+  -- Step 1: Capability bounds
   -- In PlanMode, filter out any destructive grants so subagent is strictly read-only
   let isDestructiveGlob g = any (`T.isPrefixOf` g) ["bash*", "write_file*", "edit_file*", "replace_lines*"]
       effectiveGrants = if curMode == PlanMode
         then filter (not . isDestructiveGlob) combinedGlobs
         else combinedGlobs
+      grantedWithReport = "submit_report*" : effectiveGrants
 
-  let grantedWithReport = "submit_report*" : effectiveGrants
+  -- Step 2: Isolated ephemeral state with Depth-1 Star Graph enforcement
+  reportVar <- newTVarIO Nothing
+  attemptedToolsVar <- newTVarIO ([] :: [Text])
 
-  let isSafeReadGlob g = any (`T.isPrefixOf` g)
-        [ "read_file*", "list_directory*", "grep_search*", "find_by_name*", "fetch_url*", "sd_*", "git status*", "git diff*", "git log*", "ls*", "pwd*", "cat*", "submit_report*" ]
-      allSafe = all isSafeReadGlob grantedWithReport
+  baseReg <- readTVarIO appToolRegistry
+  let subReg = filterSubAgentRegistry (submitReportTool reportVar) baseReg
+  subRegVar <- newTVarIO subReg
+  let subEngineState = engineState { appToolRegistry = subRegVar }
 
-  authorized <- if curMode == PlanMode || allSafe
-    then pure True
-    else requestGrantApproval appSecurity sId subTaskDescription grantedWithReport
+  let sysPrompt = T.unlines
+        [ specPrompt
+        , ""
+        , "## Operating Mode: " <> (if curMode == PlanMode then "[PLAN MODE - Read-Only]" else "[EXEC MODE - Mutating]")
+        , "## Assigned Objective: " <> subTaskDescription
+        , ""
+        , "## Reporting Invariant:"
+        , "Operate within your turn budget. You have access to the synthetic tool `submit_report`."
+        , "When your work, survey, diagnosis, profiling, or implementation is complete, you MUST call `submit_report` with status, summary, and details."
+        ]
+      initTurns =
+        [ Turn 1 SystemRole [TextBlock sysPrompt]
+        , Turn 2 UserRole [TextBlock ("Begin task: " <> subTaskDescription)]
+        ]
+  subTurnsVar <- newTVarIO initTurns
+  updateSubAgentTurns engineState sId initTurns
 
-  if not authorized
-    then do
-      updateSubAgentStatus engineState sId (SubAgentBlocked "Capability grant denied by user")
-      pure $ Left "Subagent launch aborted: Capability grant denied by user."
-    else do
-      -- Step 2: Isolated ephemeral state with Depth-1 Star Graph enforcement
-      reportVar <- newTVarIO Nothing
-      attemptedToolsVar <- newTVarIO ([] :: [Text])
-
-      baseReg <- readTVarIO appToolRegistry
-      let subReg = filterSubAgentRegistry (submitReportTool reportVar) baseReg
-      subRegVar <- newTVarIO subReg
-      let subEngineState = engineState { appToolRegistry = subRegVar }
-
-      let sysPrompt = T.unlines
-            [ specPrompt
-            , ""
-            , "## Operating Mode: " <> (if curMode == PlanMode then "[PLAN MODE - Read-Only]" else "[EXEC MODE - Mutating]")
-            , "## Assigned Objective: " <> subTaskDescription
-            , ""
-            , "## Reporting Invariant:"
-            , "Operate within your turn budget. You have access to the synthetic tool `submit_report`."
-            , "When your work, survey, diagnosis, profiling, or implementation is complete, you MUST call `submit_report` with status, summary, and details."
-            ]
-          initTurns =
-            [ Turn 1 SystemRole [TextBlock sysPrompt]
-            , Turn 2 UserRole [TextBlock ("Begin task: " <> subTaskDescription)]
-            ]
-      subTurnsVar <- newTVarIO initTurns
-      updateSubAgentTurns engineState sId initTurns
-
-      -- Step 3: Run execution loop
-      res <- subAgentLoop subEngineState driver sId grantedWithReport subTurnsVar attemptedToolsVar reportVar 1 effectiveBudget
-      case res of
-        Right r -> do
-          updateSubAgentStatus engineState sId (SubAgentSuccess (reportStatus r))
-          pure (Right r)
-        Left err -> do
-          updateSubAgentStatus engineState sId (SubAgentFailed err)
-          pure (Left err)
+  -- Step 3: Run execution loop
+  res <- subAgentLoop subEngineState driver sId grantedWithReport subTurnsVar attemptedToolsVar reportVar 1 effectiveBudget
+  case res of
+    Right r -> do
+      updateSubAgentStatus engineState sId (SubAgentSuccess (reportStatus r))
+      pure (Right r)
+    Left err -> do
+      updateSubAgentStatus engineState sId (SubAgentFailed err)
+      pure (Left err)
 
 subAgentLoop
   :: AppEngineState

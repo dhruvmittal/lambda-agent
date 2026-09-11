@@ -25,7 +25,7 @@ import Network.HTTP.Client
 import Network.HTTP.Client.TLS (newTlsManager)
 import Network.HTTP.Types.Header (hUserAgent, hAccept)
 import System.Directory (doesFileExist, doesDirectoryExist, listDirectory, createDirectoryIfMissing)
-import System.FilePath (takeDirectory, (</>))
+import System.FilePath (takeDirectory, isAbsolute, (</>))
 import System.IO.Unsafe (unsafePerformIO)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import System.Process.Typed
@@ -90,6 +90,10 @@ bashTool wsRoot artDir = ToolDefinition
               pure $ ToolResult "" (compactOutput <> exitStatus) errText mArtifact
   }
 
+-- | Resolves a path, preserving absolute paths and making relative paths workspace-relative
+resolvePath :: FilePath -> FilePath -> FilePath
+resolvePath wsRoot p = if isAbsolute p then p else wsRoot </> p
+
 -- | Directory listing tool
 listDirectoryTool :: FilePath -> ToolDefinition
 listDirectoryTool wsRoot = ToolDefinition
@@ -114,7 +118,7 @@ listDirectoryTool wsRoot = ToolDefinition
         Right relPath -> do
           let fullPath = if T.null relPath || relPath == "."
                            then wsRoot
-                           else wsRoot </> T.unpack relPath
+                           else resolvePath wsRoot (T.unpack relPath)
           isDir <- doesDirectoryExist fullPath
           if not isDir
             then pure $ ToolResult "" "" ("Directory not found: " <> relPath) Nothing
@@ -157,7 +161,7 @@ readFileTool wsRoot = ToolDefinition
       case parseEither parseArgs args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
         Right (relPath, mStart, mCount) -> do
-          let fullPath = wsRoot </> T.unpack relPath
+          let fullPath = resolvePath wsRoot (T.unpack relPath)
           isFile <- doesFileExist fullPath
           isDir <- doesDirectoryExist fullPath
           if isDir
@@ -210,7 +214,7 @@ writeFileTool wsRoot = ToolDefinition
       case parseEither parseArgs args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
         Right (relPath, content) -> do
-          let fullPath = wsRoot </> T.unpack relPath
+          let fullPath = resolvePath wsRoot (T.unpack relPath)
           createDirectoryIfMissing True (takeDirectory fullPath)
           TIO.writeFile fullPath content
           pure $ ToolResult "" ("File successfully written: " <> relPath) "" Nothing
@@ -249,7 +253,7 @@ editFileTool wsRoot = ToolDefinition
       case parseEither parseArgs args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
         Right (relPath, target, replacement) -> do
-          let fullPath = wsRoot </> T.unpack relPath
+          let fullPath = resolvePath wsRoot (T.unpack relPath)
           exists <- doesFileExist fullPath
           if not exists
             then pure $ ToolResult "" "" ("File not found: " <> relPath) Nothing

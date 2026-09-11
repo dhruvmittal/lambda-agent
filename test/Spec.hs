@@ -45,10 +45,10 @@ import Lambda.Engine.State
   , appSubAgentSeq
   , appSessionDir
   )
-import Lambda.Engine.SubAgent (submitReportTool, filterSubAgentRegistry, subAgentLoop, SubAgentReport(..))
+import Lambda.Engine.SubAgent (submitReportTool, filterSubAgentRegistry, subAgentLoop, runEphemeralSubAgent, SubAgentSpec(..), SubAgentReport(..))
 import qualified Data.Map.Strict as Map
 import Brick.Types (vSize, Size(..))
-import Lambda.Provider.Builtin (listDirectoryTool, readFileTool, fetchUrlTool)
+import Lambda.Provider.Builtin (builtinTools, listDirectoryTool, readFileTool, fetchUrlTool)
 import Lambda.Provider.Mcp (inferCapability, parseMcpCallResult, startAndLoadMcpServers, stopMcpClient)
 import Lambda.UI.Draw (renderSubAgents, renderSubAgentsSelected, renderInlineSubAgent)
 import Lambda.Types
@@ -91,6 +91,7 @@ main = do
   testCompactionWireIntegrity
   testParallelArtifactUniqueness
   testJsonRpcProcessDisconnection
+  testJustInTimeSubAgentPermissions
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -1084,6 +1085,69 @@ testJsonRpcProcessDisconnection = do
       putStrLn "  -> OK: Pending requests to terminated processes fail promptly without deadlocking TMVars."
     Right _ -> failTest "Expected request to dead process to return Left error."
   stopRpcClient client
+
+-- 35. Verify Just-In-Time SubAgent Permissions Invariant
+testJustInTimeSubAgentPermissions :: IO ()
+testJustInTimeSubAgentPermissions = do
+  putStrLn "\n[Test 35] Just-In-Time SubAgent Permissions & Workspace Confinement"
+  sec <- initSecurity [] []
+  cfg <- loadConfig "."
+  let tools = builtinTools "." ".lambda/artifacts"
+      reg = registerTools tools emptyRegistry
+  es <- initEngineState cfg reg sec
+  atomically $ writeTVar (appMode es) ExecMode
+
+  -- 1. Spawning subagents launches immediately without upfront UI modal prompts
+  let driver = ModelDriver
+        { streamCompletion = \_ _ cb -> do
+            cb (ChunkToolCallStart "call_read" "read_file")
+            cb (ChunkToolCallArgs "" "{\"path\":\"README.md\"}")
+            cb ChunkDone
+        }
+      spec = SubAgentSpec "implementer" "Survey codebase" 1 []
+  subHandle <- async $ runEphemeralSubAgent es driver spec
+  threadDelay 50000
+  promptQueueEmpty <- atomically $ isEmptyTBQueue (uiPromptQueue sec)
+  assert "SubAgent spawned without triggering upfront grant prompt" promptQueueEmpty
+
+  -- 2. Safe workspace read finishes without prompt
+  _ <- wait subHandle
+  queueStillEmpty <- atomically $ isEmptyTBQueue (uiPromptQueue sec)
+  assert "Safe file read inside workspace succeeded without prompt" queueStillEmpty
+
+  -- 3. Outside workspace read triggers dynamic JIT prompt
+  let caller = SubAgentId 99 "Outside file inspection"
+      callOutside = ToolCall "c_out" "read_file" (Aeson.object ["path" .= ("/etc/passwd" :: Text)])
+  outHandle <- async $ executeToolDispatch es caller ["read_file*"] callOutside
+  promptOut <- atomically $ readTBQueue (uiPromptQueue sec)
+  assert "Prompt indicates outside workspace access" ("outside_workspace: read_file" `T.isInfixOf` promptTool promptOut)
+  atomically $ putTMVar (promptReply promptOut) PermNo
+  resOut <- wait outHandle
+  assert "Outside read rejected when denied" ("Permission Denied" `T.isInfixOf` resultStderr resOut)
+
+  -- 4. External web fetch triggers dynamic JIT prompt
+  let callWeb = ToolCall "c_web" "fetch_url" (Aeson.object ["url" .= ("https://api.github.com" :: Text)])
+  webHandle <- async $ executeToolDispatch es caller ["fetch_url*"] callWeb
+  promptWeb <- atomically $ readTBQueue (uiPromptQueue sec)
+  assert "Web fetch triggers dynamic JIT prompt" ("fetch_url" `T.isInfixOf` promptTool promptWeb)
+  atomically $ putTMVar (promptReply promptWeb) PermNo
+  resWeb <- wait webHandle
+  assert "Web fetch rejected when denied" ("Permission Denied" `T.isInfixOf` resultStderr resWeb)
+
+  -- 5. Destructive mutating command (write_file) triggers dynamic JIT prompt
+  let callWrite = ToolCall "c_wr" "write_file" (Aeson.object
+        [ "path" .= ("test_out.txt" :: Text)
+        , "content" .= ("hello" :: Text)
+        ])
+  writeHandle <- async $ executeToolDispatch es caller ["write_file*"] callWrite
+  promptWrite <- atomically $ readTBQueue (uiPromptQueue sec)
+  assert "Destructive write triggers dynamic JIT prompt" ("write_file" `T.isInfixOf` promptTool promptWrite)
+  atomically $ putTMVar (promptReply promptWrite) PermOnce
+  resWrite <- wait writeHandle
+  assert "Destructive write succeeds when approved" (resultStdout resWrite == "File successfully written: test_out.txt")
+  removeFile "test_out.txt"
+
+  putStrLn "  -> OK: Subagents spawn without upfront prompt; JIT prompts enforce workspace boundaries, web fetches, and destructive writes."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =
