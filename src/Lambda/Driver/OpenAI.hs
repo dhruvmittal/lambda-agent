@@ -8,7 +8,7 @@ module Lambda.Driver.OpenAI
   ) where
 
 import Control.Exception (try, SomeException)
-import Control.Monad (forM_, when, unless)
+import Control.Monad (forM, forM_, when, unless)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?))
 import Data.Aeson.Types (parseEither)
@@ -197,26 +197,35 @@ extractDeltas obj =
           case mReasoning of
             Just r -> pure [Left (ChunkThinking r)]
             Nothing -> do
-              -- Priority 2: tool_calls delta
+              -- Priority 2: tool_calls delta (support multi-tool-call arrays with index tracking)
               mToolCalls <- delta .:? "tool_calls"
               case mToolCalls of
-                Just (Aeson.Object tc : _) -> do
-                  mId <- tc .:? "id"
-                  mFn <- tc .:? "function"
-                  (mName, mArgs) <- case mFn of
-                    Just (Aeson.Object fn) -> do
-                      n <- fn .:? "name"
-                      a <- fn .:? "arguments"
-                      pure (n, a)
-                    _ -> pure (Nothing, Nothing)
-                  let startChunk = case (mId, mName) of
-                        (Just cid, Just name) -> [Left (ChunkToolCallStart cid name)]
-                        _                     -> []
-                      cidRef = maybe "" id mId
-                      argChunk = case mArgs of
-                        Just args | not (T.null args) -> [Left (ChunkToolCallArgs cidRef args)]
-                        _                             -> []
-                  pure (startChunk ++ argChunk)
+                Just (tcList :: [Aeson.Value]) | not (null tcList) -> do
+                  chunkLists <- forM tcList $ \case
+                    Aeson.Object tc -> do
+                      mId <- tc .:? "id"
+                      mFn <- tc .:? "function"
+                      mIdx <- tc .:? "index"
+                      (mName, mArgs) <- case mFn of
+                        Just (Aeson.Object fn) -> do
+                          n <- fn .:? "name"
+                          a <- fn .:? "arguments"
+                          pure (n, a)
+                        _ -> pure (Nothing, Nothing)
+                      let startChunk = case (mId, mName) of
+                            (Just cid, Just name) -> [Left (ChunkToolCallStart cid name)]
+                            _                     -> []
+                          cidRef = case mId of
+                            Just cid -> cid
+                            Nothing  -> case (mIdx :: Maybe Int) of
+                              Just idx -> "idx_" <> T.pack (show idx)
+                              Nothing  -> ""
+                          argChunk = case mArgs of
+                            Just args | not (T.null args) -> [Left (ChunkToolCallArgs cidRef args)]
+                            _                             -> []
+                      pure (startChunk ++ argChunk)
+                    _ -> pure []
+                  pure (concat chunkLists)
                 _ -> do
                   -- Priority 3: content delta
                   mContent <- delta .:? "content"

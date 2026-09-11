@@ -12,6 +12,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import System.FilePath.Glob (compile, match)
 
+import Control.Exception (SomeException, try)
 import Lambda.Core.ToolProvider
 import Lambda.Engine.Security (checkAuthorization)
 import Lambda.Engine.State (AppEngineState(..))
@@ -63,9 +64,13 @@ executeToolDispatch AppEngineState{..} caller grantedGlobs ToolCall{..} = do
                    ("Permission Denied: Operation not authorized for " <> T.pack (show caller))
                    Nothing
             else do
-              -- Step 3: Execute tool
-              res <- toolExecute caller toolCallArgs
-              pure res { resultCallIdRef = toolCallId }
+              -- Step 3: Execute tool with exception guard
+              execRes <- try (toolExecute caller toolCallArgs)
+              case execRes of
+                Left (ex :: SomeException) ->
+                  pure $ ToolResult toolCallId "" ("Tool execution failure: " <> T.pack (show ex)) Nothing
+                Right res ->
+                  pure res { resultCallIdRef = toolCallId }
   where
     matchesPattern globPat str =
       let patStr = T.unpack globPat

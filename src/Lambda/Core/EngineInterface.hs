@@ -8,7 +8,7 @@ module Lambda.Core.EngineInterface
   ) where
 
 import Control.Concurrent (forkIO)
-import Control.Concurrent.Async (mapConcurrently, race)
+import Control.Concurrent.Async (Async, async, cancel, mapConcurrently, race)
 import Control.Concurrent.STM
 import Control.Exception (try, SomeException)
 import Control.Monad (forever, when, unless)
@@ -18,9 +18,12 @@ import qualified Data.ByteString.Lazy as BL
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Text.Read (readMaybe)
 
+import Lambda.Config (Config(..))
 import Lambda.Core.ModelDriver (ModelDriver(..))
 import Lambda.Core.ToolProvider (toolsToOpenAISchema)
+import Lambda.Engine.Compactor (compactHistory, estimateTotalTokens)
 import Lambda.Engine.Dispatcher (executeToolDispatch)
 import Lambda.Engine.Security (SecurityState(..))
 import Lambda.Engine.Session (exportSessionTrace, loadSession)
@@ -40,48 +43,57 @@ initEngineChannels eQueue = do
 -- | Starts the headless autonomous agent loop in a background thread
 startEngineLoop :: AppEngineState -> ModelDriver -> EngineChannels -> IO ()
 startEngineLoop state driver channels = do
-  _ <- forkIO $ engineWorkerLoop state driver channels
+  activeTaskVar <- newTVarIO Nothing
+  _ <- forkIO $ engineWorkerLoop state driver channels activeTaskVar
   _ <- forkIO $ forever $ do
     prompt <- atomically $ readTBQueue (uiPromptQueue (appSecurity state))
     emitEngineEvent state (EvPermissionRequired prompt)
   pure ()
 
-engineWorkerLoop :: AppEngineState -> ModelDriver -> EngineChannels -> IO ()
-engineWorkerLoop engineState@AppEngineState{..} driver EngineChannels{..} = do
+engineWorkerLoop :: AppEngineState -> ModelDriver -> EngineChannels -> TVar (Maybe (Async ())) -> IO ()
+engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{..} activeTaskVar = do
   cmd <- atomically $ readTBQueue cmdQueue
   case cmd of
-    CmdQuit -> pure ()
-    CmdSetMode newMode -> do
-      atomically $ writeTVar appMode newMode
-      engineWorkerLoop engineState driver EngineChannels{..}
-    CmdResolvePermission _ _ -> do
-      -- Handled directly via TMVar resolution in security prompt
-      engineWorkerLoop engineState driver EngineChannels{..}
-    CmdCancelSubAgent sId -> do
-      updateSubAgentStatus engineState sId (SubAgentBlocked "Cancelled by user")
-      engineWorkerLoop engineState driver EngineChannels{..}
-    CmdCompactHistory -> do
-      -- Context compaction trigger
-      ts <- readTVarIO appTurns
-      let summaryText = "[Compaction Checkpoint: " <> T.pack (show (length ts)) <> " historical turns preserved in disk archives]"
-      _ <- addTurn engineState SystemRole [TextBlock summaryText]
-      engineWorkerLoop engineState driver EngineChannels{..}
+    CmdQuit -> do
+      mTask <- readTVarIO activeTaskVar
+      case mTask of
+        Just t  -> cancel t
+        Nothing -> pure ()
     CmdInterrupt -> do
       atomically $ writeTVar appInterrupted True
-      engineWorkerLoop engineState driver EngineChannels{..}
+      mTask <- readTVarIO activeTaskVar
+      case mTask of
+        Just t  -> cancel t
+        Nothing -> pure ()
+      engineWorkerLoop engineState driver channels activeTaskVar
+    CmdSetMode newMode -> do
+      atomically $ writeTVar appMode newMode
+      engineWorkerLoop engineState driver channels activeTaskVar
+    CmdCancelSubAgent sId -> do
+      updateSubAgentStatus engineState sId (SubAgentBlocked "Cancelled by user")
+      engineWorkerLoop engineState driver channels activeTaskVar
+    CmdCompactHistory -> do
+      -- Real context compaction trigger
+      atomically $ do
+        ts <- readTVar appTurns
+        let compacted = compactHistory 0 4 ts
+        writeTVar appTurns compacted
+      persistCurrentSession engineState
+      emitEngineEvent engineState (EvWorkingStateUpdate "Context compaction completed.")
+      engineWorkerLoop engineState driver channels activeTaskVar
     CmdSystemMessage msg -> do
       _ <- addTurn engineState SystemRole [TextBlock msg]
-      engineWorkerLoop engineState driver EngineChannels{..}
+      engineWorkerLoop engineState driver channels activeTaskVar
     CmdClearHistory -> do
       atomically $ do
         writeTVar appTurns []
         writeTVar appTurnCounter 1
       _ <- addTurn engineState SystemRole [TextBlock "Conversation history cleared."]
       persistCurrentSession engineState
-      engineWorkerLoop engineState driver EngineChannels{..}
+      engineWorkerLoop engineState driver channels activeTaskVar
     CmdNewSession -> do
       _ <- resetEngineSession engineState
-      engineWorkerLoop engineState driver EngineChannels{..}
+      engineWorkerLoop engineState driver channels activeTaskVar
     CmdSwitchSession sid -> do
       loadRes <- loadSession appSessionDir sid
       case loadRes of
@@ -89,13 +101,19 @@ engineWorkerLoop engineState@AppEngineState{..} driver EngineChannels{..} = do
           emitEngineEvent engineState (EvError $ "Failed to switch session: " <> err)
         Right sess ->
           restoreEngineSession engineState sess
-      engineWorkerLoop engineState driver EngineChannels{..}
+      engineWorkerLoop engineState driver channels activeTaskVar
     CmdExportTrace -> do
       snap <- snapshotSession engineState
       path <- exportSessionTrace appSessionDir snap
       _ <- addTurn engineState SystemRole [TextBlock $ "Debug execution trace exported to: " <> T.pack path]
-      engineWorkerLoop engineState driver EngineChannels{..}
+      engineWorkerLoop engineState driver channels activeTaskVar
     CmdUserPrompt promptText -> do
+      -- If prior turn task is still active, cancel it before running new prompt
+      mPrev <- readTVarIO activeTaskVar
+      case mPrev of
+        Just prev -> cancel prev
+        Nothing   -> pure ()
+
       -- 1. Reset interrupt flag, update State Vector, and add user turn
       let goalText = if "/goal " `T.isPrefixOf` promptText
                        then T.strip (T.drop 6 promptText)
@@ -111,23 +129,36 @@ engineWorkerLoop engineState@AppEngineState{..} driver EngineChannels{..} = do
 
       _ <- addTurn engineState UserRole [TextBlock promptText]
 
-      -- 2. Run agent conversation loop with exception protection
-      turnRes <- try $ runAgentTurnLoop engineState driver EngineChannels{..} 1 15
-      case turnRes of
-        Left (ex :: SomeException) ->
-          emitEngineEvent engineState (EvError $ "Engine loop failure: " <> T.pack (show ex))
-        Right () -> pure ()
-
+      -- Check if automatic context compaction is required prior to LLM call
       atomically $ do
-        curVec <- readTVar appStateVector
-        let updatedVec = T.unlines $ map (\l -> if "BLOCKED_ON:" `T.isPrefixOf` l then "BLOCKED_ON: User input" else l) (T.lines curVec)
-        writeTVar appStateVector updatedVec
-        writeTQueue appEventQueue (EvWorkingStateUpdate updatedVec)
+        ts <- readTVar appTurns
+        let maxLimit = contextWindowLimit appConfig
+        if estimateTotalTokens ts > maxLimit
+          then writeTVar appTurns (compactHistory maxLimit 4 ts)
+          else pure ()
 
-      -- Auto-save session state after turn completion
-      persistCurrentSession engineState
+      -- 2. Run agent conversation loop in async task so cmdQueue remains responsive
+      turnTask <- async $ do
+        turnRes <- try $ runAgentTurnLoop engineState driver channels 1 15
+        case turnRes of
+          Left (ex :: SomeException) -> do
+            intr <- readTVarIO appInterrupted
+            unless intr $
+              emitEngineEvent engineState (EvError $ "Engine loop failure: " <> T.pack (show ex))
+          Right () -> pure ()
 
-      engineWorkerLoop engineState driver EngineChannels{..}
+        atomically $ do
+          curVec <- readTVar appStateVector
+          let updatedVec = T.unlines $ map (\l -> if "BLOCKED_ON:" `T.isPrefixOf` l then "BLOCKED_ON: User input" else l) (T.lines curVec)
+          writeTVar appStateVector updatedVec
+          writeTQueue appEventQueue (EvWorkingStateUpdate updatedVec)
+          writeTVar activeTaskVar Nothing
+
+        -- Auto-save session state after turn completion
+        persistCurrentSession engineState
+
+      atomically $ writeTVar activeTaskVar (Just turnTask)
+      engineWorkerLoop engineState driver channels activeTaskVar
 
 runAgentTurnLoop
   :: AppEngineState
@@ -241,6 +272,13 @@ runAgentTurnLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
             then []
             else let (prev, lastTc) = (init tcs, last tcs)
                  in prev ++ [addChunk chunk lastTc]
+      | "idx_" `T.isPrefixOf` targetId =
+          case (readMaybe (T.unpack (T.drop 4 targetId)) :: Maybe Int) of
+            Just idx | idx >= 0 && idx < length tcs ->
+              case splitAt idx tcs of
+                (before, target : after) -> before ++ [addChunk chunk target] ++ after
+                _ -> map (\tc -> if toolCallId tc == targetId then addChunk chunk tc else tc) tcs
+            _ -> map (\tc -> if toolCallId tc == targetId then addChunk chunk tc else tc) tcs
       | otherwise =
           map (\tc -> if toolCallId tc == targetId then addChunk chunk tc else tc) tcs
       where

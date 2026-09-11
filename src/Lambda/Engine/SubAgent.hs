@@ -23,6 +23,7 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Text.Read (readMaybe)
 
 import Lambda.Config (Config(..), SpecialistConfig(..))
 import Lambda.Core.ModelDriver (ModelDriver(..))
@@ -293,6 +294,13 @@ subAgentLoop engineState@AppEngineState{..} driver sId grants turnsVar attempted
             then []
             else let (prev, lastTc) = (init tcs, last tcs)
                  in prev ++ [addChunk chunk lastTc]
+      | "idx_" `T.isPrefixOf` targetId =
+          case (readMaybe (T.unpack (T.drop 4 targetId)) :: Maybe Int) of
+            Just idx | idx >= 0 && idx < length tcs ->
+              case splitAt idx tcs of
+                (before, target : after) -> before ++ [addChunk chunk target] ++ after
+                _ -> map (\tc -> if toolCallId tc == targetId then addChunk chunk tc else tc) tcs
+            _ -> map (\tc -> if toolCallId tc == targetId then addChunk chunk tc else tc) tcs
       | otherwise =
           map (\tc -> if toolCallId tc == targetId then addChunk chunk tc else tc) tcs
       where

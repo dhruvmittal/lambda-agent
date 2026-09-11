@@ -203,7 +203,6 @@ data FrontendCommand
   | CmdSystemMessage !Text
   | CmdClearHistory
   | CmdSetMode !AgentMode
-  | CmdResolvePermission !Int !PermissionLevel
   | CmdCancelSubAgent !Int
   | CmdCompactHistory
   | CmdNewSession

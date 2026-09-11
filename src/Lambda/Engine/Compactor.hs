@@ -8,6 +8,8 @@ module Lambda.Engine.Compactor
   , isThinkingBlock
   , estimateTotalTokens
   , defaultAgentSystemPrompt
+  , compactHistory
+  , synthesizeTurnSummary
   ) where
 
 import qualified Data.Aeson as Aeson
@@ -161,3 +163,43 @@ estimateTotalTokens turns = sum (map estimateTurnTokens turns)
       max 1 ((T.length (toolCallName tc) + 20) `div` 4)
     estimateBlockTokens (ToolResultBlock tr) =
       max 1 ((T.length (resultStdout tr) + T.length (resultStderr tr)) `div` 4)
+
+-- | Compacts conversation history when it exceeds token limits or when explicitly triggered.
+-- Retains the most recent recentCount turns intact, and synthesizes older turns into a
+-- concise context summary turn containing goals, tool calls, and references.
+compactHistory :: Int -> Int -> [Turn] -> [Turn]
+compactHistory maxTokens recentCount turns
+  | estimateTotalTokens turns <= maxTokens = turns
+  | length turns <= recentCount + 1 = turns
+  | otherwise =
+      let (older, recent) = splitAt (length turns - recentCount) turns
+          summaryText = synthesizeTurnSummary older
+          minId = case older of
+            (t:_) -> turnId t
+            []    -> 1
+          summaryTurn = Turn minId SystemRole [TextBlock summaryText]
+      in summaryTurn : recent
+
+-- | Synthesizes a structured summary from a sequence of turns
+synthesizeTurnSummary :: [Turn] -> Text
+synthesizeTurnSummary turns =
+  let totalCompacted = length turns
+      userPrompts = [ p | Turn _ UserRole blks <- turns, TextBlock p <- blks ]
+      toolCalls   = [ toolCallName tc | Turn _ AssistantRole blks <- turns, ToolCallBlock tc <- blks ]
+      artifacts   = [ T.pack path | Turn _ ToolRole blks <- turns, ToolResultBlock tr <- blks, Just path <- [resultArtifactPath tr] ]
+      promptSummary = if null userPrompts
+                        then "None recorded"
+                        else T.intercalate "; " (take 3 userPrompts)
+      toolSummary = if null toolCalls
+                      then "No tools executed"
+                      else T.intercalate ", " (take 5 toolCalls) <> (if length toolCalls > 5 then "..." else "")
+      artifactSummary = if null artifacts
+                          then "None"
+                          else T.intercalate ", " (take 5 artifacts)
+  in T.unlines
+       [ "[Context Summary: " <> T.pack (show totalCompacted) <> " historical turns compacted into working state]"
+       , "- Key Objectives: " <> promptSummary
+       , "- Tools Executed: " <> toolSummary
+       , "- Active Artifacts: " <> artifactSummary
+       ]
+

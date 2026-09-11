@@ -15,12 +15,14 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
-import System.FilePath.Glob (compile, match)
+import System.FilePath.Glob (Pattern, compile, match)
 import Lambda.Types
 
 data SecurityState = SecurityState
   { alwaysAllowedPatterns :: ![String]
   , alwaysDeniedPatterns  :: ![String]
+  , alwaysAllowedCompiled :: ![Pattern]
+  , alwaysDeniedCompiled  :: ![Pattern]
   , sessionAllowList      :: !(TVar (Set Text))
   , sessionDenyList       :: !(TVar (Set Text))
   , uiPromptQueue         :: !(TBQueue PermissionPrompt)
@@ -33,9 +35,13 @@ initSecurity allowList denyList = do
   sDeny  <- newTVarIO Set.empty
   queue  <- newTBQueueIO 64
   pCount <- newTVarIO 1
+  let cAllow = map compile allowList
+      cDeny  = map compile denyList
   pure SecurityState
     { alwaysAllowedPatterns = allowList
     , alwaysDeniedPatterns  = denyList
+    , alwaysAllowedCompiled = cAllow
+    , alwaysDeniedCompiled  = cDeny
     , sessionAllowList      = sAllow
     , sessionDenyList       = sDeny
     , uiPromptQueue         = queue
@@ -48,11 +54,11 @@ checkAuthorization SecurityState{..} caller cmd payload = do
   let cmdStr = T.unpack cmd
 
   -- Step 1: Static Deny List (Deny-first rule)
-  if any (\p -> match (compile p) cmdStr) alwaysDeniedPatterns
+  if any (`match` cmdStr) alwaysDeniedCompiled
     then pure False
     else do
       -- Step 2: Static Allow List (repetitive safe operations)
-      if any (\p -> match (compile p) cmdStr) alwaysAllowedPatterns
+      if any (`match` cmdStr) alwaysAllowedCompiled
         then pure True
         else do
           -- Step 3: Session Dynamic Memory

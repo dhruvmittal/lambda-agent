@@ -2,7 +2,8 @@
 {-# LANGUAGE RecordWildCards #-}
 
 module Lambda.Engine.Artifacts
-  ( spooDiagnosticArtifact
+  ( spoolDiagnosticArtifact
+  , spooDiagnosticArtifact
   , formatArtifactPointer
   ) where
 
@@ -12,20 +13,23 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
-import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Time.Clock (getCurrentTime)
+import Data.Time.Format (defaultTimeLocale, formatTime)
 
 -- | Spools raw output out-of-band if it exceeds the threshold (500 chars or 40 lines).
 -- Returns a compact summary string along with the optional artifact file path.
-spooDiagnosticArtifact :: FilePath -> Text -> Text -> IO (Text, Maybe FilePath)
-spooDiagnosticArtifact artifactDir toolName rawOutput = do
+spoolDiagnosticArtifact :: FilePath -> Text -> Text -> IO (Text, Maybe FilePath)
+spoolDiagnosticArtifact artifactDir toolName rawOutput = do
   let lineCount = length (T.lines rawOutput)
       charCount = T.length rawOutput
 
   if charCount > 500 || lineCount > 40
     then do
       createDirectoryIfMissing True artifactDir
-      ts <- show . (round :: Double -> Integer) . realToFrac <$> getPOSIXTime
-      let filename = T.unpack toolName <> "_" <> ts <> ".log"
+      now <- getCurrentTime
+      let ts = formatTime defaultTimeLocale "%Y%m%d_%H%M%S" now
+          pico = take 6 (formatTime defaultTimeLocale "%q" now)
+          filename = T.unpack toolName <> "_" <> ts <> "_" <> pico <> ".log"
           fullPath = artifactDir </> filename
       BS.writeFile fullPath (TE.encodeUtf8 rawOutput)
 
@@ -51,3 +55,8 @@ formatArtifactPointer artId path synopsis totalLines =
     , synopsis
     , "</artifact_pointer>"
     ]
+
+-- | Backward-compatible alias for typo in earlier versions
+spooDiagnosticArtifact :: FilePath -> Text -> Text -> IO (Text, Maybe FilePath)
+spooDiagnosticArtifact = spoolDiagnosticArtifact
+

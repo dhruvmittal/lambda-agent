@@ -26,11 +26,13 @@ import Network.HTTP.Client.TLS (newTlsManager)
 import Network.HTTP.Types.Header (hUserAgent, hAccept)
 import System.Directory (doesFileExist, doesDirectoryExist, listDirectory, createDirectoryIfMissing)
 import System.FilePath (takeDirectory, (</>))
+import System.IO.Unsafe (unsafePerformIO)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import System.Process.Typed
 import System.Timeout (timeout)
 
 import Lambda.Core.ToolProvider
-import Lambda.Engine.Artifacts (spooDiagnosticArtifact)
+import Lambda.Engine.Artifacts (spoolDiagnosticArtifact)
 import Lambda.Types
 
 builtinTools :: FilePath -> FilePath -> [ToolDefinition]
@@ -79,7 +81,7 @@ bashTool wsRoot artDir = ToolDefinition
                   errText = TE.decodeUtf8Lenient (BS.toStrict errBs)
                   combined = if T.null errText then outText else outText <> "\nSTDERR:\n" <> errText
 
-              (compactOutput, mArtifact) <- spooDiagnosticArtifact artDir "bash" combined
+              (compactOutput, mArtifact) <- spoolDiagnosticArtifact artDir "bash" combined
 
               let exitStatus = case exitCode of
                     ExitSuccess -> ""
@@ -253,13 +255,33 @@ editFileTool wsRoot = ToolDefinition
             then pure $ ToolResult "" "" ("File not found: " <> relPath) Nothing
             else do
               content <- TIO.readFile fullPath
-              if not (target `T.isInfixOf` content)
+              let occurrences = T.count target content
+              if occurrences == 0
                 then pure $ ToolResult "" "" "Target string not found in file. Edit aborted." Nothing
-                else do
-                  let updated = T.replace target replacement content
-                  TIO.writeFile fullPath updated
-                  pure $ ToolResult "" ("Successfully edited file: " <> relPath) "" Nothing
+                else if occurrences > 1
+                  then pure $ ToolResult "" ""
+                         ("Ambiguous target string: found " <> T.pack (show occurrences) <> " occurrences in " <> relPath <> ". Please provide more surrounding context in 'target' to ensure a unique match.")
+                         Nothing
+                  else do
+                    let updated = T.replace target replacement content
+                    TIO.writeFile fullPath updated
+                    pure $ ToolResult "" ("Successfully edited file: " <> relPath) "" Nothing
   }
+
+-- | Global connection manager cache for HTTP connection pooling
+globalHttpManager :: IORef (Maybe Manager)
+globalHttpManager = unsafePerformIO (newIORef Nothing)
+{-# NOINLINE globalHttpManager #-}
+
+getSharedHttpManager :: IO Manager
+getSharedHttpManager = do
+  m <- readIORef globalHttpManager
+  case m of
+    Just mgr -> pure mgr
+    Nothing -> do
+      mgr <- newTlsManager
+      writeIORef globalHttpManager (Just mgr)
+      pure mgr
 
 -- | Web URL fetching tool with HTML stripping and OOB artifact spooling
 fetchUrlTool :: FilePath -> ToolDefinition
@@ -282,7 +304,7 @@ fetchUrlTool artDir = ToolDefinition
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
         Right rawUrl -> do
           res <- try $ do
-            manager <- newTlsManager
+            manager <- getSharedHttpManager
             req <- parseRequest (T.unpack rawUrl)
             let req' = req
                   { requestHeaders =
@@ -300,7 +322,7 @@ fetchUrlTool artDir = ToolDefinition
             Left (ex :: SomeException) ->
               pure $ ToolResult "" "" ("Failed to fetch URL: " <> T.pack (show ex)) Nothing
             Right content -> do
-              (compact, mArtifact) <- spooDiagnosticArtifact artDir "fetch_url" content
+              (compact, mArtifact) <- spoolDiagnosticArtifact artDir "fetch_url" content
               pure $ ToolResult "" compact "" mArtifact
   }
 

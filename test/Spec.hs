@@ -21,8 +21,10 @@ import System.Environment (setEnv, unsetEnv)
 import System.Exit (exitFailure)
 
 import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..))
+import Lambda.Core.EngineInterface (initEngineChannels, cmdQueue, startEngineLoop, EngineChannels(..))
 import Lambda.Core.ModelDriver (ModelDriver(..))
 import Lambda.Core.ToolProvider
+import Lambda.Provider.JsonRpc (startRpcClient, stopRpcClient, sendRequest)
 import Lambda.Driver.OpenAI (parseSseChunk, splitThinkingChunks)
 import Lambda.Engine.Artifacts
 import Lambda.Engine.Compactor
@@ -85,6 +87,10 @@ main = do
   testOnDemandMarkdownTraceGeneration
   testAutocompleteAndTabInvariant
   testSubAgentStreamingToolArgs
+  testInterruptionCancellation
+  testCompactionWireIntegrity
+  testParallelArtifactUniqueness
+  testJsonRpcProcessDisconnection
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -158,7 +164,7 @@ testArtifactSpooling = do
   putStrLn "\n[Test 3] Out-of-Band Artifact Spooling & Pointer Generation"
   let testArtDir = ".lambda/test_artifacts"
       hugeLog = T.unlines [ "Line " <> T.pack (show n) <> ": test log output" | n <- [1..200 :: Int] ]
-  (pointer, mPath) <- spooDiagnosticArtifact testArtDir "test_dump" hugeLog
+  (pointer, mPath) <- spoolDiagnosticArtifact testArtDir "test_dump" hugeLog
 
   assert "Spool created artifact file path" (mPath /= Nothing)
   case mPath of
@@ -993,6 +999,91 @@ testSubAgentStreamingToolArgs = do
   assert "Tool result contains actual README content" (any ("lambdA" `T.isInfixOf`) toolResults)
 
   putStrLn "  -> OK: Multi-chunk streamed arguments with empty target IDs accumulate and decode correctly."
+
+-- 31. Verify Engine Interruption via Async Cancellation
+testInterruptionCancellation :: IO ()
+testInterruptionCancellation = do
+  putStrLn "\n[Test 31] Engine Prompt Interruption Cancellation"
+  evQ <- newTQueueIO
+  chans <- initEngineChannels evQ
+  cfg <- loadConfig "/tmp/lambda_test_config"
+  sec <- initSecurity [] []
+  es <- initEngineState cfg emptyRegistry sec
+
+  slowStartedVar <- newTVarIO False
+  let driver = ModelDriver
+        { streamCompletion = \_ _ cb -> do
+            atomically $ writeTVar slowStartedVar True
+            threadDelay 2000000
+            cb (ChunkText "Finished slow task")
+            cb ChunkDone
+        }
+
+  startEngineLoop es driver chans
+  atomically $ writeTBQueue (cmdQueue chans) (CmdUserPrompt "Start slow task")
+
+  atomically $ do
+    started <- readTVar slowStartedVar
+    check started
+
+  atomically $ writeTBQueue (cmdQueue chans) CmdInterrupt
+  threadDelay 50000
+
+  interrupted <- readTVarIO (appInterrupted es)
+  assert "Engine state marked as interrupted" interrupted
+  putStrLn "  -> OK: Active turn immediately cancelled by CmdInterrupt via Async cancellation."
+
+-- 31. Verify Context Compaction Wire Integrity
+testCompactionWireIntegrity :: IO ()
+testCompactionWireIntegrity = do
+  putStrLn "\n[Test 32] Context Compaction Wire Integrity"
+  let turns = [ Turn i (if even i then AssistantRole else UserRole)
+                   [ TextBlock ("Turn " <> T.pack (show i) <> " message with detail " <> T.replicate 40 "data ") ]
+              | i <- [1..20 :: Int] ]
+  let beforeTokens = estimateTotalTokens turns
+  let compacted = compactHistory 600 4 turns
+  let afterTokens = estimateTotalTokens compacted
+  assert "Compacted history reduces total estimated tokens" (afterTokens < beforeTokens)
+  assert "Compacted history contains summary block" (any (\t -> any isSummaryTextBlock (turnBlocks t)) compacted)
+
+  let wire = turnsToOpenAIPayload compacted
+  assert "Generated at least 2 wire messages (system prompt + compacted turns)" (length wire >= 2)
+  let wireText = TE.decodeUtf8 (BL.toStrict (Aeson.encode wire))
+  assert "Wire message contains compact context summary" ("[Context Summary:" `T.isInfixOf` wireText)
+  putStrLn "  -> OK: Compaction prunes older turns, generates structured summary block, and wire payload remains valid."
+  where
+    isSummaryTextBlock (TextBlock t) = "[Context Summary:" `T.isInfixOf` t
+    isSummaryTextBlock _ = False
+
+-- 33. Verify Parallel Diagnostic Artifact Uniqueness
+testParallelArtifactUniqueness :: IO ()
+testParallelArtifactUniqueness = do
+  putStrLn "\n[Test 33] Parallel Diagnostic Artifact Collision Immunity"
+  let testArtDir = ".lambda/test_parallel_artifacts"
+  results <- mapConcurrently (\i -> spoolDiagnosticArtifact testArtDir ("parallel_dump_" <> T.pack (show i)) ("Log content " <> T.pack (show i) <> "\n" <> T.replicate 150 "extra line\n")) [1..20 :: Int]
+  let paths = mapMaybe snd results
+  assert "All 20 parallel spools created artifact files" (length paths == 20)
+  let uniquePaths = Map.keys (Map.fromList [ (p, ()) | p <- paths ])
+  assert "All 20 artifact paths are strictly unique" (length uniquePaths == 20)
+  mapM_ (\p -> do
+    exists <- doesFileExist p
+    assert "Spool file exists on disk" exists) paths
+  removeDirectoryRecursive testArtDir
+  putStrLn "  -> OK: 20 parallel spools generated 20 collision-free artifact files with picosecond timestamps."
+
+-- 34. Verify JSON-RPC Disconnection Resilience
+testJsonRpcProcessDisconnection :: IO ()
+testJsonRpcProcessDisconnection = do
+  putStrLn "\n[Test 34] JSON-RPC Process Disconnection Resilience"
+  client <- startRpcClient LineFramed "sh" ["-c", "exit 0"]
+  threadDelay 50000
+  res <- sendRequest client "ping" (Aeson.object [])
+  case res of
+    Left err -> do
+      assert "Error indicates client disconnected / pipe closed" ("disconnected" `T.isInfixOf` err || "closed" `T.isInfixOf` err)
+      putStrLn "  -> OK: Pending requests to terminated processes fail promptly without deadlocking TMVars."
+    Right _ -> failTest "Expected request to dead process to return Left error."
+  stopRpcClient client
 
 assert :: String -> Bool -> IO ()
 assert desc condition =
