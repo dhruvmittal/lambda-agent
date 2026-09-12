@@ -227,6 +227,7 @@ main = do
   -- 8. Setup Vty terminal with bracketed paste enabled (and mouse trap disabled)
   initialVty <- VCross.mkVty V.defaultConfig
   V.setMode (V.outputIface initialVty) V.BracketedPaste True
+  V.setMode (V.outputIface initialVty) V.Mouse True
 
   -- 9. Initialize UI State from loaded session
   let initialTurns = case loadedSession of
@@ -272,6 +273,7 @@ main = do
   let buildVty = do
         v <- VCross.mkVty V.defaultConfig
         V.setMode (V.outputIface v) V.BracketedPaste True
+        V.setMode (V.outputIface v) V.Mouse True
         pure v
   _ <- customMain initialVty buildVty (Just eventChan) theApp initialUIState
   pure ()

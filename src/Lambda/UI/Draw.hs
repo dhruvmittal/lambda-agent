@@ -60,7 +60,7 @@ hudOverlay :: UIState -> Widget ResourceName
 hudOverlay UIState{ uiShowHud = True, .. } =
   C.centerLayer $
     withBorderStyle BS.unicodeRounded $
-      B.borderWithLabel (withAttr (attrName "hudTitle") (str " lambdA Intelligence HUD [^K / Alt+P or Esc to close] ")) $
+      B.borderWithLabel (withAttr (attrName "hudTitle") (str " lambdA Intelligence HUD [Alt+H / F1 or Esc to close] ")) $
         hLimit 76 $ vLimit 24 $
           padAll 1 $
             vBox
@@ -77,12 +77,14 @@ hudOverlay UIState{ uiShowHud = True, .. } =
               , padTop (Pad 1) $ withAttr (attrName "hudSection") (str "◆ KEYBINDINGS")
               , padLeft (Pad 2) $
                   vBox
-                    [ hBox [ withAttr (attrName "hudKey") (str "Tab         "), str "Toggle Plan / Exec mode (or autocomplete '/') " ]
-                    , hBox [ withAttr (attrName "hudKey") (str "^P / ^N     "), str "Previous / Next prompt history" ]
-                    , hBox [ withAttr (attrName "hudKey") (str "^K / Alt+P  "), str "Toggle this Intelligence HUD" ]
-                    , hBox [ withAttr (attrName "hudKey") (str "^T          "), str "Toggle Thinking/Reasoning visibility" ]
-                    , hBox [ withAttr (attrName "hudKey") (str "Esc Esc     "), str "Interrupt active generation or tool dispatch" ]
-                    , hBox [ withAttr (attrName "hudKey") (str "/help       "), str "Show full command reference in chat" ]
+                    [ hBox [ withAttr (attrName "hudKey") (str "Tab            "), str "Contextual autocomplete (commands, sessions, paths)" ]
+                    , hBox [ withAttr (attrName "hudKey") (str "Alt+M / F2     "), str "Toggle Plan / Exec mode" ]
+                    , hBox [ withAttr (attrName "hudKey") (str "Alt+, / Alt+.  "), str "Navigate SubAgents (< and >) / Esc to return" ]
+                    , hBox [ withAttr (attrName "hudKey") (str "^P / ^N (Alt) "), str "Previous / Next prompt history" ]
+                    , hBox [ withAttr (attrName "hudKey") (str "Alt+H / F1     "), str "Toggle this Intelligence HUD" ]
+                    , hBox [ withAttr (attrName "hudKey") (str "^T             "), str "Toggle Thinking/Reasoning visibility" ]
+                    , hBox [ withAttr (attrName "hudKey") (str "Esc Esc        "), str "Interrupt active generation or tool dispatch" ]
+                    , hBox [ withAttr (attrName "hudKey") (str "/help          "), str "Show full command reference in chat" ]
                     ]
               ]
   where
@@ -140,16 +142,18 @@ renderMainPane
   -> E.Editor Text ResourceName
   -> Widget ResourceName
 renderMainPane Nothing turns subs uiComp mode model ctxLimit cfg editor =
-  viewport ChatView Vertical $
-    padLeftRight 1 $
-      vBox
-        [ vBox (map renderTurn turns)
-        , if Map.null subs
-            then emptyWidget
-            else padTop (Pad 1) $ vBox (map renderInlineSubAgent (Map.elems subs))
-        , renderCompletionLine uiComp
-        , visible (renderPowerlinePrompt mode model (apiBaseUrl cfg) turns ctxLimit editor)
-        ]
+  vBox
+    [ viewport ChatView Vertical $
+        padLeftRight 1 $
+          vBox
+            [ vBox (map renderTurn turns)
+            , if Map.null subs
+                then emptyWidget
+                else padTop (Pad 1) $ vBox (map renderInlineSubAgent (Map.elems subs))
+            ]
+    , renderCompletionLine uiComp
+    , renderPowerlinePrompt mode model (apiBaseUrl cfg) turns ctxLimit editor
+    ]
 renderMainPane (Just sId) _ subs uiComp mode model ctxLimit cfg editor =
   case Map.lookup sId subs of
     Just task ->
@@ -160,14 +164,16 @@ renderMainPane (Just sId) _ subs uiComp mode model ctxLimit cfg editor =
             if null (subAgentTurns task)
               then padAll 1 (withAttr (attrName "thinkingDim") $ str "No dialogue turns recorded for this subagent yet.")
               else vBox (map renderTurn (subAgentTurns task))
-      in viewport ChatView Vertical $
-           padLeftRight 1 $
-             vBox
-               [ C.hCenter banner
-               , renderedTurns
-               , renderCompletionLine uiComp
-               , visible (renderPowerlinePrompt mode model (apiBaseUrl cfg) (subAgentTurns task) ctxLimit editor)
-               ]
+      in vBox
+           [ viewport ChatView Vertical $
+               padLeftRight 1 $
+                 vBox
+                   [ C.hCenter banner
+                   , renderedTurns
+                   ]
+           , renderCompletionLine uiComp
+           , renderPowerlinePrompt mode model (apiBaseUrl cfg) (subAgentTurns task) ctxLimit editor
+           ]
     Nothing ->
       viewport ChatView Vertical (padAll 1 $ withAttr (attrName "toolError") $ str ("SubAgent #" <> show sId <> " not found."))
 
@@ -338,6 +344,8 @@ renderPowerlinePrompt mode model baseUrl turns ctxLimit editor =
     modelWidget = case () of
       _ | T.null baseUrl && T.null model ->
             withAttr (attrName "toolError") (txt "NO PROVIDER CONFIGURED")
+      _ | T.null baseUrl ->
+            withAttr (attrName "toolError") (txt "NO BASE_URL")
       _ | T.null model ->
             withAttr (attrName "thinkingDim") (txt (badge <> "NO MODEL"))
       _ ->

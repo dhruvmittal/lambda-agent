@@ -487,14 +487,13 @@ isOpenRouterEndpoint url =
   let u = T.toLower url
   in "openrouter.ai" `T.isInfixOf` u
 
--- | Return a concise human-readable badge classifying provider topology
+-- | Return a concise badge classifying provider topology.
+-- Local endpoints are explicitly badged with "[local] " so local execution is unambiguous.
+-- Remote endpoints leave the badge empty to avoid cluttering the prompt with redundant tags.
 formatEndpointBadge :: Text -> Text
 formatEndpointBadge url
-  | T.null url                  = "[unconfigured] "
-  | isLocalEndpoint url         = "[local] "
-  | isOpenAiEndpoint url        = "[remote:openai] "
-  | isOpenRouterEndpoint url    = "[remote:openrouter] "
-  | otherwise                   = "[remote] "
+  | isLocalEndpoint url = "[local] "
+  | otherwise           = ""
 
 -- | Resolve model alias taking active Config into account (user aliases, endpoint type)
 resolveModelWithConfig :: Config -> Text -> Text

@@ -1828,19 +1828,19 @@ testNullDefaultsAndProviderTransparency = do
   assert "defaultConfig has empty apiBaseUrl" (T.null (apiBaseUrl defaultConfig))
   assert "defaultConfig has empty modelName" (T.null (modelName defaultConfig))
 
-  -- 2. Verify formatEndpointBadge returns distinct, unambiguous badges
-  assert "Unconfigured URL returns '[unconfigured] '"
-    (formatEndpointBadge "" == "[unconfigured] ")
+  -- 2. Verify formatEndpointBadge returns '[local] ' for local and empty string for remote
   assert "Localhost URL returns '[local] '"
     (formatEndpointBadge "http://localhost:11434/v1" == "[local] ")
   assert "127.0.0.1 URL returns '[local] '"
     (formatEndpointBadge "http://127.0.0.1:8000/v1" == "[local] ")
-  assert "OpenAI URL returns '[remote:openai] '"
-    (formatEndpointBadge "https://api.openai.com/v1" == "[remote:openai] ")
-  assert "OpenRouter URL returns '[remote:openrouter] '"
-    (formatEndpointBadge "https://openrouter.ai/api/v1" == "[remote:openrouter] ")
-  assert "Generic remote URL returns '[remote] '"
-    (formatEndpointBadge "https://api.customllm.internal/v1" == "[remote] ")
+  assert "Unconfigured URL returns empty badge"
+    (formatEndpointBadge "" == "")
+  assert "OpenAI URL returns empty badge (no remote clutter in prompt)"
+    (formatEndpointBadge "https://api.openai.com/v1" == "")
+  assert "OpenRouter URL returns empty badge (no remote clutter in prompt)"
+    (formatEndpointBadge "https://openrouter.ai/api/v1" == "")
+  assert "Generic remote URL returns empty badge"
+    (formatEndpointBadge "https://api.customllm.internal/v1" == "")
 
   -- 3. Verify unconfigured endpoint provides 0 cloud candidates in autocomplete
   evQ <- atomically newTQueue
