@@ -55,6 +55,7 @@ import Lambda.Engine.State
   )
 import Lambda.Engine.SubAgent (submitReportTool, filterSubAgentRegistry, subAgentLoop, runEphemeralSubAgent, SubAgentSpec(..), SubAgentReport(..))
 import qualified Data.Map.Strict as Map
+import Brick.AttrMap (attrName)
 import Brick.Types (vSize, Size(..))
 import qualified Brick.Widgets.Edit as E
 import Lambda.Provider.Builtin (builtinTools, listDirectoryTool, readFileTool, fetchUrlTool, editFileTool, renderDiffBlock, applyWhitespaceTolerantEdit)
@@ -62,6 +63,17 @@ import Lambda.Provider.Mcp (inferCapability, parseMcpCallResult, startAndLoadMcp
 import Lambda.UI.Completion (completeInput, allCommands, computeCommandCandidates, slidingCandidateWindow)
 import Lambda.UI.Draw (renderSubAgents, renderSubAgentsSelected, renderInlineSubAgent, renderCompletionLine)
 import Lambda.UI.Events (computeCommandMatches, replaceCurrentToken, cycleCompletedToken)
+import Lambda.UI.Markdown
+  ( parseMarkdownBlocks
+  , tokenizeInlines
+  , greedyWrap
+  , budgetWidths
+  , initVtyUnicodeWidthTable
+  , textVisualWidth
+  , tokenVisualWidth
+  , MdBlock(..)
+  , WordToken(..)
+  )
 import Lambda.UI.Types (CompletionState(..), Candidate(..), simpleCandidate, ResourceName(..), UIState(..))
 import Lambda.Types
 
@@ -113,6 +125,7 @@ main = do
   testPromptMacrosAndExpansion
   testModelSwitchingDeploymentFixes
   testNullDefaultsAndProviderTransparency
+  testMarkdownParsingAndRendering
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -1903,6 +1916,100 @@ testNullDefaultsAndProviderTransparency = do
     (not (any (\case ChunkText t -> "API key is empty" `T.isInfixOf` t; _ -> False) localChunks))
 
   putStrLn "  -> OK: Provider defaults are strictly null, local vs remote badges are explicit, and local endpoints operate keyless."
+
+-- 45. Verify Streaming-Resilient Markdown Parsing and Block Invariants
+testMarkdownParsingAndRendering :: IO ()
+testMarkdownParsingAndRendering = do
+  putStrLn "\n[Test 45] Robust Markdown Table, Inline Tokenization & Dynamic Layout Invariants"
+
+  -- 1. Headers and Inline Tokenization
+  let headerDoc = "# Top **Level** Header\n## Subheader `code`\n### Plain Section"
+      hBlocks = parseMarkdownBlocks headerDoc
+  assert "Markdown parser correctly identifies H1, H2, and H3 with inlines"
+    (case hBlocks of
+       [MdH1 h1, MdH2 h2, MdH3 h3] ->
+         any (\t -> tokText t == "Level" && tokAttr t == attrName "mdBold") h1
+         && any (\t -> tokText t == "code" && tokAttr t == attrName "mdCodeInline") h2
+         && any (\t -> tokText t == "Plain") h3
+       _ -> False)
+
+  -- 2. GFM Pipe Tables
+  let tableDoc = T.unlines
+        [ "| ✅ Strengths | ⚠️ Weaknesses |"
+        , "|---|---|"
+        , "| Safe /plan mode | Missing quick start |"
+        , "| STM SubAgents | No zlib guide |"
+        ]
+      tBlocks = parseMarkdownBlocks tableDoc
+  assert "Markdown parser correctly extracts GFM pipe tables and discards delimiter rows"
+    (case tBlocks of
+       [MdTable rows] ->
+         length rows == 3
+         && head rows == ["✅ Strengths", "⚠️ Weaknesses"]
+         && rows !! 1 == ["Safe /plan mode", "Missing quick start"]
+         && rows !! 2 == ["STM SubAgents", "No zlib guide"]
+       _ -> False)
+
+  -- 3. Inline Tokenizer
+  let inlines = tokenizeInlines "Clear **/plan ↔ /exec** mode with `Alt+M` shortcut and *italic* note."
+  assert "tokenizeInlines identifies bold, inline code, italic, and plain text"
+    (any (\t -> tokText t == "/plan" && tokAttr t == attrName "mdBold") inlines
+     && any (\t -> tokText t == "/exec" && tokAttr t == attrName "mdBold") inlines
+     && any (\t -> tokText t == "Alt+M" && tokAttr t == attrName "mdCodeInline") inlines
+     && any (\t -> tokText t == "italic" && tokAttr t == attrName "mdItalic") inlines)
+
+  let boundaryTokens = tokenizeInlines "Detailed **configuration** section"
+  assert "tokenizeInlines preserves space across markdown boundary to avoid word gluing"
+    (case boundaryTokens of
+       [WordToken _ "Detailed" True, WordToken _ "configuration" True, WordToken _ "section" _] -> True
+       _ -> False)
+
+  -- 4. Dynamic Greedy Word Wrapping & Table Width Budgeting
+  initVtyUnicodeWidthTable
+  assert "Keycap sequence has visual width 2" (textVisualWidth "1️⃣" == 2)
+  assert "Warning emoji has visual width 2" (textVisualWidth "⚠️" == 2)
+  assert "Checkmark emoji has visual width 2" (textVisualWidth "✅" == 2)
+  assert "Rocket emoji has visual width 2" (textVisualWidth "🚀" == 2)
+
+  let tokens = tokenizeInlines "The quick brown fox jumps over the lazy dog."
+      wrappedRows = greedyWrap 15 tokens
+  assert "greedyWrap groups words into bounded rows"
+    (length wrappedRows >= 3
+     && all (\row -> sum (map tokenVisualWidth row) <= 16) wrappedRows)
+
+  let colBudgets = budgetWidths 80 15 [60, 90]
+  assert "budgetWidths distributes width proportionally and fits within total usable width"
+    (sum colBudgets == 80 && all (>= 15) colBudgets)
+
+  -- 5. Fenced Code Blocks (Closed & Streaming Unclosed)
+  let codeDoc = "```haskell\nmain :: IO ()\nmain = putStrLn \"hello\"\n```"
+      cBlocks = parseMarkdownBlocks codeDoc
+  assert "Markdown parser correctly identifies closed code block with language"
+    (cBlocks == [ MdCode (Just "haskell") ["main :: IO ()", "main = putStrLn \"hello\""] ])
+
+  let streamingCodeDoc = "Introductory text.\n```python\ndef compute(x):\n    return x * 2"
+      sBlocks = parseMarkdownBlocks streamingCodeDoc
+  assert "Markdown parser naturally tolerates in-flight unclosed code fence without crashing"
+    (case sBlocks of
+       [MdPara _, MdCode (Just "python") lines'] -> lines' == ["def compute(x):", "    return x * 2"]
+       _ -> False)
+
+  -- 6. Lists, Quotes & Thematic Breaks
+  let listDoc = "- First bullet\n* Second bullet\n1. Step one\n2. Step two"
+      lBlocks = parseMarkdownBlocks listDoc
+  assert "Markdown parser identifies unordered and numbered list items"
+    (case lBlocks of
+       [MdBullet _, MdBullet _, MdNumbered 1 _, MdNumbered 2 _] -> True
+       _ -> False)
+
+  let quoteDoc = "> Note that this is a blockquote\n> spanning multiple lines.\n---\nFinal paragraph."
+      qBlocks = parseMarkdownBlocks quoteDoc
+  assert "Markdown parser identifies grouped blockquotes and thematic break rules"
+    (case qBlocks of
+       [MdQuote _, MdThematicBreak, MdPara _] -> True
+       _ -> False)
+
+  putStrLn "  -> OK: Robust Markdown engine parses GFM tables, inlines, greedy wrap, and streaming code fences cleanly."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

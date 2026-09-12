@@ -26,6 +26,7 @@ import Lambda.Config (Config(..), formatEndpointBadge)
 import Lambda.Engine.Compactor (estimateTotalTokens)
 import Lambda.Types
 import Lambda.UI.Completion (slidingCandidateWindow)
+import Lambda.UI.Markdown (renderMarkdown)
 import Lambda.UI.Types
 
 drawApp :: UIState -> [Widget ResourceName]
@@ -224,7 +225,7 @@ renderTurn (Turn tId role blocks) =
 
 renderBlock :: ContentBlock -> Widget ResourceName
 renderBlock (TextBlock t) =
-  padLeft (Pad 2) $ txtWrap t
+  padLeft (Pad 2) $ renderMarkdown t
 renderBlock (ThinkingBlock tId body vis) =
   clickable (ThinkingFold tId) $
     padLeft (Pad 2) $

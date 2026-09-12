@@ -45,6 +45,7 @@ library
         Lambda.Engine.PromptMacro
         Lambda.UI.Types
         Lambda.UI.Draw
+        Lambda.UI.Markdown
         Lambda.UI.Events
         Lambda.UI.Completion
     build-depends:

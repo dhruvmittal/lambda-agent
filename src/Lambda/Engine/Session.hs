@@ -227,7 +227,7 @@ listSessions sessionsDir = do
           Left _               -> pure Nothing
       pure $ sortOn (Down . metaUpdatedAt) metas
 
--- | Find and load the most recently updated session
+-- | Find and load the most recently updated session (prefers sessions with user interaction over empty stubs)
 getLatestSession :: FilePath -> IO (Maybe Session)
 getLatestSession sessionsDir = do
   exists <- doesDirectoryExist sessionsDir
@@ -239,12 +239,21 @@ getLatestSession sessionsDir = do
         let path = sessionsDir </> f
         mtime <- getModificationTime path
         pure (mtime, f)
-      let (_, topFile) = head (sortOn (Down . fst) filesWithTime)
-          sid = T.pack (dropExtension topFile)
-      res <- loadSession sessionsDir sid
-      case res of
-        Left _  -> pure Nothing
-        Right s -> pure (Just s)
+      let sortedFiles = sortOn (Down . fst) filesWithTime
+      -- Find the newest session that has meaningful turns (> 1 turn or user turns)
+      let loadCandidate f = do
+            let sid = T.pack (dropExtension f)
+            res <- loadSession sessionsDir sid
+            case res of
+              Right s -> pure (Just s)
+              Left _  -> pure Nothing
+      allLoaded <- catMaybes <$> mapM (loadCandidate . snd) sortedFiles
+      let isMeaningful s = length (sessionTurns s) > 1 || any (\t -> turnRole t == UserRole) (sessionTurns s)
+      case filter isMeaningful allLoaded of
+        (s:_) -> pure (Just s)
+        []    -> case allLoaded of
+                   (s:_) -> pure (Just s)
+                   []    -> pure Nothing
 
 -- | Prune oldest sessions keeping only the N most recent
 pruneSessions :: FilePath -> Int -> IO Int

@@ -41,6 +41,7 @@ import Lambda.Provider.Mcp (startAndLoadMcpServers)
 import Lambda.Types
 import Lambda.UI.Draw (drawApp)
 import Lambda.UI.Events (handleAppEvent)
+import Lambda.UI.Markdown (initVtyUnicodeWidthTable)
 import Lambda.UI.Types
 
 theApp :: App UIState EngineEvent ResourceName
@@ -91,6 +92,22 @@ theApp = App
       , (attrName "compSelected",   V.black `on` V.brightCyan)
       , (attrName "compItem",       fg V.white)
       , (attrName "compBorder",     fg V.brightBlack)
+      , (attrName "mdH1",           fg V.brightWhite `V.withStyle` V.bold)
+      , (attrName "mdH2",           fg V.brightWhite `V.withStyle` V.bold)
+      , (attrName "mdH3",           fg V.white `V.withStyle` V.bold)
+      , (attrName "mdCodeLang",     fg V.brightCyan `V.withStyle` V.bold)
+      , (attrName "mdCodeBlock",    fg V.brightWhite)
+      , (attrName "mdBullet",       fg V.brightMagenta)
+      , (attrName "mdNumbered",     fg V.brightMagenta)
+      , (attrName "mdQuoteBar",     fg V.brightBlack)
+      , (attrName "mdQuote",        fg V.brightWhite `V.withStyle` V.italic)
+      , (attrName "mdRule",         fg V.brightBlack)
+      , (attrName "mdBold",         V.currentAttr `V.withStyle` V.bold)
+      , (attrName "mdItalic",       V.currentAttr `V.withStyle` V.italic)
+      , (attrName "mdCodeInline",   fg V.brightYellow)
+      , (attrName "mdTableHeader",  fg V.brightCyan `V.withStyle` V.bold)
+      , (attrName "mdTableCell",   fg V.white)
+      , (attrName "mdNormal",       fg V.white)
       ]
   }
 
@@ -224,7 +241,8 @@ main = do
     ev <- atomically $ readTQueue (evQueue channels)
     writeBChan eventChan ev
 
-  -- 8. Setup Vty terminal with bracketed paste enabled (and mouse trap disabled)
+  -- 8. Setup Vty terminal with bracketed paste enabled and emoji width table
+  initVtyUnicodeWidthTable
   initialVty <- VCross.mkVty V.defaultConfig
   V.setMode (V.outputIface initialVty) V.BracketedPaste True
   V.setMode (V.outputIface initialVty) V.Mouse True
