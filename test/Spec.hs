@@ -34,7 +34,20 @@ import Lambda.Engine.Artifacts
 import Lambda.Engine.Compactor
 import Lambda.Engine.Dispatcher (executeToolDispatch)
 import Lambda.Engine.Security (initSecurity, checkAuthorization, SecurityState(..))
-import Lambda.Engine.Session (exportSessionTrace, loadSession, listSessions, saveSession, getLatestSession, pruneSessions, renderSessionTraceMarkdown, Session(..), SessionMeta(..))
+import Lambda.Engine.Session
+  ( exportSessionTrace
+  , loadSession
+  , listSessions
+  , listMeaningfulSessions
+  , cleanEmptySessions
+  , resolveSessionId
+  , saveSession
+  , getLatestSession
+  , pruneSessions
+  , renderSessionTraceMarkdown
+  , Session(..)
+  , SessionMeta(..)
+  )
 import Lambda.Engine.State
   ( initEngineState
   , initEngineStateWithSession
@@ -126,6 +139,7 @@ main = do
   testModelSwitchingDeploymentFixes
   testNullDefaultsAndProviderTransparency
   testMarkdownParsingAndRendering
+  testSessionChooserAndResolutionInvariant
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -1319,6 +1333,7 @@ testContextualCompletersAndMruInvariant = do
         , uiSelectedSubAgent = Nothing
         , uiShowHud          = False
         , uiCompletion       = Nothing
+        , uiSessionChooser   = Nothing
         , uiIsGenerating     = False
         , uiConfig           = defaultConfig
         }
@@ -1483,6 +1498,7 @@ testDynamicModelSwitching = do
         , uiSelectedSubAgent = Nothing
         , uiShowHud          = False
         , uiCompletion       = Nothing
+        , uiSessionChooser   = Nothing
         , uiIsGenerating     = False
         , uiConfig           = defaultConfig { apiBaseUrl = "https://openrouter.ai/api/v1" }
         }
@@ -1693,6 +1709,7 @@ testPromptMacrosAndExpansion = do
         , uiSelectedSubAgent = Nothing
         , uiShowHud          = False
         , uiCompletion       = Nothing
+        , uiSessionChooser   = Nothing
         , uiIsGenerating     = False
         , uiConfig           = cfg
         }
@@ -1797,6 +1814,7 @@ testModelSwitchingDeploymentFixes = do
         , uiSelectedSubAgent = Nothing
         , uiShowHud          = False
         , uiCompletion       = Nothing
+        , uiSessionChooser   = Nothing
         , uiIsGenerating     = False
         , uiConfig           = localCfg
         }
@@ -1877,6 +1895,7 @@ testNullDefaultsAndProviderTransparency = do
         , uiSelectedSubAgent = Nothing
         , uiShowHud          = False
         , uiCompletion       = Nothing
+        , uiSessionChooser   = Nothing
         , uiIsGenerating     = False
         , uiConfig           = defaultConfig
         }
@@ -2010,6 +2029,78 @@ testMarkdownParsingAndRendering = do
        _ -> False)
 
   putStrLn "  -> OK: Robust Markdown engine parses GFM tables, inlines, greedy wrap, and streaming code fences cleanly."
+
+-- 46. Verify Session Chooser, 1-Based Index/Substring Resolution & Empty Session Exclusion
+testSessionChooserAndResolutionInvariant :: IO ()
+testSessionChooserAndResolutionInvariant = do
+  putStrLn "\n[Test 46] Session Chooser, Index/Substring Resolution & Empty Session Exclusion"
+  let tempDir = ".lambda/test_sessions_46"
+  createDirectoryIfMissing True tempDir
+  now <- getCurrentTime
+
+  -- 1. Create 3 meaningful sessions and 4 empty stub sessions
+  let mkTurn i = Turn i UserRole [TextBlock ("Goal " <> T.pack (show i))]
+      sess1 = Session "sess_meaningful_1" Nothing now now "Fix Markdown Table Border" ExecMode [mkTurn 1, Turn 2 AssistantRole [TextBlock "Fixed"]] Map.empty Map.empty []
+      sess2 = Session "sess_meaningful_2" (Just "sess_meaningful_1") (addUTCTime (-100) now) (addUTCTime (-100) now) "Code Review Pipeline" PlanMode [mkTurn 1] Map.empty Map.empty []
+      sess3 = Session "sess_meaningful_3" Nothing (addUTCTime (-200) now) (addUTCTime (-200) now) "Initial Architecture Setup" PlanMode [mkTurn 1] Map.empty Map.empty []
+      
+      -- Empty stubs (simulating startup or quick tests: title "New Session", <= 1 turn, 0 user turns)
+      mkStub i = Session ("sess_stub_" <> T.pack (show i)) Nothing (addUTCTime (fromIntegral i) now) (addUTCTime (fromIntegral i) now) "New Session" PlanMode [Turn 1 SystemRole [TextBlock "lambdA initialized."]] Map.empty Map.empty []
+
+  saveSession tempDir 0 sess1
+  saveSession tempDir 0 sess2
+  saveSession tempDir 0 sess3
+  mapM_ (\i -> saveSession tempDir 0 (mkStub i)) [1..4 :: Int]
+
+  -- Verify raw listSessions returns all 7 sessions
+  allMetas <- listSessions tempDir
+  assert "listSessions returns all 7 session files" (length allMetas == 7)
+
+  -- Verify listMeaningfulSessions filters out the 4 stubs and retains only the 3 meaningful sessions in MRU order
+  meaningfulMetas <- listMeaningfulSessions tempDir
+  assert "listMeaningfulSessions returns exactly 3 meaningful sessions" (length meaningfulMetas == 3)
+  assert "Meaningful sessions are ordered MRU descending"
+    (map metaId meaningfulMetas == ["sess_meaningful_1", "sess_meaningful_2", "sess_meaningful_3"])
+
+  -- 2. Verify 1-based index resolution
+  res1 <- resolveSessionId tempDir "1"
+  assert "resolveSessionId '1' resolves to newest meaningful session"
+    (res1 == Right "sess_meaningful_1")
+
+  res2 <- resolveSessionId tempDir "2"
+  assert "resolveSessionId '2' resolves to second newest meaningful session"
+    (res2 == Right "sess_meaningful_2")
+
+  resOutOfRange <- resolveSessionId tempDir "99"
+  assert "resolveSessionId '99' returns error message"
+    (case resOutOfRange of
+       Left err -> "out of range" `T.isInfixOf` err
+       Right _  -> False)
+
+  -- 3. Verify case-insensitive substring resolution on titles
+  resSub1 <- resolveSessionId tempDir "table"
+  assert "resolveSessionId 'table' resolves to 'Fix Markdown Table Border'"
+    (resSub1 == Right "sess_meaningful_1")
+
+  resSub2 <- resolveSessionId tempDir "REVIEW"
+  assert "resolveSessionId 'REVIEW' resolves case-insensitively to 'Code Review Pipeline'"
+    (resSub2 == Right "sess_meaningful_2")
+
+  -- 4. Verify exact session ID resolution
+  resExact <- resolveSessionId tempDir "sess_meaningful_3"
+  assert "resolveSessionId matches exact session ID"
+    (resExact == Right "sess_meaningful_3")
+
+  -- 5. Verify cleanEmptySessions purges the 4 stubs while keeping the 3 meaningful sessions
+  cleanedCount <- cleanEmptySessions tempDir
+  assert "cleanEmptySessions purges exactly 4 stub sessions" (cleanedCount == 4)
+
+  remainingAfterClean <- listSessions tempDir
+  assert "Only the 3 meaningful sessions remain on disk"
+    (length remainingAfterClean == 3 && map metaId remainingAfterClean == ["sess_meaningful_1", "sess_meaningful_2", "sess_meaningful_3"])
+
+  removeDirectoryRecursive tempDir
+  putStrLn "  -> OK: Session chooser, 1-based index/substring resolution & empty session exclusion verified."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

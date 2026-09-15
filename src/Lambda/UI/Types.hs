@@ -10,6 +10,7 @@ import Data.Time.Clock (UTCTime)
 
 import Lambda.Config (Config)
 import Lambda.Core.EngineInterface (EngineChannels)
+import Lambda.Engine.Session (SessionMeta)
 import Lambda.Types
 
 data ResourceName
@@ -25,6 +26,8 @@ data ResourceName
   | HudOverlay
   | HudScroll
   | CompletionPopup
+  | SessionChooserOverlay
+  | SessionItem !Int
   deriving (Eq, Ord, Show)
 
 data Candidate = Candidate
@@ -42,6 +45,12 @@ data CompletionState = CompletionState
 
 compMatches :: CompletionState -> [Text]
 compMatches = map candInsert . compCandidates
+
+data SessionChooserState = SessionChooserState
+  { scSessions :: ![SessionMeta]
+  , scSelected :: !Int
+  , scActiveId :: !Text
+  } deriving (Eq, Show)
 
 data UIState = UIState
   { uiTurns            :: ![Turn]
@@ -62,6 +71,7 @@ data UIState = UIState
   , uiSelectedSubAgent :: !(Maybe Int)
   , uiShowHud          :: !Bool
   , uiCompletion       :: !(Maybe CompletionState)
+  , uiSessionChooser   :: !(Maybe SessionChooserState)
   , uiIsGenerating     :: !Bool
   , uiConfig           :: !Config
   }

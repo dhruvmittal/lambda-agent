@@ -28,9 +28,10 @@ import Lambda.Engine.Security (initSecurity)
 import Lambda.Engine.Session
   ( Session(..)
   , SessionMeta(..)
+  , cleanEmptySessions
   , exportSessionTrace
   , getLatestSession
-  , listSessions
+  , listMeaningfulSessions
   , loadSession
   , renderSessionTraceMarkdown
   )
@@ -120,8 +121,12 @@ main = do
 
   -- Handle CLI-only commands
   case args of
+    ["--clean-sessions"] -> do
+      cleaned <- cleanEmptySessions sessDir
+      putStrLn $ "Cleaned " ++ show cleaned ++ " empty stub session(s)."
+      exitSuccess
     ["--list-sessions"] -> do
-      metas <- listSessions sessDir
+      metas <- listMeaningfulSessions sessDir
       let total = length metas
           recent = take 20 metas
           formatMeta m =
@@ -212,7 +217,7 @@ main = do
           pure (Just s)
     [] -> pure Nothing
     _  -> do
-      putStrLn "Usage: lambda [--continue|-c] [--session|-s <id>] [--list-sessions] [--inspect [id]] [--export-trace [id]]"
+      putStrLn "Usage: lambda [--continue|-c] [--session|-s <id>] [--list-sessions] [--clean-sessions] [--inspect [id]] [--export-trace [id]]"
       exitFailure
 
   -- 2. Initialize tool registry with builtins and configured MCP servers
@@ -283,6 +288,7 @@ main = do
         , uiSelectedSubAgent = Nothing
         , uiShowHud          = False
         , uiCompletion       = Nothing
+        , uiSessionChooser   = Nothing
         , uiIsGenerating     = False
         , uiConfig           = cfg
         }

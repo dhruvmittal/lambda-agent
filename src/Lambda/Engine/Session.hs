@@ -15,6 +15,10 @@ module Lambda.Engine.Session
   , listSessions
   , getLatestSession
   , pruneSessions
+  , isMeaningfulMeta
+  , listMeaningfulSessions
+  , cleanEmptySessions
+  , resolveSessionId
   , sessionToMeta
   , forkSession
   , renderSessionTraceMarkdown
@@ -284,6 +288,80 @@ pruneSessions sessionsDir keepCount
                 fExists <- doesFileExist f
                 when fExists (removeFile f)
               pure (length toPrune)
+
+-- | Predicate identifying meaningful sessions that contain actual user interactions or subagent activity.
+-- Pristine stub sessions have <= 1 turn, 0 subagents, and title "New Session".
+isMeaningfulMeta :: SessionMeta -> Bool
+isMeaningfulMeta m =
+  metaTurnCount m > 1 || metaSubAgentCount m > 0 || (metaTitle m /= "New Session" && metaTurnCount m > 0)
+
+-- | List meaningful sessions ordered by updated_at descending
+listMeaningfulSessions :: FilePath -> IO [SessionMeta]
+listMeaningfulSessions sessionsDir = do
+  metas <- listSessions sessionsDir
+  pure $ filter isMeaningfulMeta metas
+
+-- | Clean up empty 0-interaction stub sessions from .lambda/sessions/
+cleanEmptySessions :: FilePath -> IO Int
+cleanEmptySessions sessionsDir = do
+  exists <- doesDirectoryExist sessionsDir
+  if not exists then pure 0 else do
+    entries <- listDirectory sessionsDir
+    let jsonFiles = filter (\f -> takeExtension f == ".json" && not (".tmp" `isSuffixOf` f)) entries
+    deleted <- forM jsonFiles $ \f -> do
+      let path = sessionsDir </> f
+      content <- BL.readFile path
+      case Aeson.eitherDecode content of
+        Right (s :: Session) ->
+          let isStub = length (sessionTurns s) <= 1
+                     && Map.null (sessionSubAgents s)
+                     && sessionTitle s == "New Session"
+                     && not (any (\t -> turnRole t == UserRole) (sessionTurns s))
+          in if isStub
+               then do
+                 removeFile path
+                 let tracePath = sessionsDir </> (dropExtension f <.> "trace.md")
+                 tExists <- doesFileExist tracePath
+                 when tExists (removeFile tracePath)
+                 pure 1
+               else pure 0
+        Left _ -> pure 0
+    pure (sum deleted)
+
+-- | Resolve a session target into a canonical session ID. Target can be:
+-- 1. A 1-based index (e.g. "1", "2") corresponding to the N-th most recent meaningful session
+-- 2. An exact session ID (e.g. "session_20260912_161506_8714")
+-- 3. A case-insensitive substring matching a session title or ID
+resolveSessionId :: FilePath -> Text -> IO (Either Text Text)
+resolveSessionId sessionsDir rawTarget = do
+  let target = T.strip rawTarget
+  if T.null target
+    then pure $ Left "No session target specified."
+    else do
+      meaningful <- listMeaningfulSessions sessionsDir
+      -- 1. Try 1-based numeric index against meaningful sessions
+      case reads (T.unpack target) of
+        [(idx, "")] | idx >= 1 && idx <= length meaningful ->
+          pure $ Right (metaId (meaningful !! (idx - 1)))
+        [(idx, "")] | idx < 1 || idx > length meaningful ->
+          pure $ Left $ "Session index " <> target <> " out of range (1.." <> T.pack (show (length meaningful)) <> ")."
+        _ -> do
+          -- 2. Check exact session ID match (in meaningful or all sessions)
+          allMetas <- listSessions sessionsDir
+          case filter (\m -> metaId m == target) allMetas of
+            (m:_) -> pure $ Right (metaId m)
+            [] -> do
+              -- 3. Case-insensitive substring match on meaningful session titles
+              let lowerTarget = T.toLower target
+                  titleMatches = filter (\m -> lowerTarget `T.isInfixOf` T.toLower (metaTitle m)) meaningful
+              case titleMatches of
+                (m:_) -> pure $ Right (metaId m)
+                [] -> do
+                  -- 4. Case-insensitive substring match on session ID
+                  let idMatches = filter (\m -> lowerTarget `T.isInfixOf` T.toLower (metaId m)) allMetas
+                  case idMatches of
+                    (m:_) -> pure $ Right (metaId m)
+                    [] -> pure $ Left $ "No session found matching '" <> target <> "'."
 
 -- | Render human-readable markdown trace on demand for debugging
 renderSessionTraceMarkdown :: Session -> Text

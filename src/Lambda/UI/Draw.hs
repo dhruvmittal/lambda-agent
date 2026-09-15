@@ -22,15 +22,80 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 
+import Data.Time.Format (defaultTimeLocale, formatTime)
+
 import Lambda.Config (Config(..), formatEndpointBadge)
 import Lambda.Engine.Compactor (estimateTotalTokens)
+import Lambda.Engine.Session (SessionMeta(..))
 import Lambda.Types
 import Lambda.UI.Completion (slidingCandidateWindow)
 import Lambda.UI.Markdown (renderMarkdown)
 import Lambda.UI.Types
 
 drawApp :: UIState -> [Widget ResourceName]
-drawApp st = [modalOverlay st, hudOverlay st, mainLayout st]
+drawApp st = [modalOverlay st, sessionChooserOverlay st, hudOverlay st, mainLayout st]
+
+sessionChooserOverlay :: UIState -> Widget ResourceName
+sessionChooserOverlay UIState{ uiSessionChooser = Just SessionChooserState{..} } =
+  C.centerLayer $
+    withBorderStyle BS.unicodeRounded $
+      B.borderWithLabel (withAttr (attrName "hudTitle") (str " Select Session [Esc to close] ")) $
+        hLimit 74 $ vLimit 18 $
+          padAll 1 $
+            vBox
+              [ if null scSessions
+                  then C.hCenter (padAll 2 $ withAttr (attrName "thinkingDim") (str "No saved sessions found."))
+                  else vBox (zipWith renderRow [0..] visibleRows)
+              , vLimit 1 (fill ' ')
+              , withBorderStyle BS.unicodeRounded B.hBorder
+              , padTop (Pad 0) $ C.hCenter $
+                  withAttr (attrName "thinkingDim") $
+                    str "[1-9] Quick Switch  •  ↑/↓: Navigate  •  Enter: Select  •  Esc: Cancel"
+              ]
+  where
+    maxVisible = 9
+    total = length scSessions
+    half = maxVisible `div` 2
+    startIdx = max 0 (min (scSelected - half) (total - maxVisible))
+    visibleRows = take maxVisible (drop startIdx (zip [1 :: Int ..] scSessions))
+
+    renderRow listIdx (num, m) =
+      let itemGlobalIdx = startIdx + listIdx
+          isSel = itemGlobalIdx == scSelected
+          isActive = metaId m == scActiveId
+          cursorStr = if isSel then " ❯ " else "   "
+          numStr = "[" <> show num <> "] "
+          timeStr = formatTime defaultTimeLocale "%H:%M" (metaUpdatedAt m)
+          turnsStr = show (metaTurnCount m) <> "t"
+          forkStr = case metaParentId m of
+            Just _  -> " ↳frk"
+            Nothing -> ""
+          activeStr = if isActive then " ★" else ""
+          rawTitle = if T.null (metaTitle m) then "Untitled Session" else metaTitle m
+          shortTitle = if T.length rawTitle > 34 then T.take 32 rawTitle <> "…" else rawTitle
+
+          cursorWidget = if isSel
+                           then withAttr (attrName "compSelected") (str cursorStr)
+                           else withAttr (attrName "thinkingDim") (str cursorStr)
+          numWidget = withAttr (attrName "hudKey") (str numStr)
+          timeWidget = withAttr (attrName "thinkingDim") (str (timeStr <> " · "))
+          titleWidget = if isSel
+                          then withAttr (attrName "compSelected") (txt shortTitle)
+                          else withAttr (attrName "mdNormal") (txt shortTitle)
+          metaWidget = withAttr (attrName "thinkingDim") (str (" " <> turnsStr <> forkStr <> activeStr))
+
+          rowContent = clickable (SessionItem (num - 1)) $ hBox
+            [ cursorWidget
+            , numWidget
+            , timeWidget
+            , titleWidget
+            , fill ' '
+            , metaWidget
+            ]
+      in if isSel
+           then withAttr (attrName "compSelected") rowContent
+           else rowContent
+sessionChooserOverlay _ = emptyWidget
 
 modalOverlay :: UIState -> Widget ResourceName
 modalOverlay UIState{ uiCurrentPrompt = Just p } =

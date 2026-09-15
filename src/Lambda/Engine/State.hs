@@ -18,6 +18,7 @@ module Lambda.Engine.State
   ) where
 
 import Control.Concurrent.STM
+import Control.Monad (unless)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -183,7 +184,12 @@ snapshotSession AppEngineState{..} = do
 persistCurrentSession :: AppEngineState -> IO ()
 persistCurrentSession state@AppEngineState{..} = do
   snap <- snapshotSession state
-  saveSession appSessionDir (maxSavedSessions appConfig) snap
+  let isUntouched = length (sessionTurns snap) <= 1
+                 && Map.null (sessionSubAgents snap)
+                 && sessionTitle snap == "New Session"
+                 && not (any (\t -> turnRole t == UserRole) (sessionTurns snap))
+  unless isUntouched $
+    saveSession appSessionDir (maxSavedSessions appConfig) snap
 
 resetEngineSession :: AppEngineState -> IO Session
 resetEngineSession state@AppEngineState{..} = do

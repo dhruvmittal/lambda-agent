@@ -10,9 +10,8 @@ module Lambda.UI.Completion
   ) where
 
 import Control.Exception (catch, SomeException)
-import Data.List (isPrefixOf, sortOn)
+import Data.List (isPrefixOf)
 import qualified Data.Map.Strict as Map
-import Data.Ord (Down(..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time.Format (defaultTimeLocale, formatTime)
@@ -21,7 +20,7 @@ import System.FilePath ((</>), splitFileName)
 
 import Lambda.Config (Config(..), isLocalEndpoint, isOpenAiEndpoint, isOpenRouterEndpoint)
 import Lambda.Engine.PromptMacro (listPromptMacros)
-import Lambda.Engine.Session (listSessions, SessionMeta(..))
+import Lambda.Engine.Session (listMeaningfulSessions, SessionMeta(..))
 import Lambda.Types
 import Lambda.UI.Types
 
@@ -67,7 +66,7 @@ completeInput baseDir st rawInput = do
         let cands = computeCommandCandidates clean
         pure $ toCompletionState cands
 
-    -- 2. /session argument completion (MRU sorted)
+    -- 2. /session argument completion (MRU sorted, meaningful sessions only)
     _ | "/session " `T.isPrefixOf` clean -> do
         let sessArg = T.drop 9 clean
             sessDir = baseDir </> ".lambda" </> "sessions"
@@ -75,16 +74,27 @@ completeInput baseDir st rawInput = do
         if not exists
           then pure Nothing
           else do
-            metas <- catch (listSessions sessDir) (\(_ :: SomeException) -> pure [])
-            let sorted = sortOn (Down . metaUpdatedAt) metas
-                formatted = [ Candidate (metaId m) (formatSessionMeta m)
-                            | m <- sorted
-                            , sessArg `T.isPrefixOf` metaId m || T.null sessArg
+            metas <- catch (listMeaningfulSessions sessDir) (\(_ :: SomeException) -> pure [])
+            let indexed = zip [1 :: Int ..] metas
+                matches (idx, m) =
+                  let idxStr = T.pack (show idx)
+                      mId = metaId m
+                      title = metaTitle m
+                  in T.null sessArg
+                     || sessArg `T.isPrefixOf` idxStr
+                     || sessArg `T.isPrefixOf` mId
+                     || T.toLower sessArg `T.isInfixOf` T.toLower title
+                matched = filter matches indexed
+                formatted = [ Candidate (T.pack (show idx)) (formatSessionCompact idx m)
+                            | (idx, m) <- matched
                             ]
                 extraPrune = if sessArg `T.isPrefixOf` "prune" && not (T.null sessArg)
                                then [Candidate "prune " "prune <keep_count>"]
                                else []
-            pure $ toCompletionState (extraPrune ++ formatted)
+                extraClean = if sessArg `T.isPrefixOf` "clean" && not (T.null sessArg)
+                               then [Candidate "clean" "clean (purge empty stubs)"]
+                               else []
+            pure $ toCompletionState (extraClean ++ extraPrune ++ formatted)
 
     -- 3. /sub argument completion (active subagent IDs + main)
     _ | "/sub " `T.isPrefixOf` clean -> do
@@ -203,14 +213,15 @@ completeInput baseDir st rawInput = do
     toCompletionState [] = Nothing
     toCompletionState cs = Just (CompletionState cs 0)
 
-    formatSessionMeta m =
+    formatSessionCompact idx m =
       let timeStr = T.pack $ formatTime defaultTimeLocale "%H:%M" (metaUpdatedAt m)
           turnsStr = T.pack (show (metaTurnCount m)) <> "t"
           forkStr = case metaParentId m of
-            Just _  -> " ↳fork"
+            Just _  -> " ↳frk"
             Nothing -> ""
-          titleStr = if T.null (metaTitle m) then "" else " · " <> T.take 22 (metaTitle m)
-      in metaId m <> " (" <> timeStr <> ", " <> turnsStr <> forkStr <> titleStr <> ")"
+          rawTitle = if T.null (metaTitle m) then "Untitled" else metaTitle m
+          shortTitle = if T.length rawTitle > 20 then T.take 18 rawTitle <> "…" else rawTitle
+      in T.pack (show idx) <> ": " <> timeStr <> " · " <> shortTitle <> " (" <> turnsStr <> forkStr <> ")"
 
     formatStatus SubAgentRunning     = "running"
     formatStatus (SubAgentSuccess _) = "success"

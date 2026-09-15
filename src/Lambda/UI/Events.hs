@@ -36,7 +36,10 @@ import Lambda.Engine.Security (resolvePrompt)
 import Lambda.Engine.Session
   ( SessionMeta(..)
   , listSessions
+  , listMeaningfulSessions
+  , cleanEmptySessions
   , pruneSessions
+  , resolveSessionId
   )
 import Lambda.Types
 import Lambda.UI.Completion (completeInput, allCommands, computeCommandCandidates)
@@ -142,30 +145,33 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 'z') [V.MCtrl])) = do
     raiseSignal sigTSTP
     pure st
 
--- Esc: If completion active -> dismiss completion
+-- Esc: If session chooser active -> dismiss session chooser
+--      If completion active -> dismiss completion
 --      If HUD active -> dismiss HUD
 --      If viewing a subagent -> return to main chat
 --      If on main chat -> double Esc interrupts active turn
 handleAppEvent (VtyEvent (V.EvKey V.KEsc [])) = do
   st <- get
-  case uiCompletion st of
-    Just _ -> put st { uiCompletion = Nothing }
-    Nothing ->
-      if uiShowHud st
-        then put st { uiShowHud = False }
-        else case uiSelectedSubAgent st of
-          Just _  -> put st { uiSelectedSubAgent = Nothing }
-          Nothing -> do
-            vScrollToEnd (viewportScroll ChatView)
-            now <- liftIO getCurrentTime
-            case uiLastEscTime st of
-              Just prev | diffUTCTime now prev < 0.5 -> do
-                put st { uiLastEscTime = Nothing }
-                liftIO $ atomically $ do
-                  writeTBQueue (cmdQueue (uiChannels st)) CmdInterrupt
-                  writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "⚠️ Interrupt dispatched (Esc Esc)...")
-              _ ->
-                put st { uiLastEscTime = Just now }
+  case uiSessionChooser st of
+    Just _ -> put st { uiSessionChooser = Nothing }
+    Nothing -> case uiCompletion st of
+      Just _ -> put st { uiCompletion = Nothing }
+      Nothing ->
+        if uiShowHud st
+          then put st { uiShowHud = False }
+          else case uiSelectedSubAgent st of
+            Just _  -> put st { uiSelectedSubAgent = Nothing }
+            Nothing -> do
+              vScrollToEnd (viewportScroll ChatView)
+              now <- liftIO getCurrentTime
+              case uiLastEscTime st of
+                Just prev | diffUTCTime now prev < 0.5 -> do
+                  put st { uiLastEscTime = Nothing }
+                  liftIO $ atomically $ do
+                    writeTBQueue (cmdQueue (uiChannels st)) CmdInterrupt
+                    writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "⚠️ Interrupt dispatched (Esc Esc)...")
+                _ ->
+                  put st { uiLastEscTime = Just now }
 
 -- Alt+, / Alt+< / Alt+[ / Ctrl+Left / Alt+Left / F3: Step back in subagents or return to Main Conversation
 handleAppEvent (VtyEvent (V.EvKey (V.KChar ',') mods))
@@ -313,17 +319,95 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 't') [V.MCtrl])) = do
     , uiSubAgents = updatedSubs
     }
 
--- Keystrokes when permission modal is open (Keys 1-4)
-handleAppEvent (VtyEvent (V.EvKey (V.KChar '1') [])) = resolveActiveModal PermAlways
-handleAppEvent (VtyEvent (V.EvKey (V.KChar '2') [])) = resolveActiveModal PermOnce
-handleAppEvent (VtyEvent (V.EvKey (V.KChar '3') [])) = resolveActiveModal PermNo
-handleAppEvent (VtyEvent (V.EvKey (V.KChar '4') [])) = resolveActiveModal PermNever
+-- ^S: Toggle / open Session Chooser Modal
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 's') [V.MCtrl])) = do
+  st <- get
+  case uiSessionChooser st of
+    Just _  -> put st { uiSessionChooser = Nothing }
+    Nothing -> do
+      metas <- liftIO $ listMeaningfulSessions ".lambda/sessions"
+      put st { uiSessionChooser = Just (SessionChooserState metas 0 "") }
+
+-- Keystrokes 1-4: resolve permission modal if open, quick-switch session if chooser open, else editor
+handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar c) []))
+  | c `elem` ['1', '2', '3', '4'] = do
+      st <- get
+      case uiCurrentPrompt st of
+        Just _ ->
+          case c of
+            '1' -> resolveActiveModal PermAlways
+            '2' -> resolveActiveModal PermOnce
+            '3' -> resolveActiveModal PermNo
+            '4' -> resolveActiveModal PermNever
+            _   -> pure ()
+        Nothing -> case uiSessionChooser st of
+          Just sc -> do
+            let idx = fromEnum c - fromEnum '1'
+            if idx < length (scSessions sc)
+              then do
+                let selectedMeta = scSessions sc !! idx
+                put st { uiSessionChooser = Nothing }
+                liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) (CmdSwitchSession (metaId selectedMeta))
+              else pure ()
+          Nothing -> do
+            zoom uiEditorLens (E.handleEditorEvent (VtyEvent ev))
+            modify $ \s -> if isJust (uiCompletion s) then s { uiCompletion = Nothing } else s
+
+-- Keystrokes 5-9: quick-switch session if chooser open, else editor
+handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar c) []))
+  | c `elem` ['5', '6', '7', '8', '9'] = do
+      st <- get
+      case uiSessionChooser st of
+        Just sc -> do
+          let idx = fromEnum c - fromEnum '1'
+          if idx < length (scSessions sc)
+            then do
+              let selectedMeta = scSessions sc !! idx
+              put st { uiSessionChooser = Nothing }
+              liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) (CmdSwitchSession (metaId selectedMeta))
+            else pure ()
+        Nothing -> do
+          zoom uiEditorLens (E.handleEditorEvent (VtyEvent ev))
+          modify $ \s -> if isJust (uiCompletion s) then s { uiCompletion = Nothing } else s
+
+-- 'q' closes session chooser if open, else editor
+handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar 'q') [])) = do
+  st <- get
+  case uiSessionChooser st of
+    Just _ -> put st { uiSessionChooser = Nothing }
+    Nothing -> do
+      zoom uiEditorLens (E.handleEditorEvent (VtyEvent ev))
+      modify $ \s -> if isJust (uiCompletion s) then s { uiCompletion = Nothing } else s
+
+-- 'j' / 'k' navigates session chooser if open, else editor
+handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar c) []))
+  | c `elem` ['j', 'k'] = do
+      st <- get
+      case uiSessionChooser st of
+        Just sc | not (null (scSessions sc)) -> do
+          let newSel = if c == 'k'
+                         then max 0 (scSelected sc - 1)
+                         else min (length (scSessions sc) - 1) (scSelected sc + 1)
+          put st { uiSessionChooser = Just sc { scSelected = newSel } }
+        _ -> do
+          zoom uiEditorLens (E.handleEditorEvent (VtyEvent ev))
+          modify $ \s -> if isJust (uiCompletion s) then s { uiCompletion = Nothing } else s
 
 -- Mouse clicks on modal buttons (if mouse events are enabled/passed)
 handleAppEvent (MouseDown ButtonAlways V.BLeft _ _) = resolveActiveModal PermAlways
 handleAppEvent (MouseDown ButtonOnce   V.BLeft _ _) = resolveActiveModal PermOnce
 handleAppEvent (MouseDown ButtonNo     V.BLeft _ _) = resolveActiveModal PermNo
 handleAppEvent (MouseDown ButtonNever  V.BLeft _ _) = resolveActiveModal PermNever
+
+-- Mouse click on session item in session chooser modal
+handleAppEvent (MouseDown (SessionItem idx) V.BLeft _ _) = do
+  st <- get
+  case uiSessionChooser st of
+    Just sc | idx >= 0 && idx < length (scSessions sc) -> do
+      let selectedMeta = scSessions sc !! idx
+      put st { uiSessionChooser = Nothing }
+      liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) (CmdSwitchSession (metaId selectedMeta))
+    _ -> pure ()
 
 -- Mouse click on subagent in sidebar
 handleAppEvent (MouseDown (SubAgentItem sId) V.BLeft _ _) =
@@ -375,32 +459,40 @@ handleAppEvent (VtyEvent (V.EvKey V.KDown mods))
   | any (`elem` [V.MMeta, V.MAlt, V.MCtrl, V.MShift]) mods =
       vScrollBy (viewportScroll ChatView) 4
 
--- Up / Down Arrow Keys: Navigate autocomplete if active, else scroll conversation
+-- Up / Down Arrow Keys: Navigate session chooser or autocomplete if active, else scroll conversation
 handleAppEvent (VtyEvent (V.EvKey V.KUp [])) = do
   st <- get
-  case uiCompletion st of
-    Just (CompletionState cands sel) | not (null cands) -> do
-      let prevSel = if sel <= 0 then length cands - 1 else sel - 1
-          prevSelected = cands !! sel
-          nextSelected = cands !! prevSel
-      put st
-        { uiEditor     = cycleCompletedToken (candInsert prevSelected) (candInsert nextSelected) (uiEditor st)
-        , uiCompletion = Just (CompletionState cands prevSel)
-        }
-    _ -> vScrollBy (viewportScroll ChatView) (-2)
+  case uiSessionChooser st of
+    Just sc | not (null (scSessions sc)) -> do
+      let newSel = max 0 (scSelected sc - 1)
+      put st { uiSessionChooser = Just sc { scSelected = newSel } }
+    _ -> case uiCompletion st of
+      Just (CompletionState cands sel) | not (null cands) -> do
+        let prevSel = if sel <= 0 then length cands - 1 else sel - 1
+            prevSelected = cands !! sel
+            nextSelected = cands !! prevSel
+        put st
+          { uiEditor     = cycleCompletedToken (candInsert prevSelected) (candInsert nextSelected) (uiEditor st)
+          , uiCompletion = Just (CompletionState cands prevSel)
+          }
+      _ -> vScrollBy (viewportScroll ChatView) (-2)
 
 handleAppEvent (VtyEvent (V.EvKey V.KDown [])) = do
   st <- get
-  case uiCompletion st of
-    Just (CompletionState cands sel) | not (null cands) -> do
-      let nextSel = if sel >= length cands - 1 then 0 else sel + 1
-          prevSelected = cands !! sel
-          nextSelected = cands !! nextSel
-      put st
-        { uiEditor     = cycleCompletedToken (candInsert prevSelected) (candInsert nextSelected) (uiEditor st)
-        , uiCompletion = Just (CompletionState cands nextSel)
-        }
-    _ -> vScrollBy (viewportScroll ChatView) 2
+  case uiSessionChooser st of
+    Just sc | not (null (scSessions sc)) -> do
+      let newSel = min (length (scSessions sc) - 1) (scSelected sc + 1)
+      put st { uiSessionChooser = Just sc { scSelected = newSel } }
+    _ -> case uiCompletion st of
+      Just (CompletionState cands sel) | not (null cands) -> do
+        let nextSel = if sel >= length cands - 1 then 0 else sel + 1
+            prevSelected = cands !! sel
+            nextSelected = cands !! nextSel
+        put st
+          { uiEditor     = cycleCompletedToken (candInsert prevSelected) (candInsert nextSelected) (uiEditor st)
+          , uiCompletion = Just (CompletionState cands nextSel)
+          }
+      _ -> vScrollBy (viewportScroll ChatView) 2
 
 -- Home / End (with Ctrl): Jump to beginning or end of conversation
 handleAppEvent (VtyEvent (V.EvKey V.KHome [V.MCtrl])) =
@@ -459,20 +551,32 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 'n') mods))
             , uiEditor       = setEditorText recalled
             }
 
--- Keyboard Enter: Submit prompt or dispatch slash command
+-- Keyboard Enter: Submit prompt, select session from chooser, or dispatch slash command
 handleAppEvent (VtyEvent (V.EvKey V.KEnter [])) = do
   st <- get
-  case uiCompletion st of
-    Just (CompletionState _ sel) | sel >= 0 -> do
-      let fullCmd = T.strip (T.concat (E.getEditContents (uiEditor st)))
-      put st
-        { uiEditor        = E.editor EditorInput (Just 1) ""
-        , uiCompletion    = Nothing
-        , uiHistoryIndex  = Nothing
-        , uiSavedDraft    = ""
-        }
-      vScrollToEnd (viewportScroll ChatView)
-      handleCommand fullCmd
+  case uiSessionChooser st of
+    Just sc -> do
+      put st { uiSessionChooser = Nothing }
+      if null (scSessions sc)
+        then pure ()
+        else do
+          let selIdx = scSelected sc
+          if selIdx >= 0 && selIdx < length (scSessions sc)
+            then do
+              let selectedMeta = scSessions sc !! selIdx
+              liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) (CmdSwitchSession (metaId selectedMeta))
+            else pure ()
+    Nothing -> case uiCompletion st of
+      Just (CompletionState _ sel) | sel >= 0 -> do
+        let fullCmd = T.strip (T.concat (E.getEditContents (uiEditor st)))
+        put st
+          { uiEditor        = E.editor EditorInput (Just 1) ""
+          , uiCompletion    = Nothing
+          , uiHistoryIndex  = Nothing
+          , uiSavedDraft    = ""
+          }
+        vScrollToEnd (viewportScroll ChatView)
+        handleCommand fullCmd
     _ -> do
       let rawLines = E.getEditContents (uiEditor st)
           inputText = T.strip (T.unlines rawLines)
@@ -558,27 +662,21 @@ handleCommand cmdText = do
             , "  Ctrl+U, Ctrl+K - Delete line to start / end"
             , "  Ctrl+A, Ctrl+E - Move cursor to start / end of line"
             , "  Ctrl+T         - Toggle thinking/reasoning blocks"
+            , "  Ctrl+S         - Open interactive session chooser modal"
             , "  Keys 1,2,3,4   - Resolve authorization prompt (Always, Once, No, Never)"
             , "  Mouse Wheel    - Scroll conversation viewport"
-            , "  Mouse Click    - Click on SubAgent #id in sidebar or thinking folds"
+            , "  Mouse Click    - Click on SubAgent #id in sidebar, thinking folds, or session chooser"
             ]
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSystemMessage helpText)
     "/new" -> do
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdNewSession
     cmd | cmd `elem` ["/session", "/sessions"] -> do
-      metas <- liftIO $ listSessions ".lambda/sessions"
-      let total = length metas
-          recent = take 20 metas
-          header = "Recent Sessions (" <> T.pack (show (length recent)) <> " of " <> T.pack (show total) <> "):\n"
-          formatMeta m =
-            let timeStr = T.pack $ formatTime defaultTimeLocale "%Y-%m-%d %H:%M" (metaUpdatedAt m)
-                turnsStr = T.pack $ show (metaTurnCount m)
-                agentsStr = T.pack $ show (metaSubAgentCount m)
-            in "  " <> metaId m <> " | " <> timeStr <> " | " <> turnsStr <> " turns | " <> agentsStr <> " subagents | " <> metaTitle m
-          msg = if null metas
-                  then "No saved sessions found in .lambda/sessions/"
-                  else header <> T.unlines (map formatMeta recent) <> "\nUse '/session <id>' to switch, or '/session prune <keep>' to clean up."
-      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSystemMessage msg)
+      metas <- liftIO $ listMeaningfulSessions ".lambda/sessions"
+      put st { uiSessionChooser = Just (SessionChooserState metas 0 "") }
+    cmd | cmd `elem` ["/session clean", "/sessions clean"] -> do
+      pruned <- liftIO $ cleanEmptySessions ".lambda/sessions"
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+        (CmdSystemMessage $ "Cleaned " <> T.pack (show pruned) <> " empty session stub(s).")
     cmd | "/session prune " `T.isPrefixOf` cmd -> do
       let arg = T.strip (T.drop 15 cmd)
       case reads (T.unpack arg) of
@@ -590,8 +688,13 @@ handleCommand cmdText = do
           liftIO $ atomically $ writeTBQueue (cmdQueue channels)
             (CmdSystemMessage "Usage: /session prune <keep_count> (e.g. /session prune 20)")
     cmd | "/session " `T.isPrefixOf` cmd -> do
-      let targetId = T.strip (T.drop 9 cmd)
-      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSwitchSession targetId)
+      let rawArg = T.strip (T.drop 9 cmd)
+      res <- liftIO $ resolveSessionId ".lambda/sessions" rawArg
+      case res of
+        Right targetId ->
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSwitchSession targetId)
+        Left err ->
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSystemMessage ("⚠️ " <> err))
     cmd | cmd `elem` ["/trace", "/export", "/dump"] -> do
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdExportTrace
     cmd | cmd `elem` ["/mode plan", "/plan"] -> do
