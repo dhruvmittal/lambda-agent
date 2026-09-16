@@ -30,7 +30,9 @@ instance Aeson.FromJSON ToolCapability
 -- | User-facing permission level for operations
 data PermissionLevel
   = PermAlways
+  | PermSession
   | PermOnce
+  | PermDeny
   | PermNo
   | PermNever
   deriving stock (Eq, Show, Ord, Generic)
@@ -49,11 +51,12 @@ instance Aeson.FromJSON CallerContext
 
 -- | Non-blocking authorization request
 data PermissionPrompt = PermissionPrompt
-  { promptId     :: !Int
-  , promptCaller :: !CallerContext
-  , promptTool   :: !Text
-  , promptArgs   :: !Aeson.Value
-  , promptReply  :: !(TMVar PermissionLevel)
+  { promptId           :: !Int
+  , promptCaller       :: !CallerContext
+  , promptTool         :: !Text
+  , promptArgs         :: !Aeson.Value
+  , promptProposedGlob :: !Text
+  , promptReply        :: !(TMVar PermissionLevel)
   }
 
 -- | Folding state for thinking / reasoning blocks

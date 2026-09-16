@@ -21,11 +21,14 @@ module Lambda.Config
   , curatedModels
   , resolveEnvTemplates
   , loadConfig
+  , persistAllowGlob
   ) where
 
 import Control.Applicative ((<|>))
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:?), (.!=))
+import qualified Data.Aeson.Key as Key
+import qualified Data.Aeson.KeyMap as KM
 import Data.Aeson.Types (parseMaybe)
 import qualified Data.ByteString.Lazy as BL
 import Data.Map.Strict (Map)
@@ -33,6 +36,7 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
+import qualified Data.Vector as V
 import GHC.Generics (Generic)
 import System.Directory (createDirectoryIfMissing, doesFileExist, getHomeDirectory)
 import System.Environment (lookupEnv)
@@ -541,3 +545,32 @@ curatedModels =
   , "openai/o3-mini"
   , "qwen/qwen-2.5-coder-32b-instruct"
   ]
+
+-- | Surgically append an approved glob pattern to always_allow_globs in <wsRoot>/.lambda/config.json
+persistAllowGlob :: FilePath -> String -> IO (Either Text ())
+persistAllowGlob wsRoot newGlob = do
+  let dirPath  = wsRoot </> ".lambda"
+      confPath = dirPath </> "config.json"
+  createDirectoryIfMissing True dirPath
+  exists <- doesFileExist confPath
+  baseObj <- if exists
+    then do
+      content <- BL.readFile confPath
+      pure $ case Aeson.decode content of
+        Just (Aeson.Object o) -> o
+        _                     -> KM.empty
+    else pure KM.empty
+
+  let currentGlobs = case KM.lookup (Key.fromString "always_allow_globs") baseObj of
+        Just (Aeson.Array arr) ->
+          [ T.unpack s | Aeson.String s <- V.toList arr ]
+        _ -> defaultAllowGlobs
+
+  if newGlob `elem` currentGlobs
+    then pure (Right ())
+    else do
+      let updatedGlobs = currentGlobs ++ [newGlob]
+          newObj = KM.insert (Key.fromString "always_allow_globs") (Aeson.toJSON updatedGlobs) baseObj
+          encoded = Aeson.encode newObj
+      BL.writeFile confPath encoded
+      pure (Right ())

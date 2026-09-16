@@ -20,7 +20,9 @@ data ResourceName
   | SubAgentItem !Int
   | EditorInput
   | ButtonAlways
+  | ButtonSession
   | ButtonOnce
+  | ButtonDeny
   | ButtonNo
   | ButtonNever
   | HudOverlay

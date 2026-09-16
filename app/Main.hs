@@ -24,7 +24,7 @@ import Lambda.Config (loadConfig, Config(..))
 import Lambda.Core.EngineInterface (initEngineChannels, startEngineLoop, EngineChannels(..))
 import Lambda.Core.ToolProvider (emptyRegistry, registerTools, registerTool)
 import Lambda.Driver.OpenAI (openAiDynamicDriver)
-import Lambda.Engine.Security (initSecurity)
+import Lambda.Engine.Security (initSecurityWithRoot)
 import Lambda.Engine.Session
   ( Session(..)
   , SessionMeta(..)
@@ -226,7 +226,7 @@ main = do
   let baseRegistry = registerTools mcpTools builtinReg
 
   -- 3. Initialize security state
-  secState <- initSecurity (alwaysAllowGlobs cfg) (alwaysDenyGlobs cfg)
+  secState <- initSecurityWithRoot (workspaceRoot cfg) (alwaysAllowGlobs cfg) (alwaysDenyGlobs cfg)
 
   -- 4. Initialize engine state and model driver
   engineState <- initEngineStateWithSession cfg baseRegistry secState loadedSession

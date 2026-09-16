@@ -152,26 +152,28 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 'z') [V.MCtrl])) = do
 --      If on main chat -> double Esc interrupts active turn
 handleAppEvent (VtyEvent (V.EvKey V.KEsc [])) = do
   st <- get
-  case uiSessionChooser st of
-    Just _ -> put st { uiSessionChooser = Nothing }
-    Nothing -> case uiCompletion st of
-      Just _ -> put st { uiCompletion = Nothing }
-      Nothing ->
-        if uiShowHud st
-          then put st { uiShowHud = False }
-          else case uiSelectedSubAgent st of
-            Just _  -> put st { uiSelectedSubAgent = Nothing }
-            Nothing -> do
-              vScrollToEnd (viewportScroll ChatView)
-              now <- liftIO getCurrentTime
-              case uiLastEscTime st of
-                Just prev | diffUTCTime now prev < 0.5 -> do
-                  put st { uiLastEscTime = Nothing }
-                  liftIO $ atomically $ do
-                    writeTBQueue (cmdQueue (uiChannels st)) CmdInterrupt
-                    writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "⚠️ Interrupt dispatched (Esc Esc)...")
-                _ ->
-                  put st { uiLastEscTime = Just now }
+  case uiCurrentPrompt st of
+    Just _  -> resolveActiveModal PermDeny
+    Nothing -> case uiSessionChooser st of
+      Just _ -> put st { uiSessionChooser = Nothing }
+      Nothing -> case uiCompletion st of
+        Just _ -> put st { uiCompletion = Nothing }
+        Nothing ->
+          if uiShowHud st
+            then put st { uiShowHud = False }
+            else case uiSelectedSubAgent st of
+              Just _  -> put st { uiSelectedSubAgent = Nothing }
+              Nothing -> do
+                vScrollToEnd (viewportScroll ChatView)
+                now <- liftIO getCurrentTime
+                case uiLastEscTime st of
+                  Just prev | diffUTCTime now prev < 0.5 -> do
+                    put st { uiLastEscTime = Nothing }
+                    liftIO $ atomically $ do
+                      writeTBQueue (cmdQueue (uiChannels st)) CmdInterrupt
+                      writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "⚠️ Interrupt dispatched (Esc Esc)...")
+                  _ ->
+                    put st { uiLastEscTime = Just now }
 
 -- Alt+, / Alt+< / Alt+[ / Ctrl+Left / Alt+Left / F3: Step back in subagents or return to Main Conversation
 handleAppEvent (VtyEvent (V.EvKey (V.KChar ',') mods))
@@ -336,9 +338,9 @@ handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar c) []))
         Just _ ->
           case c of
             '1' -> resolveActiveModal PermAlways
-            '2' -> resolveActiveModal PermOnce
-            '3' -> resolveActiveModal PermNo
-            '4' -> resolveActiveModal PermNever
+            '2' -> resolveActiveModal PermSession
+            '3' -> resolveActiveModal PermOnce
+            '4' -> resolveActiveModal PermDeny
             _   -> pure ()
         Nothing -> case uiSessionChooser st of
           Just sc -> do
@@ -370,14 +372,16 @@ handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar c) []))
           zoom uiEditorLens (E.handleEditorEvent (VtyEvent ev))
           modify $ \s -> if isJust (uiCompletion s) then s { uiCompletion = Nothing } else s
 
--- 'q' closes session chooser if open, else editor
+-- 'q' closes session chooser or dismisses modal if open, else editor
 handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar 'q') [])) = do
   st <- get
-  case uiSessionChooser st of
-    Just _ -> put st { uiSessionChooser = Nothing }
-    Nothing -> do
-      zoom uiEditorLens (E.handleEditorEvent (VtyEvent ev))
-      modify $ \s -> if isJust (uiCompletion s) then s { uiCompletion = Nothing } else s
+  case uiCurrentPrompt st of
+    Just _  -> resolveActiveModal PermDeny
+    Nothing -> case uiSessionChooser st of
+      Just _ -> put st { uiSessionChooser = Nothing }
+      Nothing -> do
+        zoom uiEditorLens (E.handleEditorEvent (VtyEvent ev))
+        modify $ \s -> if isJust (uiCompletion s) then s { uiCompletion = Nothing } else s
 
 -- 'j' / 'k' navigates session chooser if open, else editor
 handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar c) []))
@@ -394,10 +398,12 @@ handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar c) []))
           modify $ \s -> if isJust (uiCompletion s) then s { uiCompletion = Nothing } else s
 
 -- Mouse clicks on modal buttons (if mouse events are enabled/passed)
-handleAppEvent (MouseDown ButtonAlways V.BLeft _ _) = resolveActiveModal PermAlways
-handleAppEvent (MouseDown ButtonOnce   V.BLeft _ _) = resolveActiveModal PermOnce
-handleAppEvent (MouseDown ButtonNo     V.BLeft _ _) = resolveActiveModal PermNo
-handleAppEvent (MouseDown ButtonNever  V.BLeft _ _) = resolveActiveModal PermNever
+handleAppEvent (MouseDown ButtonAlways  V.BLeft _ _) = resolveActiveModal PermAlways
+handleAppEvent (MouseDown ButtonSession V.BLeft _ _) = resolveActiveModal PermSession
+handleAppEvent (MouseDown ButtonOnce    V.BLeft _ _) = resolveActiveModal PermOnce
+handleAppEvent (MouseDown ButtonDeny    V.BLeft _ _) = resolveActiveModal PermDeny
+handleAppEvent (MouseDown ButtonNo      V.BLeft _ _) = resolveActiveModal PermDeny
+handleAppEvent (MouseDown ButtonNever   V.BLeft _ _) = resolveActiveModal PermNever
 
 -- Mouse click on session item in session chooser modal
 handleAppEvent (MouseDown (SessionItem idx) V.BLeft _ _) = do

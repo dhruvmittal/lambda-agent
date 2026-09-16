@@ -118,4 +118,5 @@ test-suite lambda-test
         bytestring,
         brick,
         async,
-        time
+        time,
+        Glob

@@ -102,22 +102,25 @@ modalOverlay UIState{ uiCurrentPrompt = Just p } =
   C.centerLayer $
     withBorderStyle BS.unicodeBold $
       B.borderWithLabel (str " Security Gate: Authorization Required ") $
-        hLimit 64 $ vLimit 12 $
+        hLimit 72 $ vLimit 14 $
           padAll 1 $
             vBox
               [ padBottom (Pad 1) $ str "An operation requires user confirmation:"
-              , str $ "Caller: " <> show (promptCaller p)
-              , str $ "Tool:   " <> T.unpack (promptTool p)
-              , padBottom (Pad 1) $ txtWrap ("Args:   " <> T.pack (take 50 (show (promptArgs p))))
+              , str $ "Caller:  " <> show (promptCaller p)
+              , str $ "Tool:    " <> T.unpack (promptTool p)
+              , padBottom (Pad 1) $ txtWrap ("Args:    " <> T.pack (take 60 (show (promptArgs p))))
+              , if not (T.null (promptProposedGlob p))
+                  then padBottom (Pad 1) $ hBox [withAttr (attrName "hudKey") (str "Pattern: "), str (T.unpack (promptProposedGlob p))]
+                  else emptyWidget
               , C.hCenter $
                   hBox
-                    [ clickable ButtonAlways $ B.border (str " [1] Always ")
+                    [ clickable ButtonAlways  $ B.border (str " [1] Always (Config) ")
                     , str " "
-                    , clickable ButtonOnce   $ B.border (str " [2] Once ")
+                    , clickable ButtonSession $ B.border (str " [2] Session ")
                     , str " "
-                    , clickable ButtonNo     $ B.border (str " [3] No ")
+                    , clickable ButtonOnce    $ B.border (str " [3] Once ")
                     , str " "
-                    , clickable ButtonNever  $ B.border (str " [4] Never ")
+                    , clickable ButtonDeny    $ B.border (str " [4] Deny ")
                     ]
               ]
 modalOverlay _ = emptyWidget

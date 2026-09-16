@@ -7,8 +7,8 @@ import Control.Concurrent.Async (mapConcurrently, race, async, wait)
 import Control.Concurrent.STM
 import Control.Monad (unless)
 import qualified Data.Aeson as Aeson
-import Data.Aeson ((.=))
-import Data.Aeson.Types (parseEither)
+import Data.Aeson ((.=), (.:?))
+import Data.Aeson.Types (parseEither, parseMaybe)
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef (newIORef, readIORef, modifyIORef')
 import Data.Maybe (mapMaybe)
@@ -22,8 +22,9 @@ import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive, doe
 import System.Environment (setEnv, unsetEnv)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
+import System.FilePath.Glob (compile, match)
 
-import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, resolveEnvTemplates)
+import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, resolveEnvTemplates, persistAllowGlob)
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro, expandPromptMacro)
 import Lambda.Core.EngineInterface (initEngineChannels, cmdQueue, startEngineLoop, EngineChannels(..))
 import Lambda.Core.ModelDriver (ModelDriver(..))
@@ -33,7 +34,7 @@ import Lambda.Driver.OpenAI (openAiDynamicDriver, parseSseChunk, splitThinkingCh
 import Lambda.Engine.Artifacts
 import Lambda.Engine.Compactor
 import Lambda.Engine.Dispatcher (executeToolDispatch)
-import Lambda.Engine.Security (initSecurity, checkAuthorization, SecurityState(..))
+import Lambda.Engine.Security (initSecurity, initSecurityWithRoot, deriveSecurityGlob, checkAuthorization, resolvePrompt, SecurityState(..))
 import Lambda.Engine.Session
   ( exportSessionTrace
   , loadSession
@@ -140,6 +141,7 @@ main = do
   testNullDefaultsAndProviderTransparency
   testMarkdownParsingAndRendering
   testSessionChooserAndResolutionInvariant
+  testTieredSecurityModalAndWhitelisting
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -2101,6 +2103,76 @@ testSessionChooserAndResolutionInvariant = do
 
   removeDirectoryRecursive tempDir
   putStrLn "  -> OK: Session chooser, 1-based index/substring resolution & empty session exclusion verified."
+
+-- 47. Verify OpenCode & Antigravity Tiered Security Modal & Config Whitelisting Invariant
+testTieredSecurityModalAndWhitelisting :: IO ()
+testTieredSecurityModalAndWhitelisting = do
+  putStrLn "\n[Test 47] OpenCode & Antigravity Tiered Security Modal & Config Whitelisting"
+  let tempWs = "/tmp/test_lambda_security_whitelisting"
+  createDirectoryIfMissing True tempWs
+
+  -- 1. Test smart glob derivation
+  assert "deriveSecurityGlob: git checkout" (deriveSecurityGlob "git checkout -b feat" == "git checkout*")
+  assert "deriveSecurityGlob: pytest" (deriveSecurityGlob "pytest tests/test_sec.py" == "pytest*")
+  assert "deriveSecurityGlob: cabal test" (deriveSecurityGlob "cabal test lambda-test" == "cabal test*")
+  assert "deriveSecurityGlob: write_file" (deriveSecurityGlob "write_file src/App.hs" == "write_file*")
+  assert "deriveSecurityGlob: outside_workspace" (deriveSecurityGlob "outside_workspace: read_file /etc/passwd" == "outside_workspace: read_file*")
+
+  -- 2. Test PermDeny: rejects the call and does not whitelist for subsequent calls
+  sec <- initSecurityWithRoot tempWs ["git status*"] []
+
+  a1 <- async $ checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object [])
+  prompt1 <- atomically $ readTBQueue (uiPromptQueue sec)
+  assert "prompt1 proposes rm*" (promptProposedGlob prompt1 == "rm*")
+  resolvePrompt prompt1 PermDeny
+  res1 <- wait a1
+  assert "PermDeny results in False" (not res1)
+
+  -- Verify second invocation still prompts (not silently allowed or denied)
+  a2 <- async $ checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object [])
+  prompt2 <- atomically $ readTBQueue (uiPromptQueue sec)
+  resolvePrompt prompt2 PermOnce
+  res2 <- wait a2
+  assert "PermOnce results in True" res2
+
+  -- Third invocation must prompt again because PermOnce was only for 1 call
+  a3 <- async $ checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object [])
+  prompt3 <- atomically $ readTBQueue (uiPromptQueue sec)
+  resolvePrompt prompt3 PermSession
+  res3 <- wait a3
+  assert "PermSession results in True" res3
+
+  -- Fourth invocation must now be auto-allowed by session memory without prompting!
+  res4 <- checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object [])
+  assert "Subsequent call auto-allowed by PermSession" res4
+
+  -- 3. Test PermAlways: writes to .lambda/config.json and hot-reloads into active memory
+  a5 <- async $ checkAuthorization sec MainAgent "pytest tests/test_api.py" (Aeson.object [])
+  prompt5 <- atomically $ readTBQueue (uiPromptQueue sec)
+  assert "prompt5 proposes pytest*" (promptProposedGlob prompt5 == "pytest*")
+  resolvePrompt prompt5 PermAlways
+  res5 <- wait a5
+  assert "PermAlways results in True" res5
+
+  -- Verify hot-reloading: pytest tests/test_engine.py must be auto-allowed immediately by the compiled glob!
+  res6 <- checkAuthorization sec MainAgent "pytest tests/test_engine.py" (Aeson.object [])
+  assert "Subsequent pytest command auto-allowed in-memory via hot-reloaded compiled glob" res6
+
+  -- Verify config file persistence: <tempWs>/.lambda/config.json must contain "pytest*"
+  let confPath = tempWs </> ".lambda" </> "config.json"
+  confExists <- doesFileExist confPath
+  assert ".lambda/config.json was created" confExists
+  confBytes <- BL.readFile confPath
+  case Aeson.decode confBytes of
+    Just (Aeson.Object o) ->
+      case parseMaybe (.:? "always_allow_globs") o of
+        Just (Just (globs :: [String])) ->
+          assert "pytest* was persisted to always_allow_globs in config.json" ("pytest*" `elem` globs)
+        _ -> failTest "always_allow_globs not found in config.json"
+    _ -> failTest "failed to parse .lambda/config.json"
+
+  removeDirectoryRecursive tempWs
+  putStrLn "  -> OK: OpenCode & Antigravity Tiered Security Modal & Config Whitelisting verified."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =
