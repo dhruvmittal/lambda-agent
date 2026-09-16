@@ -4,24 +4,42 @@
 module Lambda.Engine.State
   ( AppEngineState(..)
   , initEngineState
+  , initEngineStateWithSession
   , addTurn
   , updateTurnBlocks
   , registerSubAgentTask
   , updateSubAgentStatus
+  , updateSubAgentTurns
   , emitEngineEvent
+  , snapshotSession
+  , persistCurrentSession
+  , resetEngineSession
+  , restoreEngineSession
   ) where
 
 import Control.Concurrent.STM
+import Control.Monad (unless)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
-import Lambda.Config (Config)
+import Data.Time.Clock (getCurrentTime)
+import System.FilePath ((</>))
+
+import Lambda.Config (Config(..))
 import Lambda.Core.ToolProvider (ToolRegistry)
 import Lambda.Engine.Security (SecurityState)
+import Lambda.Engine.Session
+  ( Session(..)
+  , deriveTitle
+  , newSession
+  , saveSession
+  )
 import Lambda.Types
 
 data AppEngineState = AppEngineState
   { appConfig       :: !Config
+  , appActiveModel  :: !(TVar Text)
+  , appContextLimit :: !(TVar Int)
   , appMode         :: !(TVar AgentMode)
   , appTurns        :: !(TVar [Turn])
   , appTurnCounter  :: !(TVar Int)
@@ -32,21 +50,46 @@ data AppEngineState = AppEngineState
   , appSecurity     :: !SecurityState
   , appEventQueue   :: !(TQueue EngineEvent)
   , appInterrupted  :: !(TVar Bool)
+  , appSession      :: !(TVar Session)
+  , appSessionDir   :: !FilePath
+  , appUndoStack    :: !(TVar [[Turn]])
   }
 
 initEngineState :: Config -> ToolRegistry -> SecurityState -> IO AppEngineState
-initEngineState cfg reg sec = do
-  modeVar   <- newTVarIO PlanMode
-  turnsVar  <- newTVarIO [Turn 1 SystemRole [TextBlock "lambdA initialized. Enter a goal or press /help for commands."]]
-  tCountVar <- newTVarIO 2
-  subsVar   <- newTVarIO Map.empty
-  subSeqVar <- newTVarIO 1
-  stVecVar  <- newTVarIO "GOAL: Awaiting task\nINVARIANTS: [Safe workspace ops, User grant required]\nACTIVE_HYPOTHESIS: None\nBLOCKED_ON: User input"
+initEngineState cfg reg sec = initEngineStateWithSession cfg reg sec Nothing
+
+initEngineStateWithSession :: Config -> ToolRegistry -> SecurityState -> Maybe Session -> IO AppEngineState
+initEngineStateWithSession cfg reg sec maybeSess = do
+  let sessDir = workspaceRoot cfg </> ".lambda" </> "sessions"
+  sess <- case maybeSess of
+    Just s  -> pure s
+    Nothing -> newSession
+  modeVar   <- newTVarIO (sessionMode sess)
+  let initialTurns = if null (sessionTurns sess)
+        then [Turn 1 SystemRole [TextBlock "lambdA initialized. Enter a goal or press /help for commands."]]
+        else sessionTurns sess
+      nextTurnId = if null initialTurns then 2 else maximum (map turnId initialTurns) + 1
+      initialSubs = sessionSubAgents sess
+      nextSubSeq = if Map.null initialSubs then 1 else maximum (Map.keys initialSubs) + 1
+      initialStVec = case Map.lookup "state_vector" (sessionStateVector sess) of
+        Just sv -> sv
+        Nothing -> "GOAL: Awaiting task\nINVARIANTS: [Safe workspace ops, User grant required]\nACTIVE_HYPOTHESIS: None\nBLOCKED_ON: User input"
+  turnsVar  <- newTVarIO initialTurns
+  tCountVar <- newTVarIO nextTurnId
+  subsVar   <- newTVarIO initialSubs
+  subSeqVar <- newTVarIO nextSubSeq
+  stVecVar  <- newTVarIO initialStVec
   regVar    <- newTVarIO reg
   evQueue   <- newTQueueIO
   intrVar   <- newTVarIO False
+  sessVar   <- newTVarIO sess
+  undoVar   <- newTVarIO []
+  activeModVar <- newTVarIO (modelName cfg)
+  ctxLimitVar  <- newTVarIO (contextWindowLimit cfg)
   pure AppEngineState
     { appConfig       = cfg
+    , appActiveModel  = activeModVar
+    , appContextLimit = ctxLimitVar
     , appMode         = modeVar
     , appTurns        = turnsVar
     , appTurnCounter  = tCountVar
@@ -57,6 +100,9 @@ initEngineState cfg reg sec = do
     , appSecurity     = sec
     , appEventQueue   = evQueue
     , appInterrupted  = intrVar
+    , appSession      = sessVar
+    , appSessionDir   = sessDir
+    , appUndoStack    = undoVar
     }
 
 addTurn :: AppEngineState -> Role -> [ContentBlock] -> IO Turn
@@ -77,11 +123,11 @@ updateTurnBlocks AppEngineState{..} tId blocks = atomically $ do
     (u:_) -> writeTQueue appEventQueue (EvTurnUpdated u)
     []    -> pure ()
 
-registerSubAgentTask :: AppEngineState -> Text -> Int -> IO SubAgentTask
-registerSubAgentTask AppEngineState{..} hypothesis budget = atomically $ do
+registerSubAgentTask :: AppEngineState -> Text -> Text -> Int -> IO SubAgentTask
+registerSubAgentTask AppEngineState{..} role hypothesis budget = atomically $ do
   sId <- readTVar appSubAgentSeq
   writeTVar appSubAgentSeq (sId + 1)
-  let task = SubAgentTask sId hypothesis 0 budget SubAgentRunning Nothing
+  let task = SubAgentTask sId role hypothesis 0 budget SubAgentRunning Nothing []
   modifyTVar' appSubAgents (Map.insert sId task)
   writeTQueue appEventQueue (EvSubAgentUpdate task)
   pure task
@@ -96,5 +142,89 @@ updateSubAgentStatus AppEngineState{..} sId status = atomically $ do
       writeTQueue appEventQueue (EvSubAgentUpdate updated)
     Nothing -> pure ()
 
+updateSubAgentTurns :: AppEngineState -> Int -> [Turn] -> IO ()
+updateSubAgentTurns AppEngineState{..} sId turns = atomically $ do
+  subs <- readTVar appSubAgents
+  case Map.lookup sId subs of
+    Just task -> do
+      let asstCount = length (filter (\t -> turnRole t == AssistantRole) turns)
+          updated = task { subAgentTurns = turns, subAgentTurnCount = asstCount }
+      writeTVar appSubAgents (Map.insert sId updated subs)
+      writeTQueue appEventQueue (EvSubAgentUpdate updated)
+    Nothing -> pure ()
+
 emitEngineEvent :: AppEngineState -> EngineEvent -> IO ()
 emitEngineEvent AppEngineState{..} ev = atomically $ writeTQueue appEventQueue ev
+
+snapshotSession :: AppEngineState -> IO Session
+snapshotSession AppEngineState{..} = do
+  now <- getCurrentTime
+  atomically $ do
+    currSess <- readTVar appSession
+    curMode  <- readTVar appMode
+    curTurns <- readTVar appTurns
+    curSubs  <- readTVar appSubAgents
+    curStVec <- readTVar appStateVector
+    let newTitle = if sessionTitle currSess == "New Session"
+          then case [t | Turn _ UserRole blocks <- curTurns, TextBlock t <- blocks] of
+                 (firstPrompt:_) -> deriveTitle firstPrompt
+                 []              -> sessionTitle currSess
+          else sessionTitle currSess
+    let snap = currSess
+          { sessionUpdatedAt     = now
+          , sessionTitle         = newTitle
+          , sessionMode          = curMode
+          , sessionTurns         = curTurns
+          , sessionSubAgents     = curSubs
+          , sessionStateVector   = Map.singleton "state_vector" curStVec
+          }
+    writeTVar appSession snap
+    pure snap
+
+persistCurrentSession :: AppEngineState -> IO ()
+persistCurrentSession state@AppEngineState{..} = do
+  snap <- snapshotSession state
+  let isUntouched = length (sessionTurns snap) <= 1
+                 && Map.null (sessionSubAgents snap)
+                 && sessionTitle snap == "New Session"
+                 && not (any (\t -> turnRole t == UserRole) (sessionTurns snap))
+  unless isUntouched $
+    saveSession appSessionDir (maxSavedSessions appConfig) snap
+
+resetEngineSession :: AppEngineState -> IO Session
+resetEngineSession state@AppEngineState{..} = do
+  persistCurrentSession state
+  freshSess <- newSession
+  atomically $ do
+    writeTVar appSession freshSess
+    writeTVar appMode PlanMode
+    let initTurns = [Turn 1 SystemRole [TextBlock "New session started. Enter a goal or press /help for commands."]]
+    writeTVar appTurns initTurns
+    writeTVar appTurnCounter 2
+    writeTVar appSubAgents Map.empty
+    writeTVar appSubAgentSeq 1
+    writeTVar appStateVector "GOAL: Awaiting task\nINVARIANTS: [Safe workspace ops, User grant required]\nACTIVE_HYPOTHESIS: None\nBLOCKED_ON: User input"
+    writeTQueue appEventQueue (EvSessionSwitched (sessionId freshSess) PlanMode initTurns Map.empty)
+  pure freshSess
+
+restoreEngineSession :: AppEngineState -> Session -> IO ()
+restoreEngineSession state@AppEngineState{..} s = do
+  persistCurrentSession state
+  atomically $ do
+    writeTVar appSession s
+    writeTVar appMode (sessionMode s)
+    let turns = if null (sessionTurns s)
+          then [Turn 1 SystemRole [TextBlock "Resumed session. Enter a goal or press /help for commands."]]
+          else sessionTurns s
+        nextTurnId = if null turns then 2 else maximum (map turnId turns) + 1
+        subs = sessionSubAgents s
+        nextSubId = if Map.null subs then 1 else maximum (Map.keys subs) + 1
+        stVec = case Map.lookup "state_vector" (sessionStateVector s) of
+          Just sv -> sv
+          Nothing -> "GOAL: Awaiting task\nINVARIANTS: [Safe workspace ops, User grant required]\nACTIVE_HYPOTHESIS: None\nBLOCKED_ON: User input"
+    writeTVar appTurns turns
+    writeTVar appTurnCounter nextTurnId
+    writeTVar appSubAgents subs
+    writeTVar appSubAgentSeq nextSubId
+    writeTVar appStateVector stVec
+    writeTQueue appEventQueue (EvSessionSwitched (sessionId s) (sessionMode s) turns subs)

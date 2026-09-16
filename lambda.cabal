@@ -41,9 +41,13 @@ library
         Lambda.Engine.Compactor
         Lambda.Engine.SubAgent
         Lambda.Engine.Artifacts
+        Lambda.Engine.Session
+        Lambda.Engine.PromptMacro
         Lambda.UI.Types
         Lambda.UI.Draw
+        Lambda.UI.Markdown
         Lambda.UI.Events
+        Lambda.UI.Completion
     build-depends:
         base >= 4.17 && < 5,
         text,
@@ -89,7 +93,9 @@ executable lambda
         vty-crossplatform,
         text,
         stm,
-        containers
+        containers,
+        time,
+        filepath
 
 test-suite lambda-test
     import:           common-options
@@ -110,4 +116,7 @@ test-suite lambda-test
         directory,
         filepath,
         bytestring,
-        brick
+        brick,
+        async,
+        time,
+        Glob

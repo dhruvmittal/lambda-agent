@@ -9,6 +9,8 @@ module Lambda.Provider.Builtin
   , readFileTool
   , writeFileTool
   , editFileTool
+  , renderDiffBlock
+  , applyWhitespaceTolerantEdit
   ) where
 
 import Control.Exception (SomeException, try)
@@ -25,12 +27,14 @@ import Network.HTTP.Client
 import Network.HTTP.Client.TLS (newTlsManager)
 import Network.HTTP.Types.Header (hUserAgent, hAccept)
 import System.Directory (doesFileExist, doesDirectoryExist, listDirectory, createDirectoryIfMissing)
-import System.FilePath (takeDirectory, (</>))
+import System.FilePath (takeDirectory, isAbsolute, (</>))
+import System.IO.Unsafe (unsafePerformIO)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import System.Process.Typed
 import System.Timeout (timeout)
 
 import Lambda.Core.ToolProvider
-import Lambda.Engine.Artifacts (spooDiagnosticArtifact)
+import Lambda.Engine.Artifacts (spoolDiagnosticArtifact)
 import Lambda.Types
 
 builtinTools :: FilePath -> FilePath -> [ToolDefinition]
@@ -79,7 +83,7 @@ bashTool wsRoot artDir = ToolDefinition
                   errText = TE.decodeUtf8Lenient (BS.toStrict errBs)
                   combined = if T.null errText then outText else outText <> "\nSTDERR:\n" <> errText
 
-              (compactOutput, mArtifact) <- spooDiagnosticArtifact artDir "bash" combined
+              (compactOutput, mArtifact) <- spoolDiagnosticArtifact artDir "bash" combined
 
               let exitStatus = case exitCode of
                     ExitSuccess -> ""
@@ -87,6 +91,10 @@ bashTool wsRoot artDir = ToolDefinition
 
               pure $ ToolResult "" (compactOutput <> exitStatus) errText mArtifact
   }
+
+-- | Resolves a path, preserving absolute paths and making relative paths workspace-relative
+resolvePath :: FilePath -> FilePath -> FilePath
+resolvePath wsRoot p = if isAbsolute p then p else wsRoot </> p
 
 -- | Directory listing tool
 listDirectoryTool :: FilePath -> ToolDefinition
@@ -112,7 +120,7 @@ listDirectoryTool wsRoot = ToolDefinition
         Right relPath -> do
           let fullPath = if T.null relPath || relPath == "."
                            then wsRoot
-                           else wsRoot </> T.unpack relPath
+                           else resolvePath wsRoot (T.unpack relPath)
           isDir <- doesDirectoryExist fullPath
           if not isDir
             then pure $ ToolResult "" "" ("Directory not found: " <> relPath) Nothing
@@ -126,7 +134,7 @@ listDirectoryTool wsRoot = ToolDefinition
 readFileTool :: FilePath -> ToolDefinition
 readFileTool wsRoot = ToolDefinition
   { toolName = "read_file"
-  , toolDescription = "Read the contents of a file with optional start_line and line_count parameters. For large files (>250 lines), the primary agent should specify start_line/line_count or delegate to 'spawn_diagnostic_subagent'."
+  , toolDescription = "Read the contents of a file with optional start_line and line_count parameters. For large files (>250 lines), the primary agent should specify start_line/line_count or delegate to 'spawn_specialist_subagent'."
   , toolParameters = Aeson.object
       [ "type" .= ("object" :: Text)
       , "properties" .= Aeson.object
@@ -155,7 +163,7 @@ readFileTool wsRoot = ToolDefinition
       case parseEither parseArgs args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
         Right (relPath, mStart, mCount) -> do
-          let fullPath = wsRoot </> T.unpack relPath
+          let fullPath = resolvePath wsRoot (T.unpack relPath)
           isFile <- doesFileExist fullPath
           isDir <- doesDirectoryExist fullPath
           if isDir
@@ -175,7 +183,7 @@ readFileTool wsRoot = ToolDefinition
                     numbered = zipWith (\n l -> T.pack (show n) <> ": " <> l) [sIdx + 1 ..] selectedLines
                 if caller == MainAgent && cCount > 250
                   then pure $ ToolResult "" ""
-                         ("Context Mass Guard: Direct file read of " <> T.pack (show cCount) <> " lines is restricted for the primary agent to prevent context explosion. Please delegate reading/surveying large files to a subagent via 'spawn_diagnostic_subagent', or specify 'start_line' and a 'line_count' (<= 250) for targeted inspection.")
+                         ("Context Mass Guard: Direct file read of " <> T.pack (show cCount) <> " lines is restricted for the primary agent to prevent context explosion. Please delegate reading/surveying large files to a subagent via 'spawn_specialist_subagent', or specify 'start_line' and a 'line_count' (<= 250) for targeted inspection.")
                          Nothing
                   else pure $ ToolResult "" (T.unlines numbered) "" Nothing
   }
@@ -208,7 +216,7 @@ writeFileTool wsRoot = ToolDefinition
       case parseEither parseArgs args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
         Right (relPath, content) -> do
-          let fullPath = wsRoot </> T.unpack relPath
+          let fullPath = resolvePath wsRoot (T.unpack relPath)
           createDirectoryIfMissing True (takeDirectory fullPath)
           TIO.writeFile fullPath content
           pure $ ToolResult "" ("File successfully written: " <> relPath) "" Nothing
@@ -247,19 +255,83 @@ editFileTool wsRoot = ToolDefinition
       case parseEither parseArgs args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
         Right (relPath, target, replacement) -> do
-          let fullPath = wsRoot </> T.unpack relPath
+          let fullPath = resolvePath wsRoot (T.unpack relPath)
           exists <- doesFileExist fullPath
           if not exists
             then pure $ ToolResult "" "" ("File not found: " <> relPath) Nothing
             else do
               content <- TIO.readFile fullPath
-              if not (target `T.isInfixOf` content)
-                then pure $ ToolResult "" "" "Target string not found in file. Edit aborted." Nothing
-                else do
+              let occurrences = T.count target content
+              if occurrences == 1
+                then do
                   let updated = T.replace target replacement content
                   TIO.writeFile fullPath updated
-                  pure $ ToolResult "" ("Successfully edited file: " <> relPath) "" Nothing
+                  let diff = renderDiffBlock relPath target replacement
+                  pure $ ToolResult "" ("Successfully edited file: " <> relPath <> "\n" <> diff) "" Nothing
+                else if occurrences > 1
+                  then pure $ ToolResult "" ""
+                         ("Ambiguous target string: found " <> T.pack (show occurrences) <> " occurrences in " <> relPath <> ". Please provide more surrounding context in 'target' to ensure a unique match.")
+                         Nothing
+                else do
+                  -- Fallback to whitespace-tolerant matching
+                  case applyWhitespaceTolerantEdit content target replacement of
+                    Left err -> pure $ ToolResult "" "" err Nothing
+                    Right updated -> do
+                      TIO.writeFile fullPath updated
+                      let diff = renderDiffBlock relPath target replacement
+                      pure $ ToolResult "" ("Successfully edited file (whitespace-tolerant): " <> relPath <> "\n" <> diff) "" Nothing
   }
+
+-- | Render unified diff block representation for target and replacement text
+renderDiffBlock :: Text -> Text -> Text -> Text
+renderDiffBlock path target replacement =
+  let header = [ "--- a/" <> path
+               , "+++ b/" <> path
+               ]
+      delLines = map ("- " <>) (T.lines target)
+      addLines = map ("+ " <>) (T.lines replacement)
+  in T.unlines (header ++ delLines ++ addLines)
+
+-- | Whitespace-tolerant search and replace across lines
+applyWhitespaceTolerantEdit :: Text -> Text -> Text -> Either Text Text
+applyWhitespaceTolerantEdit content target replacement =
+  let cLines = T.lines content
+      tLines = T.lines (T.filter (/= '\r') target)
+      rLines = T.lines (T.filter (/= '\r') replacement)
+      norm l = T.dropWhileEnd (== ' ') (T.filter (/= '\r') l)
+      normTarget = map norm tLines
+      tLen = length tLines
+      matches = [ i
+                | i <- [0 .. length cLines - tLen]
+                , let slice = take tLen (drop i cLines)
+                , map norm slice == normTarget
+                ]
+  in case matches of
+       []  -> Left "Target string not found in file (even with whitespace tolerance). Edit aborted."
+       [i] ->
+         let before = take i cLines
+             after  = drop (i + tLen) cLines
+             newLines = before ++ rLines ++ after
+             resultText = if T.isSuffixOf "\n" content
+                            then T.unlines newLines
+                            else T.intercalate "\n" newLines
+         in Right resultText
+       ms  -> Left $ "Ambiguous target string after whitespace normalization: found " <> T.pack (show (length ms)) <> " occurrences in file. Please provide more surrounding context."
+
+-- | Global connection manager cache for HTTP connection pooling
+globalHttpManager :: IORef (Maybe Manager)
+globalHttpManager = unsafePerformIO (newIORef Nothing)
+{-# NOINLINE globalHttpManager #-}
+
+getSharedHttpManager :: IO Manager
+getSharedHttpManager = do
+  m <- readIORef globalHttpManager
+  case m of
+    Just mgr -> pure mgr
+    Nothing -> do
+      mgr <- newTlsManager
+      writeIORef globalHttpManager (Just mgr)
+      pure mgr
 
 -- | Web URL fetching tool with HTML stripping and OOB artifact spooling
 fetchUrlTool :: FilePath -> ToolDefinition
@@ -282,7 +354,7 @@ fetchUrlTool artDir = ToolDefinition
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
         Right rawUrl -> do
           res <- try $ do
-            manager <- newTlsManager
+            manager <- getSharedHttpManager
             req <- parseRequest (T.unpack rawUrl)
             let req' = req
                   { requestHeaders =
@@ -300,7 +372,7 @@ fetchUrlTool artDir = ToolDefinition
             Left (ex :: SomeException) ->
               pure $ ToolResult "" "" ("Failed to fetch URL: " <> T.pack (show ex)) Nothing
             Right content -> do
-              (compact, mArtifact) <- spooDiagnosticArtifact artDir "fetch_url" content
+              (compact, mArtifact) <- spoolDiagnosticArtifact artDir "fetch_url" content
               pure $ ToolResult "" compact "" mArtifact
   }
 

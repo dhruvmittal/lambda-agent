@@ -29,7 +29,7 @@ import System.FilePath ((</>))
 
 import Lambda.Config (McpServerConfig(..))
 import Lambda.Core.ToolProvider
-import Lambda.Engine.Artifacts (spooDiagnosticArtifact)
+import Lambda.Engine.Artifacts (spoolDiagnosticArtifact)
 import Lambda.Provider.JsonRpc
 import Lambda.Types
 
@@ -143,7 +143,7 @@ parseMcpTool _serverName rpcClient (Aeson.Object obj) = do
             if isErr
               then pure $ ToolResult "" "" outText Nothing
               else do
-                (renderedOut, mArtPath) <- spooDiagnosticArtifact ".lambda/artifacts" ("mcp_" <> tName) outText
+                (renderedOut, mArtPath) <- spoolDiagnosticArtifact ".lambda/artifacts" ("mcp_" <> tName) outText
                 pure $ ToolResult "" renderedOut "" mArtPath
     }
 parseMcpTool _ _ _ = Nothing
@@ -172,13 +172,18 @@ parseMcpCallResult val = (TE.decodeUtf8 (BL.toStrict (Aeson.encode val)), False)
 
 -- | Heuristically infers ReadOnly vs Destructive capability for MCP tools
 inferCapability :: Text -> Text -> ToolCapability
-inferCapability name desc =
-  let nLower = T.toLower name
-      dLower = T.toLower desc
-      isReadName = any (`T.isPrefixOf` nLower)
-        [ "read", "get", "list", "search", "recall", "find", "check", "inspect", "show", "view", "sd_read", "sd_recall", "sd_search", "sd_get", "nix" ]
-      isReadDesc = "read-only" `T.isInfixOf` dLower || "inspect" `T.isInfixOf` dLower
-  in if isReadName || isReadDesc then ReadOnly else Destructive
+inferCapability name desc
+  | isMutatingName = Destructive
+  | isReadName || isReadDesc = ReadOnly
+  | otherwise = Destructive
+  where
+    nLower = T.toLower name
+    dLower = T.toLower desc
+    isMutatingName = any (`T.isInfixOf` nLower)
+      [ "delete", "write", "remove", "add", "create", "update", "modify", "patch", "replace", "drop", "format", "kill", "prune", "consolidate" ]
+    isReadName = any (`T.isPrefixOf` nLower)
+      [ "read", "get", "list", "search", "recall", "find", "check", "inspect", "show", "view", "sd_read", "sd_recall", "sd_search", "sd_get", "nix" ]
+    isReadDesc = "read-only" `T.isInfixOf` dLower || "inspect" `T.isInfixOf` dLower
 
 -- | Initializes all configured MCP servers, loads their tools, and returns active clients and definitions
 startAndLoadMcpServers :: Map Text McpServerConfig -> IO ([McpClient], [ToolDefinition])

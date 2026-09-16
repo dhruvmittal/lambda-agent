@@ -8,6 +8,7 @@ import Control.Concurrent.STM (TMVar)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:))
 import qualified Data.ByteString.Lazy as BL
+import Data.Map.Strict (Map)
 import Data.Text (Text)
 import qualified Data.Text.Encoding as TE
 import GHC.Generics (Generic)
@@ -29,7 +30,9 @@ instance Aeson.FromJSON ToolCapability
 -- | User-facing permission level for operations
 data PermissionLevel
   = PermAlways
+  | PermSession
   | PermOnce
+  | PermDeny
   | PermNo
   | PermNever
   deriving stock (Eq, Show, Ord, Generic)
@@ -48,11 +51,12 @@ instance Aeson.FromJSON CallerContext
 
 -- | Non-blocking authorization request
 data PermissionPrompt = PermissionPrompt
-  { promptId     :: !Int
-  , promptCaller :: !CallerContext
-  , promptTool   :: !Text
-  , promptArgs   :: !Aeson.Value
-  , promptReply  :: !(TMVar PermissionLevel)
+  { promptId           :: !Int
+  , promptCaller       :: !CallerContext
+  , promptTool         :: !Text
+  , promptArgs         :: !Aeson.Value
+  , promptProposedGlob :: !Text
+  , promptReply        :: !(TMVar PermissionLevel)
   }
 
 -- | Folding state for thinking / reasoning blocks
@@ -172,11 +176,13 @@ instance Aeson.FromJSON SubAgentStatus
 -- | Ephemeral SubAgent task tracker descriptor
 data SubAgentTask = SubAgentTask
   { subAgentId         :: !Int
+  , subAgentRole       :: !Text
   , subAgentHypothesis :: !Text
   , subAgentTurnCount  :: !Int
   , subAgentBudget     :: !Int
   , subAgentStatus     :: !SubAgentStatus
   , subAgentArtifact   :: !(Maybe FilePath)
+  , subAgentTurns      :: ![Turn]
   } deriving stock (Eq, Show, Generic)
 
 instance Aeson.ToJSON SubAgentTask
@@ -191,6 +197,8 @@ data EngineEvent
   | EvPermissionResolved !Int !PermissionLevel
   | EvSubAgentUpdate !SubAgentTask
   | EvWorkingStateUpdate !Text
+  | EvSessionSwitched !Text !AgentMode ![Turn] !(Map Int SubAgentTask)
+  | EvModelSwitched !Text !Int
   | EvError !Text
 
 -- | Frontend to Engine dispatch commands
@@ -199,9 +207,14 @@ data FrontendCommand
   | CmdSystemMessage !Text
   | CmdClearHistory
   | CmdSetMode !AgentMode
-  | CmdResolvePermission !Int !PermissionLevel
+  | CmdSetModel !Text
   | CmdCancelSubAgent !Int
   | CmdCompactHistory
+  | CmdRewindTurns !Int
+  | CmdForkSession !(Maybe Text)
+  | CmdNewSession
+  | CmdSwitchSession !Text
+  | CmdExportTrace
   | CmdInterrupt
   | CmdQuit
   deriving stock (Eq, Show, Generic)

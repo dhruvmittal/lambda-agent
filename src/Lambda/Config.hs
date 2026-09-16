@@ -7,18 +7,36 @@
 module Lambda.Config
   ( Config(..)
   , McpServerConfig(..)
+  , SpecialistConfig(..)
   , defaultConfig
+  , defaultSpecialists
+  , defaultModelAliases
+  , resolveModelAlias
+  , resolveModelWithConfig
+  , isLocalEndpoint
+  , isOpenAiEndpoint
+  , isOpenRouterEndpoint
+  , formatEndpointBadge
+  , lookupModelContextLimit
+  , curatedModels
+  , resolveEnvTemplates
   , loadConfig
+  , persistAllowGlob
   ) where
 
+import Control.Applicative ((<|>))
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:?), (.!=))
+import qualified Data.Aeson.Key as Key
+import qualified Data.Aeson.KeyMap as KM
+import Data.Aeson.Types (parseMaybe)
 import qualified Data.ByteString.Lazy as BL
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
+import qualified Data.Vector as V
 import GHC.Generics (Generic)
 import System.Directory (createDirectoryIfMissing, doesFileExist, getHomeDirectory)
 import System.Environment (lookupEnv)
@@ -44,6 +62,114 @@ instance Aeson.FromJSON McpServerConfig where
     mcpEnv     <- obj .:? "env" .!= Map.empty
     pure McpServerConfig{..}
 
+data SpecialistConfig = SpecialistConfig
+  { specialistDescription  :: !Text
+  , specialistPrompt       :: !Text
+  , specialistBudget       :: !Int
+  , specialistCapabilities :: ![Text]
+  } deriving stock (Eq, Show, Generic)
+
+instance Aeson.ToJSON SpecialistConfig where
+  toJSON SpecialistConfig{..} = Aeson.object
+    [ "description"  .= specialistDescription
+    , "prompt"       .= specialistPrompt
+    , "budget"       .= specialistBudget
+    , "capabilities" .= specialistCapabilities
+    ]
+
+instance Aeson.FromJSON SpecialistConfig where
+  parseJSON = Aeson.withObject "SpecialistConfig" $ \obj -> do
+    specialistDescription  <- obj .:? "description" .!= ""
+    specialistPrompt       <- obj .:? "prompt" .!= ""
+    specialistBudget       <- obj .:? "budget" .!= 6
+    specialistCapabilities <- obj .:? "capabilities" .!= []
+    pure SpecialistConfig{..}
+
+defaultSpecialists :: Map Text SpecialistConfig
+defaultSpecialists = Map.fromList
+  [ ( "surveyor"
+    , SpecialistConfig
+        { specialistDescription  = "Read-only codebase explorer & caller graph mapper"
+        , specialistPrompt       = T.unlines
+            [ "# Role: Codebase Surveyor & Architecture Mapper"
+            , "You are a fastidious, read-only codebase explorer and topological mapping specialist."
+            , "Your mission is to map symbols, locate definitions, trace imports, and verify architectural invariants."
+            , "Operational Invariants:"
+            , "1. STRICT READ-ONLY: Never modify workspace files. Only read-only tools are permitted."
+            , "2. NO PATH HALLUCINATION: Never guess paths or symbols. Always verify via find_by_name, grep_search, or sd_read/sd_recall."
+            , "3. PRECISE REFERENCES: Return exact file paths and line ranges (e.g. src/Foo.hs:L40-L65)."
+            , "When your survey is complete, call `submit_report` with status, summary, details, and any artifact path."
+            ]
+        , specialistBudget       = 16
+        , specialistCapabilities = ["read_file*", "list_directory*", "grep_search*", "find_by_name*", "fetch_url*", "sd_*", "git status*", "git diff*", "git log*"]
+        }
+    )
+  , ( "debugger"
+    , SpecialistConfig
+        { specialistDescription  = "Forensic bug investigator & minimal test reproducer"
+        , specialistPrompt       = T.unlines
+            [ "# Role: Forensic Systems Debugger"
+            , "You are a forensic debugging specialist. Your mission is to isolate the root-cause of crashes, test failures, and regressions."
+            , "Operational Invariants:"
+            , "1. HYPOTHESIS TESTING: Formulate distinct, testable hypotheses for the failure mechanism."
+            , "2. STACK ISOLATION: Locate the exact offending line, frame, or memory violation."
+            , "3. MINIMAL SURGERY: Diagnose the root cause and propose the minimal surgical fix required."
+            , "When your diagnosis is complete, call `submit_report` with status, summary, details, and any artifact path."
+            ]
+        , specialistBudget       = 14
+        , specialistCapabilities = ["read_file*", "grep_search*", "find_by_name*", "cabal test*", "ctest*", "pytest*", "bash*", "sd_*"]
+        }
+    )
+  , ( "profiler"
+    , SpecialistConfig
+        { specialistDescription  = "Systems performance, Valgrind, and hotspot analyzer"
+        , specialistPrompt       = T.unlines
+            [ "# Role: Systems Performance Profiler"
+            , "You are a systems performance profiling specialist. Your mission is to benchmark and identify CPU, memory, and cache bottlenecks."
+            , "Operational Invariants:"
+            , "1. METRIC PRECISION: Run profilers (valgrind callgrind/massif, perf, RTS profiling) and extract instruction/cycle metrics."
+            , "2. HOTSPOT ISOLATION: Identify the top 3 functions consuming the majority of time/allocations."
+            , "3. CONCRETE REMEDY: Recommend specific optimizations (e.g. allocation pre-sizing, unboxed structures, memory reuse)."
+            , "When profiling is complete, call `submit_report` with status, summary, details, and the profile artifact path."
+            ]
+        , specialistBudget       = 10
+        , specialistCapabilities = ["valgrind*", "callgrind_annotate*", "perf*", "read_file*", "bash*", "cabal bench*"]
+        }
+    )
+  , ( "implementer"
+    , SpecialistConfig
+        { specialistDescription  = "Surgical file modifier & refactoring implementer"
+        , specialistPrompt       = T.unlines
+            [ "# Role: Surgical Implementation Specialist"
+            , "You are an implementation specialist. Your mission is to execute clean, minimal file modifications based on approved plans."
+            , "Operational Invariants:"
+            , "1. SURGICAL PRECISION: Make only the targeted changes required. Do not refactor unrelated code."
+            , "2. PRESERVE DOCUMENTATION: Never delete comments, docstrings, or existing architectural conventions."
+            , "3. VERIFY DIFFS: Check your changes for syntax correctness and clean formatting."
+            , "When changes are complete, call `submit_report` with status, summary, details, and the modified file paths."
+            ]
+        , specialistBudget       = 12
+        , specialistCapabilities = ["write_file*", "replace_lines*", "read_file*", "sd_read*"]
+        }
+    )
+  , ( "reviewer"
+    , SpecialistConfig
+        { specialistDescription  = "Adversarial pre-commit invariant and simplicity auditor"
+        , specialistPrompt       = T.unlines
+            [ "# Role: Adversarial Code Reviewer"
+            , "You are an adversarial systems code reviewer. Your mission is to verify safety, correctness, and simplicity before code lands."
+            , "Operational Invariants:"
+            , "1. INVARIANT CHECKING: Inspect git diffs against architectural invariants, concurrency safety, and memory management."
+            , "2. YAGNI & SIMPLICITY: Hunt for over-engineering, unneeded dependencies, speculative abstractions, and dead flexibility."
+            , "3. ACTIONABLE VERDICT: Issue APPROVED or CHANGES_REQUESTED with precise line-by-line feedback."
+            , "When review is complete, call `submit_report` with status, summary, details, and any review artifacts."
+            ]
+        , specialistBudget       = 12
+        , specialistCapabilities = ["git diff*", "git log*", "read_file*", "cabal test*", "ctest*", "sd_recall*"]
+        }
+    )
+  ]
+
 data Config = Config
   { apiBaseUrl          :: !Text
   , apiKey              :: !Text
@@ -56,6 +182,10 @@ data Config = Config
   , maxTurnBudget       :: !Int
   , contextWindowLimit  :: !Int
   , mcpServers          :: !(Map Text McpServerConfig)
+  , specialists         :: !(Map Text SpecialistConfig)
+  , maxSavedSessions    :: !Int
+  , modelAliases        :: !(Map Text Text)
+  , configuredModels    :: ![Text]
   } deriving stock (Eq, Show, Generic)
 
 instance Aeson.ToJSON Config where
@@ -69,21 +199,34 @@ instance Aeson.ToJSON Config where
     , "max_turn_budget"     .= maxTurnBudget
     , "context_limit"       .= contextWindowLimit
     , "mcp_servers"         .= mcpServers
+    , "specialists"         .= specialists
+    , "max_saved_sessions"  .= maxSavedSessions
+    , "model_aliases"       .= modelAliases
+    , "models"              .= configuredModels
     ]
 
 instance Aeson.FromJSON Config where
   parseJSON = Aeson.withObject "Config" $ \obj -> do
-    apiBaseUrl         <- obj .:? "api_base_url" .!= "https://openrouter.ai/api/v1"
+    apiBaseUrl         <- obj .:? "api_base_url" .!= ""
     apiKey             <- obj .:? "api_key" .!= ""
-    modelName          <- obj .:? "model_name" .!= "openrouter/free"
+    modelName          <- obj .:? "model_name" .!= ""
     customHeaders      <- obj .:? "custom_headers" .!= Map.empty
     alwaysAllowGlobs   <- obj .:? "always_allow_globs" .!= defaultAllowGlobs
     alwaysDenyGlobs    <- obj .:? "always_deny_globs" .!= defaultDenyGlobs
     maxTurnBudget      <- obj .:? "max_turn_budget" .!= 30
     contextWindowLimit <- obj .:? "context_limit" .!= 128000
     mcpServers         <- obj .:? "mcp_servers" .!= Map.empty
-    let workspaceRoot = "."
-        artifactDir   = ".lambda/artifacts"
+    userSpecialists    <- obj .:? "specialists" .!= Map.empty
+    userSubagents      <- obj .:? "subagents" .!= Map.empty
+    maxSavedSessions   <- obj .:? "max_saved_sessions" .!= 50
+    mUserAliases       <- obj .:? "model_aliases"
+    modelAliases       <- case mUserAliases of
+                            Just a  -> pure a
+                            Nothing -> obj .:? "aliases" .!= Map.empty
+    configuredModels   <- obj .:? "models" .!= []
+    let specialists = Map.union userSpecialists (Map.union userSubagents defaultSpecialists)
+        workspaceRoot  = "."
+        artifactDir    = ".lambda/artifacts"
     pure Config{..}
 
 defaultAllowGlobs :: [String]
@@ -96,7 +239,7 @@ defaultAllowGlobs =
   , "cat *"
   , "read_file*"
   , "list_directory*"
-  , "fetch_url*"
+  , "spawn_specialist_subagent*"
   , "sd_*"
   ]
 
@@ -109,9 +252,9 @@ defaultDenyGlobs =
 
 defaultConfig :: Config
 defaultConfig = Config
-  { apiBaseUrl          = "https://openrouter.ai/api/v1"
+  { apiBaseUrl          = ""
   , apiKey              = ""
-  , modelName           = "openrouter/free"
+  , modelName           = ""
   , customHeaders       = Map.empty
   , alwaysAllowGlobs    = defaultAllowGlobs
   , alwaysDenyGlobs     = defaultDenyGlobs
@@ -120,6 +263,10 @@ defaultConfig = Config
   , maxTurnBudget       = 30
   , contextWindowLimit  = 128000
   , mcpServers          = Map.empty
+  , specialists         = defaultSpecialists
+  , maxSavedSessions    = 50
+  , modelAliases        = Map.empty
+  , configuredModels    = []
   }
 
 loadConfig :: FilePath -> IO Config
@@ -144,8 +291,37 @@ loadConfig wsRoot = do
       then do
         content <- BL.readFile localPath
         pure $ case Aeson.decode content of
-          Just c  -> c
-          Nothing -> baseCfg
+          Just (Aeson.Object o) ->
+            let pick field fallback = case parseMaybe (.:? field) o of
+                  Just (Just v) -> v
+                  _             -> fallback
+                pickMap field fallback = case parseMaybe (.:? field) o of
+                  Just (Just m) -> Map.union m fallback
+                  _             -> fallback
+                mAliases = case parseMaybe (.:? "model_aliases") o of
+                  Just (Just a) -> Map.union a (modelAliases baseCfg)
+                  _             -> case parseMaybe (.:? "aliases") o of
+                    Just (Just a) -> Map.union a (modelAliases baseCfg)
+                    _             -> modelAliases baseCfg
+                specsWithSubs = case parseMaybe (.:? "subagents") o of
+                  Just (Just sub) -> Map.union sub (specialists baseCfg)
+                  _               -> specialists baseCfg
+            in baseCfg
+              { apiBaseUrl         = pick "api_base_url" (apiBaseUrl baseCfg)
+              , apiKey             = pick "api_key" (apiKey baseCfg)
+              , modelName          = pick "model_name" (modelName baseCfg)
+              , customHeaders      = pickMap "custom_headers" (customHeaders baseCfg)
+              , alwaysAllowGlobs   = pick "always_allow_globs" (alwaysAllowGlobs baseCfg)
+              , alwaysDenyGlobs    = pick "always_deny_globs" (alwaysDenyGlobs baseCfg)
+              , maxTurnBudget      = pick "max_turn_budget" (maxTurnBudget baseCfg)
+              , contextWindowLimit = pick "context_limit" (contextWindowLimit baseCfg)
+              , mcpServers         = pickMap "mcp_servers" (mcpServers baseCfg)
+              , specialists        = pickMap "specialists" specsWithSubs
+              , maxSavedSessions   = pick "max_saved_sessions" (maxSavedSessions baseCfg)
+              , modelAliases       = mAliases
+              , configuredModels   = pick "models" (configuredModels baseCfg)
+              }
+          _ -> baseCfg
       else pure baseCfg
 
   -- Load local .env / .env.local variables if present
@@ -167,16 +343,27 @@ loadConfig wsRoot = do
           Just v | not (null v) -> Just v
           _                     -> Map.lookup name dotEnvMap
 
-  -- Environment variable overrides with fallbacks for OpenRouter & OpenAI
-  mEnvKey <- lookupVar "LAMBDA_API_KEY" >>= \case
+  -- Resolve {ENV:VAR} placeholders in mergedCfg fields
+  cfgKeyResolved  <- resolveEnvTemplates lookupVar (apiKey mergedCfg)
+  cfgUrlResolved  <- resolveEnvTemplates lookupVar (apiBaseUrl mergedCfg)
+  cfgModResolved  <- resolveEnvTemplates lookupVar (modelName mergedCfg)
+  cfgHdrsResolved <- mapM (resolveEnvTemplates lookupVar) (customHeaders mergedCfg)
+
+  mExplicitLambdaKey <- lookupVar "LAMBDA_API_KEY"
+  mFallbackKey <- lookupVar "OPENROUTER_API_KEY" >>= \case
     Just k | not (null k) -> pure (Just k)
-    _ -> lookupVar "OPENROUTER_API_KEY" >>= \case
-      Just k | not (null k) -> pure (Just k)
-      _ -> lookupVar "OPENAI_API_KEY"
+    _ -> lookupVar "OPENAI_API_KEY"
+
+  let finalKey = case mExplicitLambdaKey of
+        Just k | not (null k)           -> T.pack k
+        _ | not (T.null cfgKeyResolved) -> cfgKeyResolved
+        _                               -> maybe "" T.pack mFallbackKey
 
   mEnvUrl <- lookupVar "LAMBDA_BASE_URL" >>= \case
     Just u | not (null u) -> pure (Just u)
     _ -> lookupVar "OPENAI_BASE_URL"
+
+  let finalUrl = maybe cfgUrlResolved T.pack mEnvUrl
 
   mEnvMod <- lookupVar "LAMBDA_MODEL" >>= \case
     Just m | not (null m) -> pure (Just m)
@@ -184,15 +371,14 @@ loadConfig wsRoot = do
       Just m | not (null m) -> pure (Just m)
       _ -> lookupVar "OPENAI_MODEL"
 
+  let finalMod = maybe cfgModResolved T.pack mEnvMod
+
   mEnvLimit <- lookupVar "CONTEXT_LIMIT"
   let finalLimit = case mEnvLimit of
         Just l | [(n, "")] <- reads l, n > 0 -> n
         _ -> contextWindowLimit mergedCfg
 
-  let finalKey = maybe (apiKey mergedCfg) T.pack mEnvKey
-      finalUrl = maybe (apiBaseUrl mergedCfg) T.pack mEnvUrl
-      finalMod = maybe (modelName mergedCfg) T.pack mEnvMod
-      artDir   = wsRoot </> ".lambda" </> "artifacts"
+  let artDir = wsRoot </> ".lambda" </> "artifacts"
 
   createDirectoryIfMissing True artDir
   createDirectoryIfMissing True (home </> ".config" </> "lambdA")
@@ -201,10 +387,34 @@ loadConfig wsRoot = do
     { apiBaseUrl         = finalUrl
     , apiKey             = finalKey
     , modelName          = finalMod
+    , customHeaders      = cfgHdrsResolved
     , workspaceRoot      = wsRoot
     , artifactDir        = artDir
     , contextWindowLimit = finalLimit
     }
+
+-- | Resolve "{ENV:VAR_NAME}" or "{env:VAR_NAME}" placeholders using a lookup function
+resolveEnvTemplates :: (String -> IO (Maybe String)) -> Text -> IO Text
+resolveEnvTemplates lookupFn txt
+  | "{ENV:" `T.isInfixOf` txt || "{env:" `T.isInfixOf` txt = do
+      let (before, rest) = case T.breakOn "{ENV:" txt of
+            (b, r) | not (T.null r) -> (b, r)
+            _                       -> T.breakOn "{env:" txt
+      if T.null rest
+        then pure txt
+        else do
+          let afterPrefix = T.drop 5 rest -- drops "{ENV:" or "{env:"
+              (varName, afterClose) = T.breakOn "}" afterPrefix
+          if T.null afterClose
+            then pure txt
+            else do
+              let cleanVar = T.unpack (T.strip varName)
+              mVal <- lookupFn cleanVar
+              let resolvedVal = maybe "" T.pack mVal
+                  remainder = T.drop 1 afterClose -- drops "}"
+              restResolved <- resolveEnvTemplates lookupFn remainder
+              pure (before <> resolvedVal <> restResolved)
+  | otherwise = pure txt
 
 -- | Simple parser for KEY=VALUE pairs in .env / .env.local files
 parseDotEnv :: Text -> [(String, String)]
@@ -223,3 +433,144 @@ parseDotEnv raw =
       ('"':xs) | not (null xs) && last xs == '"' -> init xs
       ('\'':xs) | not (null xs) && last xs == '\'' -> init xs
       _ -> s
+
+-- | Curated model aliases mapping friendly shorthands to full provider model IDs
+defaultModelAliases :: Map Text Text
+defaultModelAliases = Map.fromList
+  [ ("claude",     "anthropic/claude-3.5-sonnet")
+  , ("sonnet",     "anthropic/claude-3.5-sonnet")
+  , ("claude-3.7", "anthropic/claude-3.7-sonnet")
+  , ("r1",         "deepseek/deepseek-r1")
+  , ("deepseek",   "deepseek/deepseek-r1")
+  , ("4o",         "openai/gpt-4o")
+  , ("gpt4",       "openai/gpt-4o")
+  , ("o3",         "openai/o3-mini")
+  , ("qwen",       "qwen/qwen-2.5-coder-32b-instruct")
+  , ("coder",      "qwen/qwen-2.5-coder-32b-instruct")
+  ]
+
+-- | Resolve an alias or model name to its canonical identifier
+resolveModelAlias :: Text -> Text
+resolveModelAlias rawName =
+  let clean = T.strip (T.toLower rawName)
+  in Map.findWithDefault rawName clean defaultModelAliases
+
+-- | Context window limits for known models (defaults to 128000)
+lookupModelContextLimit :: Text -> Int
+lookupModelContextLimit modId
+  | "claude" `T.isInfixOf` modId   = 200000
+  | "o3-mini" `T.isInfixOf` modId  = 200000
+  | "gpt-4o" `T.isInfixOf` modId   = 128000
+  | "deepseek" `T.isInfixOf` modId = 128000
+  | "qwen" `T.isInfixOf` modId     = 128000
+  | otherwise                      = 128000
+
+-- | Check if api_base_url points to a local provider (Ollama, vLLM, LM Studio, etc.)
+isLocalEndpoint :: Text -> Bool
+isLocalEndpoint url =
+  let u = T.toLower url
+  in "localhost" `T.isInfixOf` u
+     || "127.0.0.1" `T.isInfixOf` u
+     || "0.0.0.0" `T.isInfixOf` u
+     || "192.168." `T.isInfixOf` u
+     || "10." `T.isInfixOf` u
+     || ":11434" `T.isInfixOf` u
+     || ":8000" `T.isInfixOf` u
+     || ":1234" `T.isInfixOf` u
+     || ":8080" `T.isInfixOf` u
+
+-- | Check if api_base_url is direct OpenAI API
+isOpenAiEndpoint :: Text -> Bool
+isOpenAiEndpoint url =
+  let u = T.toLower url
+  in "api.openai.com" `T.isInfixOf` u
+
+-- | Check if api_base_url is OpenRouter
+isOpenRouterEndpoint :: Text -> Bool
+isOpenRouterEndpoint url =
+  let u = T.toLower url
+  in "openrouter.ai" `T.isInfixOf` u
+
+-- | Return a concise badge classifying provider topology.
+-- Local endpoints are explicitly badged with "[local] " so local execution is unambiguous.
+-- Remote endpoints leave the badge empty to avoid cluttering the prompt with redundant tags.
+formatEndpointBadge :: Text -> Text
+formatEndpointBadge url
+  | isLocalEndpoint url = "[local] "
+  | otherwise           = ""
+
+-- | Resolve model alias taking active Config into account (user aliases, endpoint type)
+resolveModelWithConfig :: Config -> Text -> Text
+resolveModelWithConfig cfg rawName =
+  let clean = T.strip rawName
+      cleanLower = T.toLower clean
+      userAliases = modelAliases cfg
+      mUserMatch = Map.lookup clean userAliases
+               <|> Map.lookup cleanLower userAliases
+  in case mUserMatch of
+       Just resolved -> resolved
+       Nothing
+         -- When unconfigured: pass through raw input without inventing cloud mappings
+         | T.null (apiBaseUrl cfg) -> clean
+         -- Direct OpenAI endpoint: use clean IDs without OpenRouter vendor prefixes
+         | isOpenAiEndpoint (apiBaseUrl cfg) ->
+             case cleanLower of
+               "4o"       -> "gpt-4o"
+               "gpt-4o"   -> "gpt-4o"
+               "4o-mini"  -> "gpt-4o-mini"
+               "gpt4"     -> "gpt-4o"
+               "o3"       -> "o3-mini"
+               "o3-mini"  -> "o3-mini"
+               "o1"       -> "o1"
+               "o1-mini"  -> "o1-mini"
+               _          -> clean
+         -- Local endpoints (Ollama, vLLM, LM Studio): never inject cloud prefixes
+         | isLocalEndpoint (apiBaseUrl cfg) ->
+             case filter (\m -> T.toLower m == cleanLower) (configuredModels cfg) of
+               (matched:_) -> matched
+               []          -> clean
+         -- Explicit OpenRouter endpoint: use curated OpenRouter map
+         | isOpenRouterEndpoint (apiBaseUrl cfg) ->
+             Map.findWithDefault clean cleanLower defaultModelAliases
+         -- Other generic remote endpoints
+         | otherwise -> clean
+
+-- | Curated list of popular models for auto-completion
+curatedModels :: [Text]
+curatedModels =
+  [ "anthropic/claude-3.5-sonnet"
+  , "anthropic/claude-3.7-sonnet"
+  , "deepseek/deepseek-r1"
+  , "openai/gpt-4o"
+  , "openai/o3-mini"
+  , "qwen/qwen-2.5-coder-32b-instruct"
+  ]
+
+-- | Surgically append an approved glob pattern to always_allow_globs in <wsRoot>/.lambda/config.json
+persistAllowGlob :: FilePath -> String -> IO (Either Text ())
+persistAllowGlob wsRoot newGlob = do
+  let dirPath  = wsRoot </> ".lambda"
+      confPath = dirPath </> "config.json"
+  createDirectoryIfMissing True dirPath
+  exists <- doesFileExist confPath
+  baseObj <- if exists
+    then do
+      content <- BL.readFile confPath
+      pure $ case Aeson.decode content of
+        Just (Aeson.Object o) -> o
+        _                     -> KM.empty
+    else pure KM.empty
+
+  let currentGlobs = case KM.lookup (Key.fromString "always_allow_globs") baseObj of
+        Just (Aeson.Array arr) ->
+          [ T.unpack s | Aeson.String s <- V.toList arr ]
+        _ -> defaultAllowGlobs
+
+  if newGlob `elem` currentGlobs
+    then pure (Right ())
+    else do
+      let updatedGlobs = currentGlobs ++ [newGlob]
+          newObj = KM.insert (Key.fromString "always_allow_globs") (Aeson.toJSON updatedGlobs) baseObj
+          encoded = Aeson.encode newObj
+      BL.writeFile confPath encoded
+      pure (Right ())

@@ -3,14 +3,20 @@
 
 module Lambda.UI.Events
   ( handleAppEvent
+  , allCommands
+  , computeCommandMatches
+  , replaceCurrentToken
+  , cycleCompletedToken
   ) where
 
 import Brick
 import qualified Brick.Widgets.Edit as E
 import Control.Concurrent.STM (atomically, writeTBQueue)
+import Control.Monad (unless)
 import Control.Monad.IO.Class (liftIO)
 import Data.Char (isSpace)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isJust)
 import Data.Sequence (Seq(..), (|>))
 import qualified Data.Sequence as Seq
 import Data.Text (Text)
@@ -18,26 +24,62 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Zipper as Z
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
+import Data.Time.Format (defaultTimeLocale, formatTime)
 import qualified Graphics.Vty as V
 import System.Posix.Signals (raiseSignal, sigTSTP)
+import Text.Read (readMaybe)
 
+import Lambda.Config (Config(..), isLocalEndpoint, isOpenAiEndpoint, isOpenRouterEndpoint)
 import Lambda.Core.EngineInterface (EngineChannels(..))
+import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro)
 import Lambda.Engine.Security (resolvePrompt)
+import Lambda.Engine.Session
+  ( SessionMeta(..)
+  , listSessions
+  , listMeaningfulSessions
+  , cleanEmptySessions
+  , pruneSessions
+  , resolveSessionId
+  )
 import Lambda.Types
+import Lambda.UI.Completion (completeInput, allCommands, computeCommandCandidates)
 import Lambda.UI.Types
 
 handleAppEvent :: BrickEvent ResourceName EngineEvent -> EventM ResourceName UIState ()
 handleAppEvent (AppEvent engineEv) = do
   case engineEv of
     EvTurnAdded turn -> do
-      modify $ \s -> s { uiTurns = uiTurns s ++ [turn] }
+      vis <- gets uiThinkingVisible
+      let adjusted = setThinkingVis (if vis then Visible else Collapsed) turn
+          genDone = turnRole turn == AssistantRole
+      modify $ \s -> s
+        { uiTurns = uiTurns s ++ [adjusted]
+        , uiIsGenerating = if genDone then False else uiIsGenerating s
+        }
       vScrollToEnd (viewportScroll ChatView)
     EvTurnUpdated turn -> do
+      vis <- gets uiThinkingVisible
+      let adjusted = setThinkingVis (if vis then Visible else Collapsed) turn
       modify $ \s ->
-        s { uiTurns = updateMatchingTurn turn (uiTurns s) }
+        s { uiTurns = updateMatchingTurn adjusted (uiTurns s) }
+      vScrollToEnd (viewportScroll ChatView)
+    EvSessionSwitched _ mode turns subs -> do
+      vis <- gets uiThinkingVisible
+      let adjustedTurns = map (setThinkingVis (if vis then Visible else Collapsed)) turns
+          adjustedSubs = Map.map (\t -> t { subAgentTurns = map (setThinkingVis (if vis then Visible else Collapsed)) (subAgentTurns t) }) subs
+      modify $ \s -> s
+        { uiTurns = adjustedTurns
+        , uiSubAgents = adjustedSubs
+        , uiMode = mode
+        , uiSelectedSubAgent = Nothing
+        , uiIsGenerating = False
+        }
       vScrollToEnd (viewportScroll ChatView)
     EvSubAgentUpdate task -> modify $ \s ->
-      s { uiSubAgents = Map.insert (subAgentId task) task (uiSubAgents s) }
+      let vis = uiThinkingVisible s
+          adjustedTurns = map (setThinkingVis (if vis then Visible else Collapsed)) (subAgentTurns task)
+          adjustedTask = task { subAgentTurns = adjustedTurns }
+      in s { uiSubAgents = Map.insert (subAgentId task) adjustedTask (uiSubAgents s) }
     EvWorkingStateUpdate ws -> modify $ \s ->
       s { uiWorkingState = ws }
     EvPermissionRequired prompt -> modify $ \s ->
@@ -45,9 +87,15 @@ handleAppEvent (AppEvent engineEv) = do
         Nothing -> s { uiCurrentPrompt = Just prompt }
         Just _  -> s { uiPendingPrompts = uiPendingPrompts s |> prompt }
     EvPermissionResolved _ _ -> pure ()
+    EvModelSwitched newModel newLimit -> do
+      modify $ \s -> s { uiModelName = newModel, uiContextLimit = newLimit }
+      vScrollToEnd (viewportScroll ChatView)
     EvError err -> do
       tId <- gets (\s -> negate (1000 + length (uiTurns s)))
-      modify $ \s -> s { uiTurns = uiTurns s ++ [Turn tId SystemRole [TextBlock ("⚠️ Error: " <> err)]] }
+      modify $ \s -> s
+        { uiTurns = uiTurns s ++ [Turn tId SystemRole [TextBlock ("⚠️ Error: " <> err)]]
+        , uiIsGenerating = False
+        }
       vScrollToEnd (viewportScroll ChatView)
     EvStreamChunk _ -> pure ()
   where
@@ -63,11 +111,32 @@ handleAppEvent (AppEvent engineEv) = do
 -- Terminal Conventions & Signal Controls
 -- =========================================================================
 
--- ^C: Immediate clean exit from TUI
+-- ^C: Cancel line or interrupt active execution
 handleAppEvent (VtyEvent (V.EvKey (V.KChar 'c') [V.MCtrl])) = do
   st <- get
-  liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) CmdQuit
-  halt
+  let editorText = T.strip (T.concat (E.getEditContents (uiEditor st)))
+      hasRunningSubs = any (\t -> subAgentStatus t == SubAgentRunning) (Map.elems (uiSubAgents st))
+  if uiIsGenerating st || hasRunningSubs
+    then do
+      liftIO $ atomically $ do
+        writeTBQueue (cmdQueue (uiChannels st)) CmdInterrupt
+        writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "⚠️ Generation interrupted (Ctrl+C)...")
+      put st { uiIsGenerating = False }
+    else if not (T.null editorText)
+      then put st { uiEditor = E.editor EditorInput (Just 1) "", uiCompletion = Nothing }
+      else do
+        liftIO $ atomically $
+          writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "💡 Press Ctrl+D or type /quit to exit lambdA.")
+
+-- ^D: EOF clean exit on empty line; forward delete character if non-empty
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'd') [V.MCtrl])) = do
+  st <- get
+  let editorContents = T.concat (E.getEditContents (uiEditor st))
+  if T.null editorContents
+    then do
+      liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) CmdQuit
+      halt
+    else modify $ \s -> s { uiEditor = E.applyEdit Z.deleteChar (uiEditor s), uiCompletion = Nothing }
 
 -- ^Z: Background process to shell (SIGTSTP) and restore terminal on fg
 handleAppEvent (VtyEvent (V.EvKey (V.KChar 'z') [V.MCtrl])) = do
@@ -76,18 +145,57 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 'z') [V.MCtrl])) = do
     raiseSignal sigTSTP
     pure st
 
--- Double Esc (within 500ms): Interrupt active turn
+-- Esc: If session chooser active -> dismiss session chooser
+--      If completion active -> dismiss completion
+--      If HUD active -> dismiss HUD
+--      If viewing a subagent -> return to main chat
+--      If on main chat -> double Esc interrupts active turn
 handleAppEvent (VtyEvent (V.EvKey V.KEsc [])) = do
-  now <- liftIO getCurrentTime
   st <- get
-  case uiLastEscTime st of
-    Just prev | diffUTCTime now prev < 0.5 -> do
-      put st { uiLastEscTime = Nothing }
-      liftIO $ atomically $ do
-        writeTBQueue (cmdQueue (uiChannels st)) CmdInterrupt
-        writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "⚠️ Interrupt dispatched (Esc Esc)...")
-    _ ->
-      put st { uiLastEscTime = Just now }
+  case uiCurrentPrompt st of
+    Just _  -> resolveActiveModal PermDeny
+    Nothing -> case uiSessionChooser st of
+      Just _ -> put st { uiSessionChooser = Nothing }
+      Nothing -> case uiCompletion st of
+        Just _ -> put st { uiCompletion = Nothing }
+        Nothing ->
+          if uiShowHud st
+            then put st { uiShowHud = False }
+            else case uiSelectedSubAgent st of
+              Just _  -> put st { uiSelectedSubAgent = Nothing }
+              Nothing -> do
+                vScrollToEnd (viewportScroll ChatView)
+                now <- liftIO getCurrentTime
+                case uiLastEscTime st of
+                  Just prev | diffUTCTime now prev < 0.5 -> do
+                    put st { uiLastEscTime = Nothing }
+                    liftIO $ atomically $ do
+                      writeTBQueue (cmdQueue (uiChannels st)) CmdInterrupt
+                      writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "⚠️ Interrupt dispatched (Esc Esc)...")
+                  _ ->
+                    put st { uiLastEscTime = Just now }
+
+-- Alt+, / Alt+< / Alt+[ / Ctrl+Left / Alt+Left / F3: Step back in subagents or return to Main Conversation
+handleAppEvent (VtyEvent (V.EvKey (V.KChar ',') mods))
+  | any (`elem` [V.MMeta, V.MAlt]) mods = stepPrevSubAgent
+handleAppEvent (VtyEvent (V.EvKey (V.KChar '<') mods))
+  | any (`elem` [V.MMeta, V.MAlt]) mods = stepPrevSubAgent
+handleAppEvent (VtyEvent (V.EvKey (V.KChar '[') mods))
+  | any (`elem` [V.MMeta, V.MAlt]) mods = stepPrevSubAgent
+handleAppEvent (VtyEvent (V.EvKey V.KLeft mods))
+  | any (`elem` [V.MMeta, V.MAlt, V.MCtrl]) mods = stepPrevSubAgent
+handleAppEvent (VtyEvent (V.EvKey (V.KFun 3) [])) = stepPrevSubAgent
+
+-- Alt+. / Alt+> / Alt+] / Ctrl+Right / Alt+Right / F4: Step forward into next subagent
+handleAppEvent (VtyEvent (V.EvKey (V.KChar '.') mods))
+  | any (`elem` [V.MMeta, V.MAlt]) mods = stepNextSubAgent
+handleAppEvent (VtyEvent (V.EvKey (V.KChar '>') mods))
+  | any (`elem` [V.MMeta, V.MAlt]) mods = stepNextSubAgent
+handleAppEvent (VtyEvent (V.EvKey (V.KChar ']') mods))
+  | any (`elem` [V.MMeta, V.MAlt]) mods = stepNextSubAgent
+handleAppEvent (VtyEvent (V.EvKey V.KRight mods))
+  | any (`elem` [V.MMeta, V.MAlt, V.MCtrl]) mods = stepNextSubAgent
+handleAppEvent (VtyEvent (V.EvKey (V.KFun 4) [])) = stepNextSubAgent
 
 -- Bracketed Paste: Paste clipboard directly into editor without line splitting
 handleAppEvent (VtyEvent (V.EvPaste bs)) = do
@@ -100,19 +208,98 @@ handleAppEvent (VtyEvent (V.EvPaste bs)) = do
 
 -- ^W or ^Backspace or ^H: Delete preceding word
 handleAppEvent (VtyEvent (V.EvKey (V.KChar 'w') [V.MCtrl])) =
-  modify $ \s -> s { uiEditor = E.applyEdit deleteWordBackward (uiEditor s) }
+  modify $ \s -> s { uiEditor = E.applyEdit deleteWordBackward (uiEditor s), uiCompletion = Nothing }
 handleAppEvent (VtyEvent (V.EvKey V.KBS [V.MCtrl])) =
-  modify $ \s -> s { uiEditor = E.applyEdit deleteWordBackward (uiEditor s) }
+  modify $ \s -> s { uiEditor = E.applyEdit deleteWordBackward (uiEditor s), uiCompletion = Nothing }
 handleAppEvent (VtyEvent (V.EvKey (V.KChar 'h') [V.MCtrl])) =
-  modify $ \s -> s { uiEditor = E.applyEdit deleteWordBackward (uiEditor s) }
+  modify $ \s -> s { uiEditor = E.applyEdit deleteWordBackward (uiEditor s), uiCompletion = Nothing }
 
 -- ^U: Kill line backwards from cursor
 handleAppEvent (VtyEvent (V.EvKey (V.KChar 'u') [V.MCtrl])) =
-  modify $ \s -> s { uiEditor = E.applyEdit Z.killToBOL (uiEditor s) }
+  modify $ \s -> s { uiEditor = E.applyEdit Z.killToBOL (uiEditor s), uiCompletion = Nothing }
 
--- ^K: Kill line forwards from cursor
+-- ^K: Kill line forward to end of line
 handleAppEvent (VtyEvent (V.EvKey (V.KChar 'k') [V.MCtrl])) =
-  modify $ \s -> s { uiEditor = E.applyEdit Z.killToEOL (uiEditor s) }
+  modify $ \s -> s { uiEditor = E.applyEdit Z.killToEOL (uiEditor s), uiCompletion = Nothing }
+
+-- Alt+H / Meta+H or F1: Toggle Intelligence HUD
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'h') mods))
+  | any (`elem` [V.MMeta, V.MAlt]) mods =
+      modify $ \s -> s { uiShowHud = not (uiShowHud s) }
+
+handleAppEvent (VtyEvent (V.EvKey (V.KFun 1) [])) =
+  modify $ \s -> s { uiShowHud = not (uiShowHud s) }
+
+-- Alt+M / Meta+M or F2: Toggle Plan / Exec Mode
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'm') mods))
+  | any (`elem` [V.MMeta, V.MAlt]) mods = toggleMode
+
+handleAppEvent (VtyEvent (V.EvKey (V.KFun 2) [])) = toggleMode
+
+-- Alt+B: Move backward one word
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'b') mods))
+  | any (`elem` [V.MMeta, V.MAlt]) mods =
+      modify $ \s -> s { uiEditor = E.applyEdit moveWordBackward (uiEditor s), uiCompletion = Nothing }
+
+-- Alt+F: Move forward one word
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'f') mods))
+  | any (`elem` [V.MMeta, V.MAlt]) mods =
+      modify $ \s -> s { uiEditor = E.applyEdit moveWordForward (uiEditor s), uiCompletion = Nothing }
+
+-- Alt+D: Delete word forward
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'd') mods))
+  | any (`elem` [V.MMeta, V.MAlt]) mods =
+      modify $ \s -> s { uiEditor = E.applyEdit deleteWordForward (uiEditor s), uiCompletion = Nothing }
+
+-- Tab: Contextual autocomplete
+handleAppEvent (VtyEvent (V.EvKey (V.KChar '\t') [])) = do
+  st <- get
+  case uiCompletion st of
+    -- If candidates already active, cycle forward in-place
+    Just (CompletionState cands sel) | not (null cands) -> do
+      let nextSel = (sel + 1) `mod` length cands
+          prevSelected = cands !! sel
+          nextSelected = cands !! nextSel
+      put st
+        { uiEditor     = cycleCompletedToken (candInsert prevSelected) (candInsert nextSelected) (uiEditor st)
+        , uiCompletion = Just (CompletionState cands nextSel)
+        }
+    -- Not yet active, trigger contextual completion
+    Nothing -> do
+      let rawLines = E.getEditContents (uiEditor st)
+          rawInput = T.concat rawLines
+      mComp <- liftIO $ completeInput "." st rawInput
+      case mComp of
+        Nothing -> pure ()
+        Just (CompletionState [single] _) -> do
+          -- Single unambiguous match: auto-fill in-place immediately, zero UI clutter
+          put st
+            { uiEditor     = replaceCurrentToken (candInsert single) (uiEditor st)
+            , uiCompletion = Nothing
+            }
+        Just cs@(CompletionState (firstMatch:_) _) -> do
+          -- Multiple matches: fill first match in-place and show minimal candidate bar
+          put st
+            { uiEditor     = replaceCurrentToken (candInsert firstMatch) (uiEditor st)
+            , uiCompletion = Just cs
+            }
+        _ -> pure ()
+    _ -> pure ()
+
+-- Shift+Tab (BackTab): Cycle completion backward (supports KBackTab and Tabby/xterm.js Shift+Tab)
+handleAppEvent (VtyEvent (V.EvKey k mods))
+  | k == V.KBackTab || (k == V.KChar '\t' && V.MShift `elem` mods) = do
+      st <- get
+      case uiCompletion st of
+        Just (CompletionState cands sel) | not (null cands) -> do
+          let prevSel = if sel <= 0 then length cands - 1 else sel - 1
+              prevSelected = cands !! sel
+              nextSelected = cands !! prevSel
+          put st
+            { uiEditor     = cycleCompletedToken (candInsert prevSelected) (candInsert nextSelected) (uiEditor st)
+            , uiCompletion = Just (CompletionState cands prevSel)
+            }
+        _ -> pure ()
 
 -- ^A: Jump to beginning of line
 handleAppEvent (VtyEvent (V.EvKey (V.KChar 'a') [V.MCtrl])) =
@@ -123,30 +310,139 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 'e') [V.MCtrl])) =
   modify $ \s -> s { uiEditor = E.applyEdit Z.gotoEOL (uiEditor s) }
 
 -- ^T: Toggle thinking accordions
-handleAppEvent (VtyEvent (V.EvKey (V.KChar 't') [V.MCtrl])) =
-  modify $ \s -> s { uiTurns = map toggleThinkingAll (uiTurns s) }
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 't') [V.MCtrl])) = do
+  st <- get
+  let newVis = not (uiThinkingVisible st)
+      targetVis = if newVis then Visible else Collapsed
+      updatedSubs = Map.map (\t -> t { subAgentTurns = map (setThinkingVis targetVis) (subAgentTurns t) }) (uiSubAgents st)
+  put st
+    { uiThinkingVisible = newVis
+    , uiTurns = map (setThinkingVis targetVis) (uiTurns st)
+    , uiSubAgents = updatedSubs
+    }
 
--- Keystrokes when permission modal is open (Keys 1-4)
-handleAppEvent (VtyEvent (V.EvKey (V.KChar '1') [])) = resolveActiveModal PermAlways
-handleAppEvent (VtyEvent (V.EvKey (V.KChar '2') [])) = resolveActiveModal PermOnce
-handleAppEvent (VtyEvent (V.EvKey (V.KChar '3') [])) = resolveActiveModal PermNo
-handleAppEvent (VtyEvent (V.EvKey (V.KChar '4') [])) = resolveActiveModal PermNever
+-- ^S: Toggle / open Session Chooser Modal
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 's') [V.MCtrl])) = do
+  st <- get
+  case uiSessionChooser st of
+    Just _  -> put st { uiSessionChooser = Nothing }
+    Nothing -> do
+      metas <- liftIO $ listMeaningfulSessions ".lambda/sessions"
+      put st { uiSessionChooser = Just (SessionChooserState metas 0 "") }
+
+-- Keystrokes 1-4: resolve permission modal if open, quick-switch session if chooser open, else editor
+handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar c) []))
+  | c `elem` ['1', '2', '3', '4'] = do
+      st <- get
+      case uiCurrentPrompt st of
+        Just _ ->
+          case c of
+            '1' -> resolveActiveModal PermAlways
+            '2' -> resolveActiveModal PermSession
+            '3' -> resolveActiveModal PermOnce
+            '4' -> resolveActiveModal PermDeny
+            _   -> pure ()
+        Nothing -> case uiSessionChooser st of
+          Just sc -> do
+            let idx = fromEnum c - fromEnum '1'
+            if idx < length (scSessions sc)
+              then do
+                let selectedMeta = scSessions sc !! idx
+                put st { uiSessionChooser = Nothing }
+                liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) (CmdSwitchSession (metaId selectedMeta))
+              else pure ()
+          Nothing -> do
+            zoom uiEditorLens (E.handleEditorEvent (VtyEvent ev))
+            modify $ \s -> if isJust (uiCompletion s) then s { uiCompletion = Nothing } else s
+
+-- Keystrokes 5-9: quick-switch session if chooser open, else editor
+handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar c) []))
+  | c `elem` ['5', '6', '7', '8', '9'] = do
+      st <- get
+      case uiSessionChooser st of
+        Just sc -> do
+          let idx = fromEnum c - fromEnum '1'
+          if idx < length (scSessions sc)
+            then do
+              let selectedMeta = scSessions sc !! idx
+              put st { uiSessionChooser = Nothing }
+              liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) (CmdSwitchSession (metaId selectedMeta))
+            else pure ()
+        Nothing -> do
+          zoom uiEditorLens (E.handleEditorEvent (VtyEvent ev))
+          modify $ \s -> if isJust (uiCompletion s) then s { uiCompletion = Nothing } else s
+
+-- 'q' closes session chooser or dismisses modal if open, else editor
+handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar 'q') [])) = do
+  st <- get
+  case uiCurrentPrompt st of
+    Just _  -> resolveActiveModal PermDeny
+    Nothing -> case uiSessionChooser st of
+      Just _ -> put st { uiSessionChooser = Nothing }
+      Nothing -> do
+        zoom uiEditorLens (E.handleEditorEvent (VtyEvent ev))
+        modify $ \s -> if isJust (uiCompletion s) then s { uiCompletion = Nothing } else s
+
+-- 'j' / 'k' navigates session chooser if open, else editor
+handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar c) []))
+  | c `elem` ['j', 'k'] = do
+      st <- get
+      case uiSessionChooser st of
+        Just sc | not (null (scSessions sc)) -> do
+          let newSel = if c == 'k'
+                         then max 0 (scSelected sc - 1)
+                         else min (length (scSessions sc) - 1) (scSelected sc + 1)
+          put st { uiSessionChooser = Just sc { scSelected = newSel } }
+        _ -> do
+          zoom uiEditorLens (E.handleEditorEvent (VtyEvent ev))
+          modify $ \s -> if isJust (uiCompletion s) then s { uiCompletion = Nothing } else s
 
 -- Mouse clicks on modal buttons (if mouse events are enabled/passed)
-handleAppEvent (MouseDown ButtonAlways V.BLeft _ _) = resolveActiveModal PermAlways
-handleAppEvent (MouseDown ButtonOnce   V.BLeft _ _) = resolveActiveModal PermOnce
-handleAppEvent (MouseDown ButtonNo     V.BLeft _ _) = resolveActiveModal PermNo
-handleAppEvent (MouseDown ButtonNever  V.BLeft _ _) = resolveActiveModal PermNever
+handleAppEvent (MouseDown ButtonAlways  V.BLeft _ _) = resolveActiveModal PermAlways
+handleAppEvent (MouseDown ButtonSession V.BLeft _ _) = resolveActiveModal PermSession
+handleAppEvent (MouseDown ButtonOnce    V.BLeft _ _) = resolveActiveModal PermOnce
+handleAppEvent (MouseDown ButtonDeny    V.BLeft _ _) = resolveActiveModal PermDeny
+handleAppEvent (MouseDown ButtonNo      V.BLeft _ _) = resolveActiveModal PermDeny
+handleAppEvent (MouseDown ButtonNever   V.BLeft _ _) = resolveActiveModal PermNever
+
+-- Mouse click on session item in session chooser modal
+handleAppEvent (MouseDown (SessionItem idx) V.BLeft _ _) = do
+  st <- get
+  case uiSessionChooser st of
+    Just sc | idx >= 0 && idx < length (scSessions sc) -> do
+      let selectedMeta = scSessions sc !! idx
+      put st { uiSessionChooser = Nothing }
+      liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) (CmdSwitchSession (metaId selectedMeta))
+    _ -> pure ()
+
+-- Mouse click on subagent in sidebar
+handleAppEvent (MouseDown (SubAgentItem sId) V.BLeft _ _) =
+  modify $ \s -> s { uiSelectedSubAgent = Just sId }
 
 -- Mouse click on thinking accordion fold header
 handleAppEvent (MouseDown (ThinkingFold tId) V.BLeft _ _) =
-  modify $ \s -> s { uiTurns = map (toggleThinking tId) (uiTurns s) }
+  modify $ \s ->
+    let updateTurns = map (toggleThinking tId)
+        updateSub t = t { subAgentTurns = updateTurns (subAgentTurns t) }
+    in s { uiTurns = updateTurns (uiTurns s)
+         , uiSubAgents = Map.map updateSub (uiSubAgents s)
+         }
   where
     toggleThinking targetId t@(Turn _ _ blks) =
       t { turnBlocks = map (flipVis targetId) blks }
     flipVis targetId (ThinkingBlock i b vis)
       | i == targetId = ThinkingBlock i b (if vis == Visible then Collapsed else Visible)
     flipVis _ other = other
+
+-- Mouse wheel scrolling
+handleAppEvent (MouseDown _ V.BScrollUp _ _) =
+  vScrollBy (viewportScroll ChatView) (-3)
+handleAppEvent (MouseDown _ V.BScrollDown _ _) =
+  vScrollBy (viewportScroll ChatView) 3
+handleAppEvent (VtyEvent (V.EvMouseDown _ _ V.BScrollUp _)) =
+  vScrollBy (viewportScroll ChatView) (-3)
+handleAppEvent (VtyEvent (V.EvMouseDown _ _ V.BScrollDown _)) =
+  vScrollBy (viewportScroll ChatView) 3
 
 -- =========================================================================
 -- Keyboard-Centric Viewport Scrolling
@@ -159,12 +455,50 @@ handleAppEvent (VtyEvent (V.EvKey V.KPageUp _)) =
 handleAppEvent (VtyEvent (V.EvKey V.KPageDown _)) =
   vScrollBy (viewportScroll ChatView) 12
 
--- Up / Down Arrow Keys: Scroll conversation viewport line by line
-handleAppEvent (VtyEvent (V.EvKey V.KUp [])) =
-  vScrollBy (viewportScroll ChatView) (-2)
+-- Alt+Up / Meta+Up / Ctrl+Up / Shift+Up: Scroll conversation up
+handleAppEvent (VtyEvent (V.EvKey V.KUp mods))
+  | any (`elem` [V.MMeta, V.MAlt, V.MCtrl, V.MShift]) mods =
+      vScrollBy (viewportScroll ChatView) (-4)
 
-handleAppEvent (VtyEvent (V.EvKey V.KDown [])) =
-  vScrollBy (viewportScroll ChatView) 2
+-- Alt+Down / Meta+Down / Ctrl+Down / Shift+Down: Scroll conversation down
+handleAppEvent (VtyEvent (V.EvKey V.KDown mods))
+  | any (`elem` [V.MMeta, V.MAlt, V.MCtrl, V.MShift]) mods =
+      vScrollBy (viewportScroll ChatView) 4
+
+-- Up / Down Arrow Keys: Navigate session chooser or autocomplete if active, else scroll conversation
+handleAppEvent (VtyEvent (V.EvKey V.KUp [])) = do
+  st <- get
+  case uiSessionChooser st of
+    Just sc | not (null (scSessions sc)) -> do
+      let newSel = max 0 (scSelected sc - 1)
+      put st { uiSessionChooser = Just sc { scSelected = newSel } }
+    _ -> case uiCompletion st of
+      Just (CompletionState cands sel) | not (null cands) -> do
+        let prevSel = if sel <= 0 then length cands - 1 else sel - 1
+            prevSelected = cands !! sel
+            nextSelected = cands !! prevSel
+        put st
+          { uiEditor     = cycleCompletedToken (candInsert prevSelected) (candInsert nextSelected) (uiEditor st)
+          , uiCompletion = Just (CompletionState cands prevSel)
+          }
+      _ -> vScrollBy (viewportScroll ChatView) (-2)
+
+handleAppEvent (VtyEvent (V.EvKey V.KDown [])) = do
+  st <- get
+  case uiSessionChooser st of
+    Just sc | not (null (scSessions sc)) -> do
+      let newSel = min (length (scSessions sc) - 1) (scSelected sc + 1)
+      put st { uiSessionChooser = Just sc { scSelected = newSel } }
+    _ -> case uiCompletion st of
+      Just (CompletionState cands sel) | not (null cands) -> do
+        let nextSel = if sel >= length cands - 1 then 0 else sel + 1
+            prevSelected = cands !! sel
+            nextSelected = cands !! nextSel
+        put st
+          { uiEditor     = cycleCompletedToken (candInsert prevSelected) (candInsert nextSelected) (uiEditor st)
+          , uiCompletion = Just (CompletionState cands nextSel)
+          }
+      _ -> vScrollBy (viewportScroll ChatView) 2
 
 -- Home / End (with Ctrl): Jump to beginning or end of conversation
 handleAppEvent (VtyEvent (V.EvKey V.KHome [V.MCtrl])) =
@@ -177,78 +511,109 @@ handleAppEvent (VtyEvent (V.EvKey V.KEnd [V.MCtrl])) =
 -- Prompt History Navigation (^P = Previous, ^N = Next)
 -- =========================================================================
 
--- ^P: Previous prompt in history (older)
-handleAppEvent (VtyEvent (V.EvKey (V.KChar 'p') [V.MCtrl])) = do
-  st <- get
-  let hist = uiPromptHistory st
-  if null hist
-    then pure ()
-    else case uiHistoryIndex st of
-      Nothing -> do
-        let currentDraft = T.strip (T.unlines (E.getEditContents (uiEditor st)))
-            firstPrompt = head hist
-        put st
-          { uiSavedDraft   = currentDraft
-          , uiHistoryIndex = Just 0
-          , uiEditor       = setEditorText firstPrompt
-          }
-      Just idx -> do
-        let nextIdx = min (length hist - 1) (idx + 1)
-            recalled = hist !! nextIdx
-        put st
-          { uiHistoryIndex = Just nextIdx
-          , uiEditor       = setEditorText recalled
-          }
+-- ^P or Alt+P: Previous prompt in history (older)
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'p') mods))
+  | V.MCtrl `elem` mods || any (`elem` [V.MMeta, V.MAlt]) mods = do
+      st <- get
+      let hist = uiPromptHistory st
+      if null hist
+        then pure ()
+        else case uiHistoryIndex st of
+          Nothing -> do
+            let currentDraft = T.strip (T.unlines (E.getEditContents (uiEditor st)))
+                firstPrompt = head hist
+            put st
+              { uiSavedDraft   = currentDraft
+              , uiHistoryIndex = Just 0
+              , uiEditor       = setEditorText firstPrompt
+              }
+          Just idx -> do
+            let nextIdx = min (length hist - 1) (idx + 1)
+                recalled = hist !! nextIdx
+            put st
+              { uiHistoryIndex = Just nextIdx
+              , uiEditor       = setEditorText recalled
+              }
 
--- ^N: Next prompt in history (newer / back to draft)
-handleAppEvent (VtyEvent (V.EvKey (V.KChar 'n') [V.MCtrl])) = do
-  st <- get
-  let hist = uiPromptHistory st
-  case uiHistoryIndex st of
-    Nothing -> pure ()
-    Just 0  -> do
-      let draft = uiSavedDraft st
-      put st
-        { uiHistoryIndex = Nothing
-        , uiSavedDraft   = ""
-        , uiEditor       = setEditorText draft
-        }
-    Just idx -> do
-      let prevIdx = idx - 1
-          recalled = hist !! prevIdx
-      put st
-        { uiHistoryIndex = Just prevIdx
-        , uiEditor       = setEditorText recalled
-        }
+-- ^N or Alt+N: Next prompt in history (newer / back to draft)
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'n') mods))
+  | V.MCtrl `elem` mods || any (`elem` [V.MMeta, V.MAlt]) mods = do
+      st <- get
+      let hist = uiPromptHistory st
+      case uiHistoryIndex st of
+        Nothing -> pure ()
+        Just 0  -> do
+          let draft = uiSavedDraft st
+          put st
+            { uiHistoryIndex = Nothing
+            , uiSavedDraft   = ""
+            , uiEditor       = setEditorText draft
+            }
+        Just idx -> do
+          let prevIdx = idx - 1
+              recalled = hist !! prevIdx
+          put st
+            { uiHistoryIndex = Just prevIdx
+            , uiEditor       = setEditorText recalled
+            }
 
--- Keyboard Enter: Submit prompt or dispatch slash command
+-- Keyboard Enter: Submit prompt, select session from chooser, or dispatch slash command
 handleAppEvent (VtyEvent (V.EvKey V.KEnter [])) = do
   st <- get
-  let rawLines = E.getEditContents (uiEditor st)
-      inputText = T.strip (T.unlines rawLines)
-  if T.null inputText
-    then pure ()
-    else do
-      -- Record prompt in history (avoiding consecutive duplicates)
-      let currentHist = uiPromptHistory st
-          newHist = case currentHist of
-            (p:_) | p == inputText -> currentHist
-            _                      -> inputText : currentHist
-      -- Reset input editor and history navigation state
-      put st
-        { uiEditor        = E.editor EditorInput (Just 1) ""
-        , uiPromptHistory = newHist
-        , uiHistoryIndex  = Nothing
-        , uiSavedDraft    = ""
-        }
-      vScrollToEnd (viewportScroll ChatView)
-      handleCommand inputText
+  case uiSessionChooser st of
+    Just sc -> do
+      put st { uiSessionChooser = Nothing }
+      if null (scSessions sc)
+        then pure ()
+        else do
+          let selIdx = scSelected sc
+          if selIdx >= 0 && selIdx < length (scSessions sc)
+            then do
+              let selectedMeta = scSessions sc !! selIdx
+              liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) (CmdSwitchSession (metaId selectedMeta))
+            else pure ()
+    Nothing -> case uiCompletion st of
+      Just (CompletionState _ sel) | sel >= 0 -> do
+        let fullCmd = T.strip (T.concat (E.getEditContents (uiEditor st)))
+        put st
+          { uiEditor        = E.editor EditorInput (Just 1) ""
+          , uiCompletion    = Nothing
+          , uiHistoryIndex  = Nothing
+          , uiSavedDraft    = ""
+          }
+        vScrollToEnd (viewportScroll ChatView)
+        handleCommand fullCmd
+    _ -> do
+      let rawLines = E.getEditContents (uiEditor st)
+          inputText = T.strip (T.unlines rawLines)
+      if T.null inputText
+        then pure ()
+        else do
+          -- Record prompt in history (avoiding consecutive duplicates)
+          let currentHist = uiPromptHistory st
+              newHist = case currentHist of
+                (p:_) | p == inputText -> currentHist
+                _                      -> inputText : currentHist
+          -- Reset input editor and history navigation state
+          put st
+            { uiEditor        = E.editor EditorInput (Just 1) ""
+            , uiPromptHistory = newHist
+            , uiHistoryIndex  = Nothing
+            , uiSavedDraft    = ""
+            , uiCompletion    = Nothing
+            }
+          vScrollToEnd (viewportScroll ChatView)
+          handleCommand inputText
 
 -- Default text editor input (regular typing)
 handleAppEvent (VtyEvent ev) = do
   zoom uiEditorLens (E.handleEditorEvent (VtyEvent ev))
+  modify $ \s -> if isJust (uiCompletion s) then s { uiCompletion = Nothing } else s
 
 handleAppEvent _ = pure ()
+
+computeCommandMatches :: Text -> [Text]
+computeCommandMatches rawInput = map candInsert (computeCommandCandidates rawInput)
 
 handleCommand :: Text -> EventM ResourceName UIState ()
 handleCommand cmdText = do
@@ -257,39 +622,205 @@ handleCommand cmdText = do
   case cmdText of
     "/help" -> do
       let helpText = T.unlines
-            [ "lambdA Commands & Controls:"
-            , "  /plan          - Switch to Plan mode (read-only tools, no mutations)"
-            , "  /exec          - Switch to Exec mode (full tools: bash, file writes)"
-            , "  /think         - Toggle thinking/reasoning blocks (or press Ctrl+T)"
-            , "  /compact       - Trigger manual context compaction to disk archives"
-            , "  /clear         - Clear conversation history"
-            , "  /help          - Show this help reference"
-            , "  /quit          - Exit application"
+            [ "lambdA Commands & Navigation Reference:"
+            , ""
+            , "Core Slash Commands:"
+            , "  /plan          - Switch to Plan mode (read-only inspection, destructive tools disabled)"
+            , "  /exec          - Switch to Exec mode (full tool execution access)"
+            , "  /mode [mode]   - Inspect or switch active mode (/mode plan, /mode exec)"
+            , "  /model [name]  - Inspect or switch active model (/model claude, /model r1, /model 4o)"
+            , "  /think         - Toggle reasoning / thinking block visibility"
+            , "  /session       - List recent sessions (/session <id> to switch, /session prune <N>)"
+            , "  /fork [title]  - Fork active conversation into a new child session"
+            , "  /rewind [N]    - Rewind conversation by N turn pairs (alias: /undo)"
+            , "  /prompt [name] - Run or list prompt templates from .lambda/prompts/*.md (alias: /p)"
+            , "  /sub <id>      - Inspect SubAgent dialogue and thought trace (/sub main to return)"
+            , "  /trace         - Export current session to formatted Markdown artifact"
+            , "  /compact       - Trigger manual context compaction of earlier conversation turns"
+            , "  /clear         - Clear conversation turns in current session"
+            , "  /new           - Start a clean session and persist previous session"
+            , "  /help          - Show this command reference"
+            , "  /quit          - Exit lambdA safely"
+            , ""
+            , "Specialist Subagents:"
+            , "  surveyor       - Large-scale directory maps, AST survey, symbol extraction"
+            , "  debugger       - Failure analysis, sanitizer traces, compiler error triage"
+            , "  profiler       - Performance diagnostics (Valgrind, perf, flamegraphs, benchmarks)"
+            , "  implementer    - Code refactoring, test cascades, localized edits"
+            , "  reviewer       - Adversarial critique, correctness audits, diff inspection"
             , ""
             , "Shortcuts & Terminal Conventions:"
-            , "  Ctrl+C         - Exit application immediately"
+            , "  Ctrl+C         - Cancel draft line / Interrupt active generation"
+            , "  Ctrl+D         - Exit lambdA (on empty line) / forward delete character"
             , "  Ctrl+Z         - Suspend/background process to shell (fg to resume)"
             , "  Esc Esc        - Interrupt active turn / cancel pending tools"
+            , "  Alt+M / F2     - Toggle Plan mode (read-only) / Exec mode"
+            , "  Alt+H / F1     - Toggle Intelligence HUD"
+            , "  Tab / Shift+Tab- Autocomplete candidate forward / backward"
+            , "  Alt+, / Alt+.  - Navigate SubAgents (< and >) / Esc to return (also Alt+[/], F3/F4)"
+            , "  ↑ / ↓          - Scroll conversation (or navigate autocomplete when active)"
+            , "  PgUp / PgDn    - Page scroll conversation"
+            , "  Alt+↑ / Alt+↓  - Scroll conversation (also Ctrl+↑/↓, Shift+↑/↓)"
+            , "  Ctrl+P, Ctrl+N - Cycle prompt history (older / newer) (also Alt+P, Alt+N)"
             , "  Ctrl+W, Ctrl+H - Delete word backward"
+            , "  Alt+D          - Delete word forward"
+            , "  Alt+B, Alt+F   - Move cursor backward / forward by word"
             , "  Ctrl+U, Ctrl+K - Delete line to start / end"
             , "  Ctrl+A, Ctrl+E - Move cursor to start / end of line"
             , "  Ctrl+T         - Toggle thinking/reasoning blocks"
+            , "  Ctrl+S         - Open interactive session chooser modal"
             , "  Keys 1,2,3,4   - Resolve authorization prompt (Always, Once, No, Never)"
-            , "  Mouse Drag     - Native text selection & copy (clipboard enabled)"
+            , "  Mouse Wheel    - Scroll conversation viewport"
+            , "  Mouse Click    - Click on SubAgent #id in sidebar, thinking folds, or session chooser"
             ]
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSystemMessage helpText)
-    "/plan" -> do
+    "/new" -> do
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdNewSession
+    cmd | cmd `elem` ["/session", "/sessions"] -> do
+      metas <- liftIO $ listMeaningfulSessions ".lambda/sessions"
+      put st { uiSessionChooser = Just (SessionChooserState metas 0 "") }
+    cmd | cmd `elem` ["/session clean", "/sessions clean"] -> do
+      pruned <- liftIO $ cleanEmptySessions ".lambda/sessions"
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+        (CmdSystemMessage $ "Cleaned " <> T.pack (show pruned) <> " empty session stub(s).")
+    cmd | "/session prune " `T.isPrefixOf` cmd -> do
+      let arg = T.strip (T.drop 15 cmd)
+      case reads (T.unpack arg) of
+        [(n, "")] -> do
+          pruned <- liftIO $ pruneSessions ".lambda/sessions" n
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+            (CmdSystemMessage $ "Pruned " <> T.pack (show pruned) <> " old session(s). Keeping " <> T.pack (show (n :: Int)) <> " most recent.")
+        _ ->
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+            (CmdSystemMessage "Usage: /session prune <keep_count> (e.g. /session prune 20)")
+    cmd | "/session " `T.isPrefixOf` cmd -> do
+      let rawArg = T.strip (T.drop 9 cmd)
+      res <- liftIO $ resolveSessionId ".lambda/sessions" rawArg
+      case res of
+        Right targetId ->
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSwitchSession targetId)
+        Left err ->
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSystemMessage ("⚠️ " <> err))
+    cmd | cmd `elem` ["/trace", "/export", "/dump"] -> do
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdExportTrace
+    cmd | cmd `elem` ["/mode plan", "/plan"] -> do
       put st { uiMode = PlanMode }
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSetMode PlanMode)
-    "/exec" -> do
+    cmd | cmd `elem` ["/mode exec", "/exec"] -> do
       put st { uiMode = ExecMode }
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSetMode ExecMode)
+    "/mode" -> do
+      let modeStr = if uiMode st == PlanMode then "Plan (read-only)" else "Exec (full access)"
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+        (CmdSystemMessage $ "Current mode: " <> modeStr <> "\nUse '/mode plan' or '/mode exec' (or press Alt+M) to switch.")
+    cmd | cmd `elem` ["/model", "/models"] -> do
+      let baseUrl = apiBaseUrl (uiConfig st)
+          providerStr = case () of
+            _ | T.null baseUrl ->
+                  "⚠️ Provider: Not configured (set api_base_url in .lambda/config.json or export LAMBDA_BASE_URL)"
+            _ | isLocalEndpoint baseUrl ->
+                  "Provider: Local (" <> baseUrl <> ")"
+            _ | isOpenAiEndpoint baseUrl ->
+                  "Provider: OpenAI (" <> baseUrl <> ")"
+            _ | isOpenRouterEndpoint baseUrl ->
+                  "Provider: OpenRouter (" <> baseUrl <> ")"
+            _ ->
+                  "Provider: " <> baseUrl
+          modelStr = if T.null (uiModelName st)
+                       then "Active model: ⚠️ None configured"
+                       else "Active model: " <> uiModelName st <> " (context limit: " <> T.pack (show (uiContextLimit st)) <> " tokens)"
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+        (CmdSystemMessage $ modelStr <> "\n" <> providerStr <> "\nUse '/model <name_or_alias>' (or /model <Tab>) to switch.")
+    cmd | "/model " `T.isPrefixOf` cmd || "/models " `T.isPrefixOf` cmd -> do
+      let target = T.strip (if "/models " `T.isPrefixOf` cmd then T.drop 8 cmd else T.drop 7 cmd)
+      if T.null target
+        then liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+               (CmdSystemMessage "Usage: /model <model_id_or_alias>")
+        else liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSetModel target)
+    "/fork" -> do
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdForkSession Nothing)
+    cmd | "/fork " `T.isPrefixOf` cmd -> do
+      let title = T.strip (T.drop 6 cmd)
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdForkSession (if T.null title then Nothing else Just title))
+    "/undo" -> do
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdRewindTurns 1)
+    cmd | cmd `elem` ["/rewind", "/undo"] -> do
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdRewindTurns 1)
+    cmd | "/rewind " `T.isPrefixOf` cmd || "/undo " `T.isPrefixOf` cmd -> do
+      let rawArg = T.strip (if "/rewind " `T.isPrefixOf` cmd then T.drop 8 cmd else T.drop 6 cmd)
+          count = case readMaybe (T.unpack rawArg) of
+                    Just c | c > 0 -> c
+                    _              -> 1
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdRewindTurns count)
+    cmd | cmd `elem` ["/prompt", "/p"] -> do
+      macroNames <- liftIO $ listPromptMacros "."
+      if null macroNames
+        then liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+               (CmdSystemMessage "No prompt templates found in .lambda/prompts/*.md. Create templates with $input to use with /prompt <name> [args].")
+        else do
+          let msg = "Available prompt templates (.lambda/prompts/*.md):\n"
+                    <> T.unlines (map (\n -> "  /p " <> n) macroNames)
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSystemMessage msg)
+    cmd | "/prompt " `T.isPrefixOf` cmd || "/p " `T.isPrefixOf` cmd -> do
+      let rawPromptArg = T.strip (if "/prompt " `T.isPrefixOf` cmd then T.drop 8 cmd else T.drop 3 cmd)
+          (macroName, rawArgs) = T.break (== ' ') rawPromptArg
+      res <- liftIO $ loadPromptMacro "." macroName (T.strip rawArgs)
+      case res of
+        Left err ->
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSystemMessage err)
+        Right expanded -> do
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdUserPrompt expanded)
     cmd | cmd `elem` ["/think", "/thinking"] -> do
-      modify $ \s -> s { uiTurns = map toggleThinkingAll (uiTurns s) }
+      let newVis = not (uiThinkingVisible st)
+          targetVis = if newVis then Visible else Collapsed
+          statusMsg = if newVis then "expanded" else "collapsed"
+          updatedSubs = Map.map (\t -> t { subAgentTurns = map (setThinkingVis targetVis) (subAgentTurns t) }) (uiSubAgents st)
+      put st
+        { uiThinkingVisible = newVis
+        , uiTurns = map (setThinkingVis targetVis) (uiTurns st)
+        , uiSubAgents = updatedSubs
+        }
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+        (CmdSystemMessage $ "Thinking scratchpad: " <> statusMsg)
     cmd | cmd `elem` ["/think on", "/think show", "/thinking on", "/thinking show"] -> do
-      modify $ \s -> s { uiTurns = map (setThinkingVis Visible) (uiTurns s) }
+      let updatedSubs = Map.map (\t -> t { subAgentTurns = map (setThinkingVis Visible) (subAgentTurns t) }) (uiSubAgents st)
+      put st
+        { uiThinkingVisible = True
+        , uiTurns = map (setThinkingVis Visible) (uiTurns st)
+        , uiSubAgents = updatedSubs
+        }
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+        (CmdSystemMessage "Thinking scratchpad: expanded")
     cmd | cmd `elem` ["/think off", "/think hide", "/thinking off", "/thinking hide"] -> do
-      modify $ \s -> s { uiTurns = map (setThinkingVis Collapsed) (uiTurns s) }
+      let updatedSubs = Map.map (\t -> t { subAgentTurns = map (setThinkingVis Collapsed) (subAgentTurns t) }) (uiSubAgents st)
+      put st
+        { uiThinkingVisible = False
+        , uiTurns = map (setThinkingVis Collapsed) (uiTurns st)
+        , uiSubAgents = updatedSubs
+        }
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+        (CmdSystemMessage "Thinking scratchpad: collapsed")
+    cmd | "/sub " `T.isPrefixOf` cmd || "/subagent " `T.isPrefixOf` cmd -> do
+      let arg = T.strip $ if "/sub " `T.isPrefixOf` cmd then T.drop 5 cmd else T.drop 10 cmd
+      if arg `elem` ["main", "back", "chat", "0", "exit"]
+        then do
+          put st { uiSelectedSubAgent = Nothing }
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+            (CmdSystemMessage "Switched to Main Conversation.")
+        else
+          case reads (T.unpack arg) of
+            [(sId, "")] ->
+              if Map.member sId (uiSubAgents st)
+                then do
+                  put st { uiSelectedSubAgent = Just sId }
+                  liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+                    (CmdSystemMessage $ "Viewing SubAgent #" <> T.pack (show sId) <> " Dialogue & CoT. Press Esc or Alt+← to return.")
+                else
+                  liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+                    (CmdSystemMessage $ "⚠️ SubAgent #" <> arg <> " not found.")
+            _ ->
+              liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+                (CmdSystemMessage "Usage: /sub <id> to view subagent CoT, or /sub main to return.")
     "/compact" -> do
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdCompactHistory
     "/clear" -> do
@@ -299,6 +830,7 @@ handleCommand cmdText = do
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdQuit
       halt
     _ -> do
+      put st { uiIsGenerating = True }
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdUserPrompt cmdText)
 
 resolveActiveModal :: PermissionLevel -> EventM ResourceName UIState ()
@@ -327,6 +859,48 @@ deleteWordBackward z =
              count   = T.length before - T.length keep
          in iterate Z.deletePrevChar z !! max 1 count
 
+-- | Moves cursor backward by word respecting whitespace boundaries (like Readline Alt+B)
+moveWordBackward :: Z.TextZipper Text -> Z.TextZipper Text
+moveWordBackward z =
+  let (_, col) = Z.cursorPosition z
+      line = Z.currentLine z
+      before = T.take col line
+  in if T.null before
+       then Z.moveLeft z
+       else
+         let trimmed = T.dropWhileEnd isSpace before
+             keep    = T.dropWhileEnd (not . isSpace) trimmed
+             count   = T.length before - T.length keep
+         in iterate Z.moveLeft z !! max 1 count
+
+-- | Moves cursor forward by word respecting whitespace boundaries (like Readline Alt+F)
+moveWordForward :: Z.TextZipper Text -> Z.TextZipper Text
+moveWordForward z =
+  let (_, col) = Z.cursorPosition z
+      line = Z.currentLine z
+      after = T.drop col line
+  in if T.null after
+       then Z.moveRight z
+       else
+         let trimmed = T.dropWhile isSpace after
+             keep    = T.dropWhile (not . isSpace) trimmed
+             count   = T.length after - T.length keep
+         in iterate Z.moveRight z !! max 1 count
+
+-- | Deletes forward by word respecting whitespace boundaries (like Readline Alt+D)
+deleteWordForward :: Z.TextZipper Text -> Z.TextZipper Text
+deleteWordForward z =
+  let (_, col) = Z.cursorPosition z
+      line = Z.currentLine z
+      after = T.drop col line
+  in if T.null after
+       then Z.deleteChar z
+       else
+         let trimmed = T.dropWhile isSpace after
+             keep    = T.dropWhile (not . isSpace) trimmed
+             count   = T.length after - T.length keep
+         in iterate Z.deleteChar z !! max 1 count
+
 -- Lens helper for editor zooming
 uiEditorLens :: Functor f => (E.Editor Text ResourceName -> f (E.Editor Text ResourceName)) -> UIState -> f UIState
 uiEditorLens f s = (\e -> s { uiEditor = e }) <$> f (uiEditor s)
@@ -335,16 +909,71 @@ uiEditorLens f s = (\e -> s { uiEditor = e }) <$> f (uiEditor s)
 setEditorText :: Text -> E.Editor Text ResourceName
 setEditorText strVal = E.applyEdit Z.gotoEOL (E.editor EditorInput (Just 1) strVal)
 
--- | Toggles visibility of all thinking blocks in dialogue history
-toggleThinkingAll :: Turn -> Turn
-toggleThinkingAll t@(Turn _ _ blks) = t { turnBlocks = map flipVis blks }
-  where
-    flipVis (ThinkingBlock i b vis) = ThinkingBlock i b (if vis == Visible then Collapsed else Visible)
-    flipVis other = other
-
 -- | Explicitly sets visibility of all thinking blocks across turns
 setThinkingVis :: BlockVisibility -> Turn -> Turn
 setThinkingVis targetVis t@(Turn _ _ blks) = t { turnBlocks = map setVis blks }
   where
     setVis (ThinkingBlock i b _) = ThinkingBlock i b targetVis
     setVis other = other
+
+-- | Toggles between PlanMode and ExecMode
+toggleMode :: EventM ResourceName UIState ()
+toggleMode = do
+  st <- get
+  let nextMode = if uiMode st == PlanMode then ExecMode else PlanMode
+  put st { uiMode = nextMode }
+  liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) (CmdSetMode nextMode)
+
+-- | Step backward through active subagents or return to Main Chat
+stepPrevSubAgent :: EventM ResourceName UIState ()
+stepPrevSubAgent = do
+  st <- get
+  let subIds = Map.keys (uiSubAgents st)
+  case uiSelectedSubAgent st of
+    Nothing -> pure ()
+    Just currId ->
+      case break (== currId) subIds of
+        ([], _)    -> put st { uiSelectedSubAgent = Nothing }
+        (prevs, _) -> put st { uiSelectedSubAgent = Just (last prevs) }
+
+-- | Step forward through active subagents
+stepNextSubAgent :: EventM ResourceName UIState ()
+stepNextSubAgent = do
+  st <- get
+  let subIds = Map.keys (uiSubAgents st)
+  unless (null subIds) $ do
+    case uiSelectedSubAgent st of
+      Nothing -> put st { uiSelectedSubAgent = Just (head subIds) }
+      Just currId ->
+        case dropWhile (/= currId) subIds of
+          (_ : nextId : _) -> put st { uiSelectedSubAgent = Just nextId }
+          _                -> pure ()
+
+-- | Replaces current word/token under cursor with completed text
+replaceCurrentToken :: Text -> E.Editor Text ResourceName -> E.Editor Text ResourceName
+replaceCurrentToken inserted ed =
+  let fullText = T.concat (E.getEditContents ed)
+      tokens = T.words fullText
+  in case tokens of
+       [] -> setEditorText (inserted <> if "/" `T.isSuffixOf` inserted then "" else " ")
+       _  ->
+         let hasTrailingSpace = T.isSuffixOf " " fullText
+         in if hasTrailingSpace
+              then setEditorText (fullText <> inserted <> if "/" `T.isSuffixOf` inserted then "" else " ")
+              else
+                let prefixTokens = init tokens
+                    prefixStr = if null prefixTokens then "" else T.unwords prefixTokens <> " "
+                    newText = prefixStr <> inserted <> if "/" `T.isSuffixOf` inserted then "" else " "
+                in setEditorText newText
+
+-- | Cycles the completed token in-place, cleanly replacing the previous candidate
+cycleCompletedToken :: Text -> Text -> E.Editor Text ResourceName -> E.Editor Text ResourceName
+cycleCompletedToken prevCand newCand ed =
+  let fullText = T.concat (E.getEditContents ed)
+      prevSuffixWithSpace = prevCand <> " "
+      newSuffix = newCand <> if "/" `T.isSuffixOf` newCand then "" else " "
+  in if prevSuffixWithSpace `T.isSuffixOf` fullText
+       then setEditorText (T.dropEnd (T.length prevSuffixWithSpace) fullText <> newSuffix)
+       else if prevCand `T.isSuffixOf` fullText
+              then setEditorText (T.dropEnd (T.length prevCand) fullText <> newSuffix)
+              else replaceCurrentToken newCand ed

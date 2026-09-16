@@ -8,33 +8,72 @@ import Data.Sequence (Seq)
 import Data.Text (Text)
 import Data.Time.Clock (UTCTime)
 
+import Lambda.Config (Config)
 import Lambda.Core.EngineInterface (EngineChannels)
+import Lambda.Engine.Session (SessionMeta)
 import Lambda.Types
 
 data ResourceName
   = ChatView
   | ThinkingFold !Int
   | SubAgentView
+  | SubAgentItem !Int
   | EditorInput
   | ButtonAlways
+  | ButtonSession
   | ButtonOnce
+  | ButtonDeny
   | ButtonNo
   | ButtonNever
+  | HudOverlay
+  | HudScroll
+  | CompletionPopup
+  | SessionChooserOverlay
+  | SessionItem !Int
   deriving (Eq, Ord, Show)
 
+data Candidate = Candidate
+  { candInsert  :: !Text
+  , candDisplay :: !Text
+  } deriving (Eq, Show)
+
+simpleCandidate :: Text -> Candidate
+simpleCandidate t = Candidate t t
+
+data CompletionState = CompletionState
+  { compCandidates :: ![Candidate]
+  , compSelected   :: !Int
+  } deriving (Eq, Show)
+
+compMatches :: CompletionState -> [Text]
+compMatches = map candInsert . compCandidates
+
+data SessionChooserState = SessionChooserState
+  { scSessions :: ![SessionMeta]
+  , scSelected :: !Int
+  , scActiveId :: !Text
+  } deriving (Eq, Show)
+
 data UIState = UIState
-  { uiTurns          :: ![Turn]
-  , uiSubAgents      :: !(Map Int SubAgentTask)
-  , uiCurrentPrompt  :: !(Maybe PermissionPrompt)
-  , uiPendingPrompts :: !(Seq PermissionPrompt)
-  , uiMode           :: !AgentMode
-  , uiEditor         :: !(Editor Text ResourceName)
-  , uiWorkingState   :: !Text
-  , uiChannels       :: !EngineChannels
-  , uiLastEscTime    :: !(Maybe UTCTime)
-  , uiContextLimit   :: !Int
-  , uiPromptHistory  :: ![Text]
-  , uiHistoryIndex   :: !(Maybe Int)
-  , uiSavedDraft     :: !Text
-  , uiModelName      :: !Text
+  { uiTurns            :: ![Turn]
+  , uiSubAgents        :: !(Map Int SubAgentTask)
+  , uiCurrentPrompt    :: !(Maybe PermissionPrompt)
+  , uiPendingPrompts   :: !(Seq PermissionPrompt)
+  , uiMode             :: !AgentMode
+  , uiEditor           :: !(Editor Text ResourceName)
+  , uiWorkingState     :: !Text
+  , uiChannels         :: !EngineChannels
+  , uiLastEscTime      :: !(Maybe UTCTime)
+  , uiContextLimit     :: !Int
+  , uiPromptHistory    :: ![Text]
+  , uiHistoryIndex     :: !(Maybe Int)
+  , uiSavedDraft       :: !Text
+  , uiModelName        :: !Text
+  , uiThinkingVisible  :: !Bool
+  , uiSelectedSubAgent :: !(Maybe Int)
+  , uiShowHud          :: !Bool
+  , uiCompletion       :: !(Maybe CompletionState)
+  , uiSessionChooser   :: !(Maybe SessionChooserState)
+  , uiIsGenerating     :: !Bool
+  , uiConfig           :: !Config
   }
