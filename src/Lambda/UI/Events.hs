@@ -667,7 +667,7 @@ handleCommand cmdText = do
             , "  Ctrl+A, Ctrl+E - Move cursor to start / end of line"
             , "  Ctrl+T         - Toggle thinking/reasoning blocks"
             , "  Ctrl+S         - Open interactive session chooser modal"
-            , "  Keys 1,2,3,4   - Resolve authorization prompt (Always, Once, No, Never)"
+            , "  Keys 1,2,3,4   - Resolve authorization prompt (Always, Session, Once, Deny)"
             , "  Mouse Wheel    - Scroll conversation viewport"
             , "  Mouse Click    - Click on SubAgent #id in sidebar, thinking folds, or session chooser"
             ]

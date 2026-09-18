@@ -22,9 +22,8 @@ import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive, doe
 import System.Environment (setEnv, unsetEnv)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
-import System.FilePath.Glob (compile, match)
 
-import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, resolveEnvTemplates, persistAllowGlob)
+import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, resolveEnvTemplates)
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro, expandPromptMacro)
 import Lambda.Core.EngineInterface (initEngineChannels, cmdQueue, startEngineLoop, EngineChannels(..))
 import Lambda.Core.ModelDriver (ModelDriver(..))
@@ -69,14 +68,18 @@ import Lambda.Engine.State
   )
 import Lambda.Engine.SubAgent (submitReportTool, filterSubAgentRegistry, subAgentLoop, runEphemeralSubAgent, SubAgentSpec(..), SubAgentReport(..))
 import qualified Data.Map.Strict as Map
-import Brick.AttrMap (attrName)
+import Brick.AttrMap (attrName, attrMap)
+import Brick.Main (customMainWithVty, App(..), showFirstCursor)
 import Brick.Types (vSize, Size(..))
 import qualified Brick.Widgets.Edit as E
+import qualified Graphics.Vty as V
+import Graphics.Vty.Output.Mock (mockTerminal)
+import Graphics.Vty.Input (Input(..), InternalEvent(..))
 import Lambda.Provider.Builtin (builtinTools, listDirectoryTool, readFileTool, fetchUrlTool, editFileTool, renderDiffBlock, applyWhitespaceTolerantEdit)
 import Lambda.Provider.Mcp (inferCapability, parseMcpCallResult, startAndLoadMcpServers, stopMcpClient)
 import Lambda.UI.Completion (completeInput, allCommands, computeCommandCandidates, slidingCandidateWindow)
-import Lambda.UI.Draw (renderSubAgents, renderSubAgentsSelected, renderInlineSubAgent, renderCompletionLine)
-import Lambda.UI.Events (computeCommandMatches, replaceCurrentToken, cycleCompletedToken)
+import Lambda.UI.Draw (drawApp, renderSubAgents, renderSubAgentsSelected, renderInlineSubAgent, renderCompletionLine)
+import Lambda.UI.Events (handleAppEvent, computeCommandMatches, replaceCurrentToken, cycleCompletedToken)
 import Lambda.UI.Markdown
   ( parseMarkdownBlocks
   , tokenizeInlines
@@ -142,6 +145,7 @@ main = do
   testMarkdownParsingAndRendering
   testSessionChooserAndResolutionInvariant
   testTieredSecurityModalAndWhitelisting
+  testHeadlessUiEventSmoke
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -2173,6 +2177,96 @@ testTieredSecurityModalAndWhitelisting = do
 
   removeDirectoryRecursive tempWs
   putStrLn "  -> OK: OpenCode & Antigravity Tiered Security Modal & Config Whitelisting verified."
+
+-- 48. Headless UI Keystroke Smoke Test & Non-Exhaustive Pattern Safety
+testHeadlessUiEventSmoke :: IO ()
+testHeadlessUiEventSmoke = do
+  putStrLn "\n[Test 48] Headless UI Keystroke Smoke Test & Non-Exhaustive Pattern Safety"
+  eQueue <- atomically (newTQueue :: STM (TQueue EngineEvent))
+  channels <- initEngineChannels eQueue
+  let cfg = defaultConfig { workspaceRoot = "." }
+      initialTurns = [Turn 1 SystemRole [TextBlock "lambdA initialized. Enter a goal or press /help for commands."]]
+      initialUIState = UIState
+        { uiTurns            = initialTurns
+        , uiSubAgents        = Map.empty
+        , uiCurrentPrompt    = Nothing
+        , uiPendingPrompts   = Seq.Empty
+        , uiMode             = PlanMode
+        , uiEditor           = E.editor EditorInput (Just 1) ""
+        , uiWorkingState     = "GOAL: Headless UI Smoke Test"
+        , uiChannels         = channels
+        , uiLastEscTime      = Nothing
+        , uiContextLimit     = 128000
+        , uiPromptHistory    = []
+        , uiHistoryIndex     = Nothing
+        , uiSavedDraft       = ""
+        , uiModelName        = "mock-model"
+        , uiThinkingVisible  = True
+        , uiSelectedSubAgent = Nothing
+        , uiShowHud          = False
+        , uiCompletion       = Nothing
+        , uiSessionChooser   = Nothing
+        , uiIsGenerating     = False
+        , uiConfig           = cfg
+        }
+      testApp :: App UIState EngineEvent ResourceName
+      testApp = App
+        { appDraw         = drawApp
+        , appChooseCursor = showFirstCursor
+        , appHandleEvent  = handleAppEvent
+        , appStartEvent   = pure ()
+        , appAttrMap      = const $ attrMap V.defAttr []
+        }
+
+  inChan <- atomically (newTChan :: STM (TChan InternalEvent))
+  let mockIn = Input
+        { eventChannel      = inChan
+        , shutdownInput     = pure ()
+        , restoreInputState = pure ()
+        , inputLogMsg       = const (pure ())
+        }
+  (_, mockOut) <- mockTerminal (80, 24)
+  mockVty <- V.mkVtyFromPair mockIn mockOut
+
+  let sendKey :: V.Key -> [V.Modifier] -> IO ()
+      sendKey k mods = atomically $ writeTChan inChan (InputEvent (V.EvKey k mods))
+
+      sendStr :: String -> IO ()
+      sendStr s = mapM_ (\c -> sendKey (V.KChar c) []) s
+
+  -- 1. Exercise /help + Enter (reproducing and verifying the fix for the non-exhaustive pattern case)
+  sendStr "/help"
+  sendKey V.KEnter []
+
+  -- 2. Switch mode to /exec + Enter
+  sendStr "/exec"
+  sendKey V.KEnter []
+
+  -- 3. Trigger Autocomplete popup with / and Tab, dismiss it with Esc, and clear editor with Ctrl+U
+  sendStr "/"
+  sendKey (V.KChar '\t') []
+  sendKey V.KEsc []
+  sendKey (V.KChar 'u') [V.MCtrl]
+
+  -- 4. Send normal user prompt "headless smoke verification" + Enter
+  sendStr "headless smoke verification"
+  sendKey V.KEnter []
+
+  -- 5. Safely terminate Brick event loop with /quit + Enter
+  sendStr "/quit"
+  sendKey V.KEnter []
+
+  (finalSt, _) <- customMainWithVty mockVty (pure mockVty) Nothing testApp initialUIState
+
+  -- Verify state transitions after headless event processing
+  assert "UI prompt history recorded user prompt"
+    ("headless smoke verification" `elem` uiPromptHistory finalSt)
+  assert "UI mode switched to ExecMode via /exec command"
+    (uiMode finalSt == ExecMode)
+  assert "Editor input cleared after submission"
+    (null (E.getEditContents (uiEditor finalSt)) || E.getEditContents (uiEditor finalSt) == [""])
+
+  putStrLn "  -> OK: Headless UI keystroke smoke test executed without crashes."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =
