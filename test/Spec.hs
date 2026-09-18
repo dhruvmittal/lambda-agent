@@ -2,7 +2,7 @@
 
 module Main where
 
-import Control.Concurrent (threadDelay)
+import Control.Concurrent (threadDelay, forkIO)
 import Control.Concurrent.Async (mapConcurrently, race, async, wait)
 import Control.Concurrent.STM
 import Control.Monad (unless)
@@ -93,6 +93,14 @@ import Lambda.UI.Markdown
   )
 import Lambda.UI.Types (CompletionState(..), Candidate(..), simpleCandidate, ResourceName(..), UIState(..))
 import Lambda.Types
+import Lambda.Server.Acp
+  ( initAcpServerStateWithSink
+  , handleAcpRequest
+  , handleAcpResponse
+  , callClientRpc
+  , AcpServerState(..)
+  )
+import Lambda.Server.Acp.Types
 
 main :: IO ()
 main = do
@@ -149,6 +157,11 @@ main = do
   testMcpStderrDrainAndDeadlockImmunity
   testBashConfigurableTimeoutAndProcessGroup
   testToolCallCompactionPairIntegrity
+  testAcpInitialize
+  testAcpSessionAndModeControl
+  testAcpSessionPromptAndStreaming
+  testAcpSessionLifecycle
+  testAcpFullDuplexRpcAndNotifications
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -2300,7 +2313,10 @@ testBashConfigurableTimeoutAndProcessGroup = do
 
   -- 2. Bounded timeout aborts long-running command cleanly
   resTimeout <- toolExecute tool MainAgent (Aeson.object [ "command" .= ("sleep 10" :: Text), "timeout_seconds" .= (5 :: Int) ])
-  assert "Command aborts after configured timeout" ("Command timed out after 5 seconds." `T.isInfixOf` resultStderr resTimeout)
+  let errOut = resultStderr resTimeout
+      stdOut = resultStdout resTimeout
+  unless ("Command timed out after 5 seconds." `T.isInfixOf` errOut) $
+    failTest ("Expected timeout error but got stderr: " <> T.unpack errOut <> ", stdout: " <> T.unpack stdOut)
   putStrLn "  -> OK: Configurable execution timeout and process group bounds verified."
 
 -- 51. Verify Tool-Call Turn-Pair Compaction Boundary Safety
@@ -2332,6 +2348,341 @@ testToolCallCompactionPairIntegrity = do
     [] -> failTest "Compaction unexpectedly returned empty recent turns"
 
   putStrLn "  -> OK: Tool-call turn-pairs preserved across compaction boundaries."
+
+drainQueue :: TQueue a -> IO [a]
+drainQueue q = atomically $ go []
+  where
+    go acc = do
+      mx <- tryReadTQueue q
+      case mx of
+        Nothing -> pure (reverse acc)
+        Just x  -> go (x : acc)
+
+-- 52. Verify ACP Initialize Handshake Protocol
+testAcpInitialize :: IO ()
+testAcpInitialize = do
+  putStrLn "\n[Test 52] ACP Initialize Handshake Protocol Verification"
+  cfg <- loadConfig "."
+  outputQueue <- newTQueueIO
+  state <- initAcpServerStateWithSink cfg (\bytes -> atomically $ writeTQueue outputQueue bytes)
+
+  let initReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (101 :: Int))
+        , reqMethod = "initialize"
+        , reqParams = Just (Aeson.object [ "protocolVersion" .= (1 :: Int) ])
+        }
+  handleAcpRequest state initReq
+
+  mBytes <- atomically $ tryReadTQueue outputQueue
+  case mBytes of
+    Nothing -> failTest "No response received for initialize request"
+    Just bytes -> case Aeson.decode bytes of
+      Nothing -> failTest ("Failed to parse JSON-RPC response: " <> show bytes)
+      Just (AcpJsonRpcResponse rId mRes mErr) -> do
+        assert "Response id matches request id" (rId == Aeson.toJSON (101 :: Int))
+        assert "Response has no error" (mErr == Nothing)
+        case mRes of
+          Nothing -> failTest "Response missing result payload"
+          Just resVal -> case Aeson.fromJSON resVal of
+            Aeson.Error err -> failTest ("Failed to decode AcpInitializeResult: " <> err)
+            Aeson.Success (AcpInitializeResult ver agent caps _) -> do
+              assert "Protocol version is 1" (ver == 1)
+              assert "Agent name is lambdA" (agentName agent == "lambdA")
+              assert "Agent version is 0.1.0.0" (agentVersion agent == "0.1.0.0")
+              assert "Load session capability is enabled" (capLoadSession caps)
+              case capSessionCapabilities caps of
+                Nothing -> failTest "Missing session capabilities in agent capabilities"
+                Just sc -> do
+                  assert "session/list capability is advertised" (capList sc /= Nothing)
+                  assert "session/delete capability is advertised" (capDelete sc /= Nothing)
+                  assert "session/close capability is advertised" (capClose sc /= Nothing)
+                  assert "session/setConfigOption capability is advertised" (capSetConfigOption sc /= Nothing)
+  putStrLn "  -> OK: ACP initialize handshake satisfies protocol version 1 & capability negotiation."
+
+-- 53. Verify ACP Session Creation & Mode Switching (Plan vs Exec)
+testAcpSessionAndModeControl :: IO ()
+testAcpSessionAndModeControl = do
+  putStrLn "\n[Test 53] ACP Session Creation & Mode Control (Plan vs Exec)"
+  cfg <- loadConfig "."
+  outputQueue <- newTQueueIO
+  state <- initAcpServerStateWithSink cfg (\bytes -> atomically $ writeTQueue outputQueue bytes)
+
+  -- 1. session/new
+  let newReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (102 :: Int))
+        , reqMethod = "session/new"
+        , reqParams = Just (Aeson.object [ "cwd" .= ("." :: Text) ])
+        }
+  handleAcpRequest state newReq
+
+  msgs <- drainQueue outputQueue
+  let responses = [ r | Just (r :: AcpJsonRpcResponse) <- map Aeson.decode msgs ]
+      notifications = [ n | Just (n :: AcpJsonRpcNotification) <- map Aeson.decode msgs ]
+
+  assert "session/new returned a response" (not (null responses))
+  let sessResp = head responses
+  assert "session/new response id matches" (respId sessResp == Aeson.toJSON (102 :: Int))
+  sId <- case respResult sessResp of
+    Just val -> case Aeson.fromJSON val of
+      Aeson.Success (AcpSessionNewResult sid) -> pure sid
+      Aeson.Error err -> failTest ("Failed to parse AcpSessionNewResult: " <> err) >> pure ""
+    Nothing -> failTest "session/new missing result" >> pure ""
+
+  assert "Available commands notification broadcast on session start"
+    (any (\n -> notifMethod n == "session/update") notifications)
+
+  -- 2. session/set_mode to "exec"
+  let setExecReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (103 :: Int))
+        , reqMethod = "session/set_mode"
+        , reqParams = Just (Aeson.object [ "sessionId" .= sId, "mode" .= ("exec" :: Text) ])
+        }
+  handleAcpRequest state setExecReq
+
+  execMsgs <- drainQueue outputQueue
+  let execNotifs = [ n | Just (n :: AcpJsonRpcNotification) <- map Aeson.decode execMsgs ]
+  assert "session/set_mode broadcast mode update"
+    (any (\n -> notifMethod n == "session/update" && "exec" `T.isInfixOf` TE.decodeUtf8 (BL.toStrict (Aeson.encode (notifParams n)))) execNotifs)
+
+  mEngine <- readTVarIO (acpActiveEngine state)
+  case mEngine of
+    Nothing -> failTest "Engine not active after session/new"
+    Just eng -> do
+      curMode <- readTVarIO (appMode eng)
+      assert "Engine mode transitioned to ExecMode" (curMode == ExecMode)
+
+  -- 3. session/set_mode to "plan"
+  let setPlanReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (104 :: Int))
+        , reqMethod = "session/set_mode"
+        , reqParams = Just (Aeson.object [ "sessionId" .= sId, "mode" .= ("plan" :: Text) ])
+        }
+  handleAcpRequest state setPlanReq
+  planMsgs <- drainQueue outputQueue
+  let planNotifs = [ n | Just (n :: AcpJsonRpcNotification) <- map Aeson.decode planMsgs ]
+  assert "session/set_mode broadcast plan update"
+    (any (\n -> notifMethod n == "session/update" && "plan" `T.isInfixOf` TE.decodeUtf8 (BL.toStrict (Aeson.encode (notifParams n)))) planNotifs)
+
+  putStrLn "  -> OK: ACP session creation, command manifests, and mode switching verified."
+
+-- 54. Verify ACP Session Prompt Streaming Lifecycle & Cancellation
+testAcpSessionPromptAndStreaming :: IO ()
+testAcpSessionPromptAndStreaming = do
+  putStrLn "\n[Test 54] ACP Session Prompt Streaming Lifecycle & Cancellation"
+  cfg <- loadConfig "."
+  outputQueue <- newTQueueIO
+  state <- initAcpServerStateWithSink cfg (\bytes -> atomically $ writeTQueue outputQueue bytes)
+
+  let mockDriver = ModelDriver
+        { streamCompletion = \_ _ cb -> do
+            cb (ChunkThinking "Analyzing codebase architecture...")
+            cb (ChunkText "lambdA ACP streaming verified.")
+            cb ChunkDone
+        }
+  atomically $ writeTVar (acpDriverOverride state) (Just mockDriver)
+
+  -- Create session
+  let newReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (201 :: Int))
+        , reqMethod = "session/new"
+        , reqParams = Just (Aeson.object [ "cwd" .= ("." :: Text) ])
+        }
+  handleAcpRequest state newReq
+  _ <- drainQueue outputQueue
+  sId <- readTVarIO (acpActiveSessionId state)
+
+  -- Send prompt request with id = 202
+  let promptReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (202 :: Int))
+        , reqMethod = "session/prompt"
+        , reqParams = Just (Aeson.object [ "sessionId" .= sId, "prompt" .= ("Run audit" :: Text) ])
+        }
+  handleAcpRequest state promptReq
+
+  promptMsgs <- drainQueue outputQueue
+  let promptResps = [ r | Just (r :: AcpJsonRpcResponse) <- map Aeson.decode promptMsgs ]
+      promptNotifs = [ n | Just (n :: AcpJsonRpcNotification) <- map Aeson.decode promptMsgs ]
+
+  assert "Received prompt response" (not (null promptResps))
+  let pResp = head promptResps
+  assert "Prompt response id matches" (respId pResp == Aeson.toJSON (202 :: Int))
+  case respResult pResp of
+    Just val -> case Aeson.fromJSON val of
+      Aeson.Success (AcpSessionPromptResult stopReason) ->
+        assert "Prompt completed with end_turn" (stopReason == "end_turn")
+      Aeson.Error err -> failTest ("Failed to parse AcpSessionPromptResult: " <> err)
+    Nothing -> failTest "Missing prompt result"
+
+  let notifTexts = map (TE.decodeUtf8 . BL.toStrict . Aeson.encode . notifParams) promptNotifs
+  assert "Captured agent_thought_chunk"
+    (any (\txt -> "agent_thought_chunk" `T.isInfixOf` txt && "Analyzing codebase architecture..." `T.isInfixOf` txt) notifTexts)
+  assert "Captured agent_message_chunk"
+    (any (\txt -> "agent_message_chunk" `T.isInfixOf` txt && "lambdA ACP streaming verified." `T.isInfixOf` txt) notifTexts)
+
+  -- Test session/cancel
+  let cancelReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (203 :: Int))
+        , reqMethod = "session/cancel"
+        , reqParams = Just (Aeson.object [ "sessionId" .= sId ])
+        }
+  handleAcpRequest state cancelReq
+  cancelMsgs <- drainQueue outputQueue
+  let cancelResps = [ r | Just (r :: AcpJsonRpcResponse) <- map Aeson.decode cancelMsgs ]
+  assert "Received cancel response" (not (null cancelResps))
+  let cResp = head cancelResps
+  assert "Cancel response id matches" (respId cResp == Aeson.toJSON (203 :: Int))
+
+  putStrLn "  -> OK: ACP session/prompt streaming chunks, turn completion, and cancellation verified."
+
+-- 55. Verify ACP Extended Session Lifecycle (session/list, set_config_option, close, delete)
+testAcpSessionLifecycle :: IO ()
+testAcpSessionLifecycle = do
+  putStrLn "\n[Test 55] ACP Extended Session Lifecycle (list, set_config_option, close, delete)"
+  cfg <- loadConfig "."
+  outputQueue <- newTQueueIO
+  state <- initAcpServerStateWithSink cfg (\bytes -> atomically $ writeTQueue outputQueue bytes)
+
+  -- 1. Create a session
+  let newReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (301 :: Int))
+        , reqMethod = "session/new"
+        , reqParams = Just (Aeson.object [ "cwd" .= ("." :: Text) ])
+        }
+  handleAcpRequest state newReq
+  _ <- drainQueue outputQueue
+  sId <- readTVarIO (acpActiveSessionId state)
+  assert "Session ID is non-empty" (not (T.null sId))
+
+  -- 2. Test session/set_config_option
+  let setCfgReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (302 :: Int))
+        , reqMethod = "session/set_config_option"
+        , reqParams = Just (Aeson.object
+            [ "sessionId" .= sId
+            , "configId"  .= ("model" :: Text)
+            , "value"     .= ("claude-3-5-sonnet" :: Text)
+            ])
+        }
+  handleAcpRequest state setCfgReq
+  cfgMsgs <- drainQueue outputQueue
+  let cfgResps = [ r | Just (r :: AcpJsonRpcResponse) <- map Aeson.decode cfgMsgs ]
+  assert "Received set_config_option response" (not (null cfgResps))
+  let cfgResp = head cfgResps
+  assert "set_config_option response id matches" (respId cfgResp == Aeson.toJSON (302 :: Int))
+  mEng <- readTVarIO (acpActiveEngine state)
+  case mEng of
+    Just eng -> do
+      activeMod <- readTVarIO (appActiveModel eng)
+      assert "Active model updated to claude-3-5-sonnet" (activeMod == "claude-3-5-sonnet")
+    Nothing -> failTest "Missing active engine state"
+
+  -- 3. Test session/list
+  let listReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (303 :: Int))
+        , reqMethod = "session/list"
+        , reqParams = Just (Aeson.object [ "cwd" .= ("." :: Text) ])
+        }
+  handleAcpRequest state listReq
+  listMsgs <- drainQueue outputQueue
+  let listResps = [ r | Just (r :: AcpJsonRpcResponse) <- map Aeson.decode listMsgs ]
+  assert "Received session/list response" (not (null listResps))
+  let lResp = head listResps
+  assert "session/list response id matches" (respId lResp == Aeson.toJSON (303 :: Int))
+  case respResult lResp of
+    Just val -> case Aeson.fromJSON val of
+      Aeson.Success (AcpSessionListResult _sessions _cursor) ->
+        assert "Parsed AcpSessionListResult successfully" True
+      Aeson.Error err -> failTest ("Failed to parse AcpSessionListResult: " <> err)
+    Nothing -> failTest "Missing result payload in session/list response"
+
+  -- 4. Test session/close
+  let closeReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (304 :: Int))
+        , reqMethod = "session/close"
+        , reqParams = Just (Aeson.object [ "sessionId" .= sId ])
+        }
+  handleAcpRequest state closeReq
+  closeMsgs <- drainQueue outputQueue
+  let closeResps = [ r | Just (r :: AcpJsonRpcResponse) <- map Aeson.decode closeMsgs ]
+  assert "Received session/close response" (not (null closeResps))
+  let clResp = head closeResps
+  assert "session/close response id matches" (respId clResp == Aeson.toJSON (304 :: Int))
+  mEngAfterClose <- readTVarIO (acpActiveEngine state)
+  case mEngAfterClose of
+    Nothing -> assert "Engine state cleared after close" True
+    Just _  -> failTest "Engine state was not cleared after session/close"
+
+  -- 5. Test session/delete
+  let deleteReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (305 :: Int))
+        , reqMethod = "session/delete"
+        , reqParams = Just (Aeson.object [ "sessionId" .= sId ])
+        }
+  handleAcpRequest state deleteReq
+  delMsgs <- drainQueue outputQueue
+  let delResps = [ r | Just (r :: AcpJsonRpcResponse) <- map Aeson.decode delMsgs ]
+  assert "Received session/delete response" (not (null delResps))
+  let dResp = head delResps
+  assert "session/delete response id matches" (respId dResp == Aeson.toJSON (305 :: Int))
+
+  putStrLn "  -> OK: ACP session/list, set_config_option, close, and delete verified."
+
+-- 56. Verify ACP Full-Duplex Client RPC & Rich Notification Manifests
+testAcpFullDuplexRpcAndNotifications :: IO ()
+testAcpFullDuplexRpcAndNotifications = do
+  putStrLn "\n[Test 56] ACP Full-Duplex Client RPC & Rich Notification Manifests"
+  cfg <- loadConfig "."
+  outputQueue <- newTQueueIO
+  state <- initAcpServerStateWithSink cfg (\bytes -> atomically $ writeTQueue outputQueue bytes)
+
+  -- 1. Full-Duplex RPC round-trip test: callClientRpc in background thread
+  replyResultVar <- newEmptyTMVarIO
+  _ <- forkIO $ do
+    res <- callClientRpc state "session/request_permission" (Aeson.object [ "test" .= True ])
+    atomically $ putTMVar replyResultVar res
+
+  -- 2. Read outgoing server request from outputQueue deterministically
+  reqMsg <- atomically $ readTQueue outputQueue
+  let reqTxt = TE.decodeUtf8 (BL.toStrict reqMsg)
+  assert "Dispatched method is session/request_permission" ("session/request_permission" `T.isInfixOf` reqTxt)
+
+  -- 3. Simulate client replying with response id 1000
+  let clientResp = AcpJsonRpcResponse
+        { respId     = Aeson.toJSON (1000 :: Int)
+        , respResult = Just (Aeson.object [ "outcome" .= ("allow" :: Text) ])
+        , respError  = Nothing
+        }
+  handleAcpResponse state clientResp
+
+  -- 4. Verify callClientRpc unblocked with outcome
+  outcomeRes <- atomically $ takeTMVar replyResultVar
+  case outcomeRes of
+    Right val -> do
+      let encoded = TE.decodeUtf8 (BL.toStrict (Aeson.encode val))
+      assert "Client RPC returned outcome allow" ("allow" `T.isInfixOf` encoded)
+    Left err -> failTest ("Client RPC failed: " <> show err)
+
+  -- 5. Test Rich Notification Serialization
+  let planEntries =
+        [ AcpPlanEntry "Verify compiler flags" "completed" (Just "high")
+        , AcpPlanEntry "Run ACP test suite" "in_progress" (Just "medium")
+        ]
+      planNotif = AcpSessionUpdateNotification "sess_test" (AcpPlanUpdate planEntries)
+      planTxt = TE.decodeUtf8 (BL.toStrict (Aeson.encode planNotif))
+  assert "Plan update contains sessionUpdate plan" ("\"sessionUpdate\":\"plan\"" `T.isInfixOf` planTxt)
+  assert "Plan update contains Verify compiler flags" ("Verify compiler flags" `T.isInfixOf` planTxt)
+
+  let usageNotif = AcpSessionUpdateNotification "sess_test" (AcpUsageUpdate 1500 1000 (Just 0.0075))
+      usageTxt = TE.decodeUtf8 (BL.toStrict (Aeson.encode usageNotif))
+  assert "Usage update contains session_usage_update" ("\"sessionUpdate\":\"session_usage_update\"" `T.isInfixOf` usageTxt)
+  assert "Usage update contains totalTokens 1500" ("\"totalTokens\":1500" `T.isInfixOf` usageTxt)
+
+  let titleNotif = AcpSessionUpdateNotification "sess_test" (AcpSessionInfoUpdate "Dynamic Title")
+      titleTxt = TE.decodeUtf8 (BL.toStrict (Aeson.encode titleNotif))
+  assert "Title update contains session_info_update" ("\"sessionUpdate\":\"session_info_update\"" `T.isInfixOf` titleTxt)
+  assert "Title update contains Dynamic Title" ("\"title\":\"Dynamic Title\"" `T.isInfixOf` titleTxt)
+
+  putStrLn "  -> OK: ACP full-duplex client RPC and rich notification manifests verified."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

@@ -200,6 +200,7 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
 
         -- Auto-save session state after turn completion
         persistCurrentSession engineState
+        emitEngineEvent engineState EvDone
 
       atomically $ writeTVar activeTaskVar (Just turnTask)
       engineWorkerLoop engineState driver channels activeTaskVar

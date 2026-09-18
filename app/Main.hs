@@ -39,6 +39,7 @@ import Lambda.Engine.State (initEngineStateWithSession, AppEngineState(..))
 import Lambda.Engine.SubAgent (spawnSpecialistSubAgentTool)
 import Lambda.Provider.Builtin (builtinTools)
 import Lambda.Provider.Mcp (startAndLoadMcpServers)
+import Lambda.Server.Acp (runAcpServer)
 import Lambda.Types
 import Lambda.UI.Draw (drawApp)
 import Lambda.UI.Events (handleAppEvent)
@@ -121,6 +122,12 @@ main = do
 
   -- Handle CLI-only commands
   case args of
+    ["--acp"] -> do
+      runAcpServer cfg
+      exitSuccess
+    ["-a"] -> do
+      runAcpServer cfg
+      exitSuccess
     ["--clean-sessions"] -> do
       cleaned <- cleanEmptySessions sessDir
       putStrLn $ "Cleaned " ++ show cleaned ++ " empty stub session(s)."
@@ -217,7 +224,7 @@ main = do
           pure (Just s)
     [] -> pure Nothing
     _  -> do
-      putStrLn "Usage: lambda [--continue|-c] [--session|-s <id>] [--list-sessions] [--clean-sessions] [--inspect [id]] [--export-trace [id]]"
+      putStrLn "Usage: lambda [--acp|-a] [--continue|-c] [--session|-s <id>] [--list-sessions] [--clean-sessions] [--inspect [id]] [--export-trace [id]]"
       exitFailure
 
   -- 2. Initialize tool registry with builtins and configured MCP servers

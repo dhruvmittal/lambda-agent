@@ -200,6 +200,7 @@ data EngineEvent
   | EvSessionSwitched !Text !AgentMode ![Turn] !(Map Int SubAgentTask)
   | EvModelSwitched !Text !Int
   | EvError !Text
+  | EvDone
 
 -- | Frontend to Engine dispatch commands
 data FrontendCommand

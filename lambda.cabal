@@ -50,6 +50,8 @@ library
         Lambda.UI.Markdown
         Lambda.UI.Events
         Lambda.UI.Completion
+        Lambda.Server.Acp.Types
+        Lambda.Server.Acp
     build-depends:
         base >= 4.17 && < 5,
         text,

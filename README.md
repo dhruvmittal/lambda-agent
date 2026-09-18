@@ -74,6 +74,41 @@ cabal run lambda -- --list-sessions
 
 ---
 
+## Zed Editor Integration (Agent Client Protocol)
+
+lambdA provides native headless **ACP (Agent Client Protocol)** support via `lambda --acp` (or `lambda -a`). When run in ACP mode, lambdA bypasses the terminal UI completely, reserving `stdout` strictly for JSON-RPC 2.0 streaming messages while routing internal engine diagnostics to `stderr`.
+
+### Features Supported
+- **Extended Session Lifecycle**: Full support for `session/new`, `session/load`, `session/list` (browser / session picker), `session/delete`, `session/close`, and `session/set_config_option` (dynamic model selection).
+- **Rich Notifications**:
+  - `plan`: Structured checklist updates (`pending`, `in_progress`, `completed`) reflecting internal goals and planning loops.
+  - `session_usage_update`: Live prompt/completion token counts and estimated USD cost per turn.
+  - `session_info_update`: Dynamic session title updates.
+- **Client-Side Delegation & Full-Duplex RPC**: `session/request_permission` delegates tool authorization prompts to native editor modals with fallback to local security policies.
+- **Interactive Mode Switching**: Seamless switching between `/plan` (safe read-only inspection) and `/exec` (full modification tools).
+
+### Zed Configuration
+Install the `lambda` binary to your `$PATH` (e.g. via `nix profile install .` or `cabal install`), then add lambdA to your Zed configuration (`~/.config/zed/settings.json` or `Preferences: Open Settings`):
+
+```json
+{
+  "agent_servers": {
+    "lambdA": {
+      "type": "custom",
+      "command": "lambda",
+      "args": ["--acp"]
+    }
+  }
+}
+```
+
+Once configured:
+- Open the Zed Assistant panel (`Ctrl+?` or `Cmd+?`).
+- Select **lambdA** as your active agent server.
+- The assistant streams thoughts, tool executions, and turn completions natively, displaying live plans, token usage telemetry, and session management.
+
+---
+
 ## Build & Install
 
 ### Prerequisites
@@ -100,7 +135,7 @@ cabal build exe:lambda
 # Install binary to ~/.cabal/bin (ensure it's in your $PATH)
 cabal install exe:lambda --overwrite-policy=always
 
-# Run 42-stage invariant test suite
+# Run 56-stage invariant test suite
 cabal test
 ```
 

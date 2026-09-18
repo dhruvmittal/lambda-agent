@@ -96,6 +96,9 @@ handleAppEvent (AppEvent engineEv) = do
         }
       vScrollToEnd (viewportScroll ChatView)
     EvStreamChunk _ -> pure ()
+    EvDone -> do
+      modify $ \s -> s { uiIsGenerating = False }
+      vScrollToEnd (viewportScroll ChatView)
   where
     updateMatchingTurn updatedTurn turns =
       let rev = reverse turns
