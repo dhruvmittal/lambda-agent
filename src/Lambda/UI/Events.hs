@@ -24,7 +24,6 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Zipper as Z
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
-import Data.Time.Format (defaultTimeLocale, formatTime)
 import qualified Graphics.Vty as V
 import System.Posix.Signals (raiseSignal, sigTSTP)
 import Text.Read (readMaybe)
@@ -35,7 +34,6 @@ import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro)
 import Lambda.Engine.Security (resolvePrompt)
 import Lambda.Engine.Session
   ( SessionMeta(..)
-  , listSessions
   , listMeaningfulSessions
   , cleanEmptySessions
   , pruneSessions
@@ -583,27 +581,27 @@ handleAppEvent (VtyEvent (V.EvKey V.KEnter [])) = do
           }
         vScrollToEnd (viewportScroll ChatView)
         handleCommand fullCmd
-    _ -> do
-      let rawLines = E.getEditContents (uiEditor st)
-          inputText = T.strip (T.unlines rawLines)
-      if T.null inputText
-        then pure ()
-        else do
-          -- Record prompt in history (avoiding consecutive duplicates)
-          let currentHist = uiPromptHistory st
-              newHist = case currentHist of
-                (p:_) | p == inputText -> currentHist
-                _                      -> inputText : currentHist
-          -- Reset input editor and history navigation state
-          put st
-            { uiEditor        = E.editor EditorInput (Just 1) ""
-            , uiPromptHistory = newHist
-            , uiHistoryIndex  = Nothing
-            , uiSavedDraft    = ""
-            , uiCompletion    = Nothing
-            }
-          vScrollToEnd (viewportScroll ChatView)
-          handleCommand inputText
+      _ -> do
+        let rawLines = E.getEditContents (uiEditor st)
+            inputText = T.strip (T.unlines rawLines)
+        if T.null inputText
+          then pure ()
+          else do
+            -- Record prompt in history (avoiding consecutive duplicates)
+            let currentHist = uiPromptHistory st
+                newHist = case currentHist of
+                  (p:_) | p == inputText -> currentHist
+                  _                      -> inputText : currentHist
+            -- Reset input editor and history navigation state
+            put st
+              { uiEditor        = E.editor EditorInput (Just 1) ""
+              , uiPromptHistory = newHist
+              , uiHistoryIndex  = Nothing
+              , uiSavedDraft    = ""
+              , uiCompletion    = Nothing
+              }
+            vScrollToEnd (viewportScroll ChatView)
+            handleCommand inputText
 
 -- Default text editor input (regular typing)
 handleAppEvent (VtyEvent ev) = do
