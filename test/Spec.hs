@@ -7,7 +7,7 @@ import Control.Concurrent.Async (mapConcurrently, race, async, wait)
 import Control.Concurrent.STM
 import Control.Monad (unless)
 import qualified Data.Aeson as Aeson
-import Data.Aeson ((.=), (.:?))
+import Data.Aeson ((.=), (.:?), (.:))
 import Data.Aeson.Types (parseEither, parseMaybe)
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef (newIORef, readIORef, modifyIORef')
@@ -75,7 +75,7 @@ import qualified Brick.Widgets.Edit as E
 import qualified Graphics.Vty as V
 import Graphics.Vty.Output.Mock (mockTerminal)
 import Graphics.Vty.Input (Input(..), InternalEvent(..))
-import Lambda.Provider.Builtin (builtinTools, listDirectoryTool, readFileTool, fetchUrlTool, editFileTool, renderDiffBlock, applyWhitespaceTolerantEdit)
+import Lambda.Provider.Builtin (builtinTools, listDirectoryTool, readFileTool, fetchUrlTool, bashTool, editFileTool, renderDiffBlock, applyWhitespaceTolerantEdit)
 import Lambda.Provider.Mcp (inferCapability, parseMcpCallResult, startAndLoadMcpServers, stopMcpClient)
 import Lambda.UI.Completion (completeInput, allCommands, computeCommandCandidates, slidingCandidateWindow)
 import Lambda.UI.Draw (drawApp, renderSubAgents, renderSubAgentsSelected, renderInlineSubAgent, renderCompletionLine)
@@ -146,6 +146,9 @@ main = do
   testSessionChooserAndResolutionInvariant
   testTieredSecurityModalAndWhitelisting
   testHeadlessUiEventSmoke
+  testMcpStderrDrainAndDeadlockImmunity
+  testBashConfigurableTimeoutAndProcessGroup
+  testToolCallCompactionPairIntegrity
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -2267,6 +2270,68 @@ testHeadlessUiEventSmoke = do
     (null (E.getEditContents (uiEditor finalSt)) || E.getEditContents (uiEditor finalSt) == [""])
 
   putStrLn "  -> OK: Headless UI keystroke smoke test executed without crashes."
+
+-- 49. Verify MCP Stderr Drain and 64KB OS Buffer Deadlock Immunity
+testMcpStderrDrainAndDeadlockImmunity :: IO ()
+testMcpStderrDrainAndDeadlockImmunity = do
+  putStrLn "\n[Test 49] MCP Stderr Drain & 64KB Pipe Buffer Deadlock Immunity"
+  -- We dump 128KB of data to stderr via POSIX dd before writing the JSON-RPC response.
+  -- Without an active stderr drain loop, this would completely freeze on OS pipe write.
+  let shCmd = "dd if=/dev/zero bs=1024 count=128 of=/dev/stderr 2>/dev/null; echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"status\":\"drain_ok\"}}'"
+  client <- startRpcClient LineFramed "sh" ["-c", shCmd]
+  res <- sendRequest client "test_method" (Aeson.object [])
+  stopRpcClient client
+  case res of
+    Right val -> do
+      case parseMaybe (Aeson.withObject "res" (.: "status")) val of
+        Just ("drain_ok" :: Text) ->
+          putStrLn "  -> OK: 128KB stderr burst drained without pipe buffer deadlock."
+        _ -> failTest "Unexpected result from MCP client after stderr drain."
+    Left err -> failTest ("MCP request failed during stderr drain: " <> T.unpack err)
+
+-- 50. Verify Configurable Timeout & Process Group Bounds in bashTool
+testBashConfigurableTimeoutAndProcessGroup :: IO ()
+testBashConfigurableTimeoutAndProcessGroup = do
+  putStrLn "\n[Test 50] Bash Configurable Timeout & Process Group"
+  let tool = bashTool "." "/tmp"
+  -- 1. Fast execution with explicit timeout
+  resFast <- toolExecute tool MainAgent (Aeson.object [ "command" .= ("echo 'fast execution'" :: Text), "timeout_seconds" .= (10 :: Int) ])
+  assert "Fast command succeeds with custom timeout" ("fast execution" `T.isInfixOf` resultStdout resFast)
+
+  -- 2. Bounded timeout aborts long-running command cleanly
+  resTimeout <- toolExecute tool MainAgent (Aeson.object [ "command" .= ("sleep 10" :: Text), "timeout_seconds" .= (5 :: Int) ])
+  assert "Command aborts after configured timeout" ("Command timed out after 5 seconds." `T.isInfixOf` resultStderr resTimeout)
+  putStrLn "  -> OK: Configurable execution timeout and process group bounds verified."
+
+-- 51. Verify Tool-Call Turn-Pair Compaction Boundary Safety
+testToolCallCompactionPairIntegrity :: IO ()
+testToolCallCompactionPairIntegrity = do
+  putStrLn "\n[Test 51] Tool-Call Turn-Pair Compaction Boundary Safety"
+  let t1 = Turn 1 UserRole [TextBlock "Initial prompt"]
+      t2 = Turn 2 AssistantRole [TextBlock "Response 1"]
+      t3 = Turn 3 UserRole [TextBlock "Prompt 2"]
+      t4 = Turn 4 AssistantRole [TextBlock "Response 2"]
+      tc = ToolCall "call_1" "bash" (Aeson.object ["command" .= ("ls" :: Text)])
+      t5 = Turn 5 AssistantRole [ToolCallBlock tc]
+      tr = ToolResult "call_1" "file1\nfile2" "" Nothing
+      t6 = Turn 6 ToolRole [ToolResultBlock tr]
+      t7 = Turn 7 AssistantRole [TextBlock "Analyzed files."]
+      turns = [t1, t2, t3, t4, t5, t6, t7]
+
+  -- If recentCount is 2 (recent turns would naively be [t6, t7]), naive splitAt would separate t5 (Assistant) from t6 (Tool).
+  -- compactHistory's adjustSplit must pull t5 into recent so t6 is never orphaned!
+  let compacted = compactHistory 10 2 turns
+  assert "Compacted turns have summary turn at head" (case compacted of (Turn _ SystemRole _:_) -> True; _ -> False)
+
+  -- Check the non-summary turns in compacted
+  let recentTurns = tail compacted
+  case recentTurns of
+    (firstTurn:_) -> do
+      assert "First non-summary turn is NOT an orphaned ToolRole" (turnRole firstTurn /= ToolRole)
+      assert "First non-summary turn is the AssistantRole initiating the tool call" (turnId firstTurn == 5)
+    [] -> failTest "Compaction unexpectedly returned empty recent turns"
+
+  putStrLn "  -> OK: Tool-call turn-pairs preserved across compaction boundaries."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

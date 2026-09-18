@@ -132,11 +132,15 @@ turnsToOpenAIPayload turns =
     extractToolCall _                  = Nothing
 
     toolResultToMessage (ToolResultBlock ToolResult{..}) =
-      let contentText =
-            if T.null resultStdout && not (T.null resultStderr)
-              then "ERROR: " <> resultStderr
-              else if not (T.null resultStderr)
-                then resultStdout <> "\nSTDERR:\n" <> resultStderr
+      let cleanStderr =
+            if T.length resultStderr > 2000
+              then T.takeEnd 2000 resultStderr
+              else resultStderr
+          contentText =
+            if T.null resultStdout && not (T.null cleanStderr)
+              then "ERROR: " <> cleanStderr
+              else if not (T.null cleanStderr)
+                then resultStdout <> "\nSTDERR:\n" <> cleanStderr
                 else if T.null resultStdout
                   then "(empty output)"
                   else resultStdout
@@ -172,13 +176,22 @@ compactHistory maxTokens recentCount turns
   | estimateTotalTokens turns <= maxTokens = turns
   | length turns <= recentCount + 1 = turns
   | otherwise =
-      let (older, recent) = splitAt (length turns - recentCount) turns
+      let rawSplit = splitAt (length turns - recentCount) turns
+          (older, recent) = adjustSplit rawSplit
           summaryText = synthesizeTurnSummary older
           minId = case older of
             (t:_) -> turnId t
             []    -> 1
           summaryTurn = Turn minId SystemRole [TextBlock summaryText]
-      in summaryTurn : recent
+      in if null older
+           then recent
+           else summaryTurn : recent
+  where
+    -- Ensures recent turns do not begin with an orphaned ToolRole turn whose
+    -- AssistantRole tool call would otherwise be compacted away into the summary.
+    adjustSplit (older, recent@(Turn _ ToolRole _:_))
+      | not (null older) = adjustSplit (init older, last older : recent)
+    adjustSplit pair = pair
 
 -- | Synthesizes a structured summary from a sequence of turns
 synthesizeTurnSummary :: [Turn] -> Text

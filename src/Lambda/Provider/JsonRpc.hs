@@ -30,12 +30,13 @@ import System.Process.Typed
 import Lambda.Types (Framing(..))
 
 data JsonRpcClient = JsonRpcClient
-  { rpcProcess   :: !(Process Handle Handle Handle)
-  , rpcReqId     :: !(TVar Int)
-  , rpcPending   :: !(TVar (Map Int (TMVar (Either Text Aeson.Value))))
-  , rpcReader    :: !(Async ())
-  , _rpcFraming  :: !Framing
-  , rpcWriteLock :: !(MVar ())
+  { rpcProcess      :: !(Process Handle Handle Handle)
+  , rpcReqId        :: !(TVar Int)
+  , rpcPending      :: !(TVar (Map Int (TMVar (Either Text Aeson.Value))))
+  , rpcReader       :: !(Async ())
+  , rpcStderrReader :: !(Async ())
+  , _rpcFraming     :: !Framing
+  , rpcWriteLock    :: !(MVar ())
   }
 
 startRpcClient :: Framing -> FilePath -> [Text] -> IO JsonRpcClient
@@ -59,9 +60,20 @@ startRpcClientWithEnv framing cmd args extraEnv = do
   writeLock <- newMVar ()
 
   let readerAction = readLineFramedLoop (getStdout p) pendingVar
+      drainStderrAction = drainStderrLoop (getStderr p)
 
   reader <- async readerAction
-  pure $ JsonRpcClient p reqIdVar pendingVar reader framing writeLock
+  errReader <- async drainStderrAction
+  pure $ JsonRpcClient p reqIdVar pendingVar reader errReader framing writeLock
+
+-- | Continuously drains stderr to prevent 64KB OS pipe buffer exhaustion from deadlocking the process
+drainStderrLoop :: Handle -> IO ()
+drainStderrLoop hErr = do
+  res <- try (BS.hGetSome hErr 4096)
+  case res of
+    Left (_ :: SomeException) -> pure ()
+    Right bs | BS.null bs     -> pure ()
+             | otherwise      -> drainStderrLoop hErr
 
 -- | Newline-delimited JSON reader with robust EOF / exception recovery
 readLineFramedLoop :: Handle -> TVar (Map Int (TMVar (Either Text Aeson.Value))) -> IO ()
@@ -148,6 +160,7 @@ sendNotification client method params = do
 stopRpcClient :: JsonRpcClient -> IO ()
 stopRpcClient client = do
   cancel (rpcReader client)
+  cancel (rpcStderrReader client)
   _ <- (try (stopProcess (rpcProcess client)) :: IO (Either SomeException ()))
   pure ()
 

@@ -59,25 +59,32 @@ bashTool wsRoot artDir = ToolDefinition
               [ "type" .= ("string" :: Text)
               , "description" .= ("The exact command line string to execute." :: Text)
               ]
+          , "timeout_seconds" .= Aeson.object
+              [ "type" .= ("integer" :: Text)
+              , "description" .= ("Optional execution timeout in seconds (default: 120, max: 7200 for long-running profilers or builds)." :: Text)
+              ]
           ]
       , "required" .= (["command"] :: [Text])
       ]
   , toolCapability = Destructive
   , toolExecute = \_caller args -> do
-      case parseEither (Aeson.withObject "bash" (.: "command")) args of
+      case parseEither (Aeson.withObject "bash" $ \o -> (,) <$> o .: "command" <*> (o .:? "timeout_seconds")) args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
-        Right cmd -> do
-          let pConf = setStdin closed
+        Right (cmd, mTimeout) -> do
+          let reqTimeout = maybe 120 id mTimeout
+              effTimeout = max 5 (min 7200 reqTimeout)
+              pConf = setStdin closed
                     $ setStdout byteStringOutput
                     $ setStderr byteStringOutput
                     $ setWorkingDir wsRoot
+                    $ setCreateGroup True
                     $ shell (T.unpack cmd)
-          res <- try $ timeout (120 * 1000000) $ readProcess pConf
+          res <- try $ timeout (effTimeout * 1000000) $ readProcess pConf
           case res of
             Left (ex :: SomeException) ->
               pure $ ToolResult "" "" ("Execution exception: " <> T.pack (show ex)) Nothing
             Right Nothing ->
-              pure $ ToolResult "" "" "Command timed out after 120 seconds." Nothing
+              pure $ ToolResult "" "" ("Command timed out after " <> T.pack (show effTimeout) <> " seconds.") Nothing
             Right (Just (exitCode, outBs, errBs)) -> do
               let outText = TE.decodeUtf8Lenient (BS.toStrict outBs)
                   errText = TE.decodeUtf8Lenient (BS.toStrict errBs)
@@ -89,7 +96,13 @@ bashTool wsRoot artDir = ToolDefinition
                     ExitSuccess -> ""
                     ExitFailure code -> "\n[Process exited with code " <> T.pack (show code) <> "]"
 
-              pure $ ToolResult "" (compactOutput <> exitStatus) errText mArtifact
+              -- When output is spooled, compactOutput already captures the combined stdout/stderr summary.
+              -- Cap resultStderr so raw unspooled megabytes never bypass compaction to remote API payloads.
+              let boundedErr = case mArtifact of
+                    Just _ -> ""
+                    Nothing -> if T.length errText > 2000 then T.takeEnd 2000 errText else errText
+
+              pure $ ToolResult "" (compactOutput <> exitStatus) boundedErr mArtifact
   }
 
 -- | Resolves a path, preserving absolute paths and making relative paths workspace-relative
