@@ -1461,7 +1461,8 @@ testDynamicModelSwitching = do
 
   -- 3. Dynamic Model Switching via Engine Loop
   sec <- initSecurity [] []
-  cfg <- loadConfig "."
+  cfgRaw <- loadConfig "."
+  let cfg = cfgRaw { apiBaseUrl = "https://openrouter.ai/api/v1" }
   let tools = builtinTools "." ".lambda/artifacts"
       reg = registerTools tools emptyRegistry
   es <- initEngineState cfg reg sec

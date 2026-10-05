@@ -25,6 +25,7 @@ module Lambda.Config
   ) where
 
 import Control.Applicative ((<|>))
+import Control.Exception (catch, IOException)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:?), (.!=))
 import qualified Data.Aeson.Key as Key
@@ -380,8 +381,8 @@ loadConfig wsRoot = do
 
   let artDir = wsRoot </> ".lambda" </> "artifacts"
 
-  createDirectoryIfMissing True artDir
-  createDirectoryIfMissing True (home </> ".config" </> "lambdA")
+  createDirectoryIfMissing True artDir `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True (home </> ".config" </> "lambdA") `catch` (\(_ :: IOException) -> pure ())
 
   pure mergedCfg
     { apiBaseUrl         = finalUrl

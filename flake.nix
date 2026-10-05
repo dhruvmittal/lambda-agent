@@ -23,6 +23,10 @@
         };
 
         packages.default = hp.callCabal2nix "lambda" ./. {};
+
+        apps.default = flake-utils.lib.mkApp {
+          drv = self.packages.${system}.default;
+        };
       }
     );
 }
