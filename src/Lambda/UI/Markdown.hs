@@ -225,10 +225,11 @@ initVtyUnicodeWidthTable = do
   let rKeycap = VtyTable.WidthTableRange 0x20E3 1 1     -- Combining enclosing keycap (turns 1️⃣..9️⃣ into width 2)
       rTime1  = VtyTable.WidthTableRange 0x231A 2 2     -- ⌚, ⌛
       rTime2  = VtyTable.WidthTableRange 0x23E9 12 2    -- ⏩..⏳ (0x23E9..0x23F3)
-      rDing   = VtyTable.WidthTableRange 0x2600 0x200 2 -- Misc Symbols & Dingbats (0x2600..0x27BF, e.g. ⚠️, ✅, ❌, ✨)
+      rWarn   = VtyTable.WidthTableRange 0x26A0 1 2     -- ⚠️ Warning
+      rCheck  = VtyTable.WidthTableRange 0x2705 1 2     -- ✅ Checkmark emoji
       rStar   = VtyTable.WidthTableRange 0x2B50 6 2     -- ⭐, ⭕, etc.
       rEmoji1 = VtyTable.WidthTableRange 0x1F000 0xB00 2 -- SMP Emojis & Pictographs (0x1F000..0x1FAFF)
-      tbl = VtyTable.UnicodeWidthTable [rKeycap, rTime1, rTime2, rDing, rStar, rEmoji1]
+      tbl = VtyTable.UnicodeWidthTable [rKeycap, rTime1, rTime2, rWarn, rCheck, rStar, rEmoji1]
   VtyInstall.installUnicodeWidthTable tbl
 
 -- | Compute visual terminal column width of a text string using Vty's active width table
