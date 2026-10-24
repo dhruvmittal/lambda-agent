@@ -631,7 +631,7 @@ handleCommand cmdText = do
             , "- `/exec` - Switch to Exec mode (full tool execution access)"
             , "- `/mode [mode]` - Inspect or switch active mode (`/mode plan`, `/mode exec`)"
             , "- `/model [name]` - Inspect or switch active model (`/model claude`, `/model r1`, `/model 4o`)"
-            , "- `/theme [name]` - Inspect or switch UI colorscheme (`default`, `solarized-dark`, `solarized-light`, `nordic`, `zenburn`, `dracula`)"
+            , "- `/theme [name]` - Inspect or switch UI colorscheme (`default`, `solarized-dark`, `solarized-light`, `nordic`, `zenburn`, `dracula`, `tokyonight`, `gruvbox`, `gruvbox-dark`)"
             , "- `/think` - Toggle reasoning / thinking block visibility"
             , "- `/session` - List recent sessions (`/session <id>` to switch, `/session prune <N>`)"
             , "- `/fork [title]` - Fork active conversation into a new child session"

@@ -2692,7 +2692,7 @@ testThemeEngineAndCompletion :: IO ()
 testThemeEngineAndCompletion = do
   putStrLn "\n[Test 57] Theme Engine Palettes, Custom Hex Parsing, and /theme Autocomplete"
   -- 1. Verify all requested built-in themes exist and never use broken ANSI 8 (V.brightBlack) for tpFgDim
-  let expectedBuiltins = ["default", "solarized-dark", "solarized-light", "nordic", "zenburn", "dracula"]
+  let expectedBuiltins = ["default", "solarized-dark", "solarized-light", "nordic", "zenburn", "dracula", "tokyonight", "gruvbox", "gruvbox-dark"]
   mapM_ (\name -> do
     let mPal = resolveThemePalette defaultConfig name
     assert ("Built-in theme " <> T.unpack name <> " resolves") (mPal /= Nothing)
@@ -2702,8 +2702,8 @@ testThemeEngineAndCompletion = do
     ) expectedBuiltins
 
   -- 2. Verify hex color parser and custom user theme fallback resolution
-  assert "Valid hex #2e3440 parses" (parseHexColor "#2e3440" == Just (V.srgbColor 0x2e 0x34 0x40))
-  assert "Valid hex without hash parses" (parseHexColor "ff5555" == Just (V.srgbColor 0xff 0x55 0x55))
+  assert "Valid hex #2e3440 parses" (parseHexColor "#2e3440" == Just (V.linearColor 0x2e 0x34 0x40))
+  assert "Valid hex without hash parses" (parseHexColor "ff5555" == Just (V.linearColor 0xff 0x55 0x55))
   assert "Invalid hex rejected" (parseHexColor "#12345" == Nothing)
 
   let customCfg = defaultConfig
@@ -2713,8 +2713,8 @@ testThemeEngineAndCompletion = do
         }
   case resolveThemePalette customCfg "custom-cyber" of
     Just pal -> do
-      assert "Custom theme bg parsed" (tpBg pal == Just (V.srgbColor 0x10 0x10 0x18))
-      assert "Custom theme fg_dim parsed" (tpFgDim pal == V.srgbColor 0x88 0x99 0xaa)
+      assert "Custom theme bg parsed" (tpBg pal == Just (V.linearColor 0x10 0x10 0x18))
+      assert "Custom theme fg_dim parsed" (tpFgDim pal == V.linearColor 0x88 0x99 0xaa)
     Nothing -> failTest "Custom theme failed to resolve"
 
   -- 2b. Verify persistTheme on an existing config.json does not hit lazy ByteString file lock

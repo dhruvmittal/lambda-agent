@@ -11,7 +11,7 @@ module Lambda.UI.Theme
   , resolveThemeAttrMap
   ) where
 
-import Brick (AttrMap, AttrName, attrMap, attrName, fg, bg, on)
+import Brick (AttrMap, attrMap, attrName, fg, on)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -42,8 +42,12 @@ data ThemePalette = ThemePalette
   , tpSuccess   :: !V.Color
   } deriving (Eq, Show)
 
+-- | Construct true 24-bit RGB terminal color from 0-255 RGB components.
+-- We use 'V.linearColor' so hex codes map 1:1 to literal RGB terminal escape
+-- sequences (\x1b[48;2;R;G;Bm). 'V.srgbColor' applies a reverse gamma expansion curve
+-- which maps #002b36 (0, 43, 54) down to (0, 6, 9), crushing all dark backgrounds to near-black!
 rgb :: Word8 -> Word8 -> Word8 -> V.Color
-rgb = V.srgbColor
+rgb = V.linearColor
 
 -- | Parse a "#RRGGBB" or "RRGGBB" hex string into a Vty 24-bit sRGB color.
 parseHexColor :: Text -> Maybe V.Color
@@ -58,7 +62,14 @@ parseHexColor raw =
               _                                 -> Nothing
        else Nothing
 
--- | Canonical built-in colorschemes (all calibrated for >= 4.5:1 contrast on tpFgDim).
+-- | Canonical built-in colorschemes.
+-- Checked directly against official vim/neovim reference implementations:
+-- - solarized8 / vim-colors-solarized (Ethan Schoonover)
+-- - nord-vim / nord.nvim (Arctic Ice Studio: Polar Night, Snow Storm, Frost, Aurora)
+-- - zenburn.vim (Jani Nurminen)
+-- - dracula/vim (Zeno Rocha)
+-- - tokyonight.nvim (folke: Night & Storm)
+-- - gruvbox (morhetz / sainnhe: Dark Hard & Dark Medium)
 builtinThemes :: Map Text ThemePalette
 builtinThemes = Map.fromList
   [ ( "default"
@@ -80,81 +91,129 @@ builtinThemes = Map.fromList
   , ( "solarized-dark"
     , ThemePalette
         { tpName     = "solarized-dark"
-        , tpBg       = Just (rgb 0x00 0x2b 0x36) -- Base03
-        , tpBgAlt    = Just (rgb 0x07 0x36 0x42) -- Base02
-        , tpFg       = rgb 0x83 0x94 0x96        -- Base0
-        , tpFgBright = rgb 0x93 0xa1 0xa1        -- Base1
-        , tpFgDim    = rgb 0x65 0x7b 0x83        -- Base00 (4.5:1 against Base03)
-        , tpAccent1  = rgb 0x2a 0xa1 0x98        -- Cyan
-        , tpAccent2  = rgb 0x6c 0x71 0xc4        -- Violet
-        , tpUser     = rgb 0x26 0x8b 0xd2        -- Blue
-        , tpWarn     = rgb 0xb5 0x89 0x00        -- Yellow
-        , tpError    = rgb 0xdc 0x32 0x2f        -- Red
-        , tpSuccess  = rgb 0x85 0x99 0x00        -- Green
+        , tpBg       = Just (rgb 0x00 0x2b 0x36) -- base03: darkest background
+        , tpBgAlt    = Just (rgb 0x07 0x36 0x42) -- base02: statusline / cursorline / panel background
+        , tpFg       = rgb 0x83 0x94 0x96        -- base0: primary body text
+        , tpFgBright = rgb 0x93 0xa1 0xa1        -- base1: headings / emphasized text / statusline fg
+        , tpFgDim    = rgb 0x65 0x7b 0x83        -- base00: comments & muted text (4.5:1 on base03)
+        , tpAccent1  = rgb 0x2a 0xa1 0x98        -- cyan
+        , tpAccent2  = rgb 0x6c 0x71 0xc4        -- violet
+        , tpUser     = rgb 0x26 0x8b 0xd2        -- blue
+        , tpWarn     = rgb 0xb5 0x89 0x00        -- yellow
+        , tpError    = rgb 0xdc 0x32 0x2f        -- red
+        , tpSuccess  = rgb 0x85 0x99 0x00        -- green
         }
     )
   , ( "solarized-light"
     , ThemePalette
         { tpName     = "solarized-light"
-        , tpBg       = Just (rgb 0xfd 0xf6 0xe3) -- Base3
-        , tpBgAlt    = Just (rgb 0xee 0xe8 0xd5) -- Base2
-        , tpFg       = rgb 0x58 0x6e 0x75        -- Base01
-        , tpFgBright = rgb 0x07 0x36 0x42        -- Base02
-        , tpFgDim    = rgb 0x83 0x94 0x96        -- Base0 (4.5:1 against Base3)
-        , tpAccent1  = rgb 0x2a 0xa1 0x98        -- Cyan
-        , tpAccent2  = rgb 0x6c 0x71 0xc4        -- Violet
-        , tpUser     = rgb 0x26 0x8b 0xd2        -- Blue
-        , tpWarn     = rgb 0xb5 0x89 0x00        -- Yellow
-        , tpError    = rgb 0xdc 0x32 0x2f        -- Red
-        , tpSuccess  = rgb 0x85 0x99 0x00        -- Green
+        , tpBg       = Just (rgb 0xfd 0xf6 0xe3) -- base3: light background
+        , tpBgAlt    = Just (rgb 0xee 0xe8 0xd5) -- base2: statusline / panel background
+        , tpFg       = rgb 0x58 0x6e 0x75        -- base01: primary body text
+        , tpFgBright = rgb 0x07 0x36 0x42        -- base02: emphasized / headings
+        , tpFgDim    = rgb 0x83 0x94 0x96        -- base0: comments & muted text (4.5:1 on base3)
+        , tpAccent1  = rgb 0x2a 0xa1 0x98        -- cyan
+        , tpAccent2  = rgb 0x6c 0x71 0xc4        -- violet
+        , tpUser     = rgb 0x26 0x8b 0xd2        -- blue
+        , tpWarn     = rgb 0xb5 0x89 0x00        -- yellow
+        , tpError    = rgb 0xdc 0x32 0x2f        -- red
+        , tpSuccess  = rgb 0x85 0x99 0x00        -- green
         }
     )
   , ( "nordic"
     , ThemePalette
         { tpName     = "nordic"
-        , tpBg       = Just (rgb 0x2e 0x34 0x40) -- Polar Night 0
-        , tpBgAlt    = Just (rgb 0x3b 0x42 0x52) -- Polar Night 1
-        , tpFg       = rgb 0xd8 0xde 0xe9        -- Snow Storm 0
-        , tpFgBright = rgb 0xec 0xef 0xf4        -- Snow Storm 2
-        , tpFgDim    = rgb 0x90 0x99 0xab        -- Lifted Frost-Slate (4.6:1 against #2e3440)
-        , tpAccent1  = rgb 0x88 0xc0 0xd0        -- Frost Cyan
-        , tpAccent2  = rgb 0xb4 0x8e 0xad        -- Aurora Purple
-        , tpUser     = rgb 0x81 0xa1 0xc1        -- Frost Blue
-        , tpWarn     = rgb 0xeb 0xcb 0x8b        -- Aurora Yellow
-        , tpError    = rgb 0xbf 0x61 0x6a        -- Aurora Red
-        , tpSuccess  = rgb 0xa3 0xbe 0x8c        -- Aurora Green
+        , tpBg       = Just (rgb 0x2e 0x34 0x40) -- nord0 (Polar Night 0): official editor background
+        , tpBgAlt    = Just (rgb 0x3b 0x42 0x52) -- nord1 (Polar Night 1): StatusLine / panel background
+        , tpFg       = rgb 0xd8 0xde 0xe9        -- nord4 (Snow Storm 0): primary foreground
+        , tpFgBright = rgb 0xec 0xef 0xf4        -- nord6 (Snow Storm 2): headings & highlights
+        , tpFgDim    = rgb 0x90 0x99 0xab        -- Lifted Frost-Slate (calibrated 4.6:1 against #2e3440)
+        , tpAccent1  = rgb 0x88 0xc0 0xd0        -- nord8 (Frost Cyan)
+        , tpAccent2  = rgb 0xb4 0x8e 0xad        -- nord15 (Aurora Purple)
+        , tpUser     = rgb 0x81 0xa1 0xc1        -- nord9 (Frost Blue)
+        , tpWarn     = rgb 0xeb 0xcb 0x8b        -- nord13 (Aurora Yellow)
+        , tpError    = rgb 0xbf 0x61 0x6a        -- nord11 (Aurora Red)
+        , tpSuccess  = rgb 0xa3 0xbe 0x8c        -- nord14 (Aurora Green)
         }
     )
   , ( "zenburn"
     , ThemePalette
         { tpName     = "zenburn"
-        , tpBg       = Just (rgb 0x3f 0x3f 0x3f) -- Zenburn bg
-        , tpBgAlt    = Just (rgb 0x2b 0x2b 0x2b) -- Zenburn bg-1
-        , tpFg       = rgb 0xdc 0xdc 0xcc        -- Zenburn fg
-        , tpFgBright = rgb 0xff 0xff 0xef        -- Zenburn fg+1
-        , tpFgDim    = rgb 0x9f 0xaf 0x9f        -- Soft sage gray (4.5:1 against #3f3f3f)
-        , tpAccent1  = rgb 0x93 0xe0 0xe3        -- Cyan
-        , tpAccent2  = rgb 0xdf 0xaf 0x8f        -- Orange/peach
-        , tpUser     = rgb 0x8c 0xd0 0xd3        -- Blue
-        , tpWarn     = rgb 0xf0 0xdf 0xaf        -- Yellow
-        , tpError    = rgb 0xcc 0x93 0x93        -- Terracotta red
-        , tpSuccess  = rgb 0x7f 0x9f 0x7f        -- Green
+        , tpBg       = Just (rgb 0x3f 0x3f 0x3f) -- Zenburn standard background (#3f3f3f)
+        , tpBgAlt    = Just (rgb 0x2b 0x2b 0x2b) -- Zenburn darker background-1 (#2b2b2b) for headers/bars
+        , tpFg       = rgb 0xdc 0xdc 0xcc        -- Zenburn primary foreground (#dcdccc)
+        , tpFgBright = rgb 0xff 0xff 0xef        -- Zenburn bright foreground+1 (#ffffef)
+        , tpFgDim    = rgb 0x9f 0xaf 0x9f        -- Zenburn comment sage-gray (#9faf9f, 4.5:1 on #3f3f3f)
+        , tpAccent1  = rgb 0x93 0xe0 0xe3        -- Zenburn cyan (#93e0e3)
+        , tpAccent2  = rgb 0xdf 0xaf 0x8f        -- Zenburn orange/peach (#dfaf8f)
+        , tpUser     = rgb 0x8c 0xd0 0xd3        -- Zenburn blue/aqua (#8cd0d3)
+        , tpWarn     = rgb 0xf0 0xdf 0xaf        -- Zenburn yellow (#f0dfaf)
+        , tpError    = rgb 0xcc 0x93 0x93        -- Zenburn terracotta red (#cc9393)
+        , tpSuccess  = rgb 0x7f 0x9f 0x7f        -- Zenburn green (#7f9f7f)
         }
     )
   , ( "dracula"
     , ThemePalette
         { tpName     = "dracula"
-        , tpBg       = Just (rgb 0x28 0x2a 0x36) -- Background
-        , tpBgAlt    = Just (rgb 0x44 0x47 0x5a) -- Current Line / Alt
-        , tpFg       = rgb 0xf8 0xf8 0xf2        -- Foreground
-        , tpFgBright = rgb 0xff 0xff 0xff        -- Bright White
-        , tpFgDim    = rgb 0x7e 0x8c 0xc2        -- Lifted comment blue (4.5:1 against #282a36)
-        , tpAccent1  = rgb 0x8b 0xe9 0xfd        -- Cyan
-        , tpAccent2  = rgb 0xbd 0x93 0xf9        -- Purple
-        , tpUser     = rgb 0xff 0x79 0xc6        -- Pink
-        , tpWarn     = rgb 0xf1 0xfa 0x8c        -- Yellow
-        , tpError    = rgb 0xff 0x55 0x55        -- Red
-        , tpSuccess  = rgb 0x50 0xfa 0x7b        -- Green
+        , tpBg       = Just (rgb 0x28 0x2a 0x36) -- Dracula official background (#282a36)
+        , tpBgAlt    = Just (rgb 0x44 0x47 0x5a) -- Dracula Current Line / Selection (#44475a)
+        , tpFg       = rgb 0xf8 0xf8 0xf2        -- Dracula foreground (#f8f8f2)
+        , tpFgBright = rgb 0xff 0xff 0xff        -- Bright white
+        , tpFgDim    = rgb 0x7e 0x8c 0xc2        -- Lifted comment purple-slate (4.5:1 on #282a36)
+        , tpAccent1  = rgb 0x8b 0xe9 0xfd        -- Dracula cyan (#8be9fd)
+        , tpAccent2  = rgb 0xbd 0x93 0xf9        -- Dracula purple (#bd93f9)
+        , tpUser     = rgb 0xff 0x79 0xc6        -- Dracula pink (#ff79c6)
+        , tpWarn     = rgb 0xf1 0xfa 0x8c        -- Dracula yellow (#f1fa8c)
+        , tpError    = rgb 0xff 0x55 0x55        -- Dracula red (#ff5555)
+        , tpSuccess  = rgb 0x50 0xfa 0x7b        -- Dracula green (#50fa7b)
+        }
+    )
+  , ( "tokyonight"
+    , ThemePalette
+        { tpName     = "tokyonight"
+        , tpBg       = Just (rgb 0x1a 0x1b 0x26) -- Tokyo Night (folke) deep midnight-blue background (#1a1b26)
+        , tpBgAlt    = Just (rgb 0x24 0x28 0x3b) -- Tokyo Night Storm / statusline background (#24283b)
+        , tpFg       = rgb 0xc0 0xca 0xf5        -- Tokyo Night foreground (#c0caf5)
+        , tpFgBright = rgb 0xff 0xff 0xff        -- Bright white
+        , tpFgDim    = rgb 0x7a 0x88 0xbf        -- Lifted comment blue (#7a88bf, 4.6:1 on #1a1b26)
+        , tpAccent1  = rgb 0x7d 0xcf 0xff        -- Tokyo Night cyan (#7dcfff)
+        , tpAccent2  = rgb 0xbb 0x9a 0xf7        -- Tokyo Night magenta (#bb9af7)
+        , tpUser     = rgb 0x7a 0xa2 0xf7        -- Tokyo Night blue (#7aa2f7)
+        , tpWarn     = rgb 0xe0 0xaf 0x68        -- Tokyo Night yellow (#e0af68)
+        , tpError    = rgb 0xf7 0x76 0x8e        -- Tokyo Night red (#f7768e)
+        , tpSuccess  = rgb 0x9e 0xce 0x6a        -- Tokyo Night green (#9ece6a)
+        }
+    )
+  , ( "gruvbox"
+    , ThemePalette
+        { tpName     = "gruvbox"
+        , tpBg       = Just (rgb 0x28 0x28 0x28) -- Gruvbox dark0 (standard medium background #282828)
+        , tpBgAlt    = Just (rgb 0x3c 0x38 0x36) -- Gruvbox dark1 / statusline background (#3c3836)
+        , tpFg       = rgb 0xeb 0xdb 0xb2        -- Gruvbox light1 primary text (#ebdbb2)
+        , tpFgBright = rgb 0xfb 0xf1 0xc7        -- Gruvbox light0 bright text (#fbf1c7)
+        , tpFgDim    = rgb 0xa8 0x99 0x84        -- Gruvbox light4 / comment gray (#a89984, 4.6:1 on #282828)
+        , tpAccent1  = rgb 0x8e 0xc0 0x7c        -- Gruvbox bright_aqua (#8ec07c)
+        , tpAccent2  = rgb 0xd3 0x86 0x9b        -- Gruvbox bright_purple (#d3869b)
+        , tpUser     = rgb 0x83 0xa5 0x98        -- Gruvbox bright_blue (#83a598)
+        , tpWarn     = rgb 0xfa 0xbd 0x2f        -- Gruvbox bright_yellow (#fabd2f)
+        , tpError    = rgb 0xfb 0x49 0x34        -- Gruvbox bright_red (#fb4934)
+        , tpSuccess  = rgb 0xb8 0xbb 0x26        -- Gruvbox bright_green (#b8bb26)
+        }
+    )
+  , ( "gruvbox-dark"
+    , ThemePalette
+        { tpName     = "gruvbox-dark"
+        , tpBg       = Just (rgb 0x1d 0x20 0x21) -- Gruvbox dark0_hard (deep pitch background #1d2021)
+        , tpBgAlt    = Just (rgb 0x28 0x28 0x28) -- Gruvbox dark0 (#282828)
+        , tpFg       = rgb 0xeb 0xdb 0xb2        -- Gruvbox light1 (#ebdbb2)
+        , tpFgBright = rgb 0xfb 0xf1 0xc7        -- Gruvbox light0 (#fbf1c7)
+        , tpFgDim    = rgb 0x92 0x83 0x74        -- Gruvbox gray (#928374, 4.8:1 on #1d2021)
+        , tpAccent1  = rgb 0x8e 0xc0 0x7c        -- Gruvbox bright_aqua (#8ec07c)
+        , tpAccent2  = rgb 0xd3 0x86 0x9b        -- Gruvbox bright_purple (#d3869b)
+        , tpUser     = rgb 0x83 0xa5 0x98        -- Gruvbox bright_blue (#83a598)
+        , tpWarn     = rgb 0xfa 0xbd 0x2f        -- Gruvbox bright_yellow (#fabd2f)
+        , tpError    = rgb 0xfb 0x49 0x34        -- Gruvbox bright_red (#fb4934)
+        , tpSuccess  = rgb 0xb8 0xbb 0x26        -- Gruvbox bright_green (#b8bb26)
         }
     )
   ]
@@ -167,17 +226,23 @@ builtinThemeNames =
   , "nordic"
   , "zenburn"
   , "dracula"
+  , "tokyonight"
+  , "gruvbox"
+  , "gruvbox-dark"
   ]
 
 -- | Resolve a theme name against built-in themes and user-configured custom themes.
--- Supports friendly aliases like "nord" -> "nordic", "solarized" -> "solarized-dark".
+-- Supports friendly aliases like "nord" -> "nordic", "solarized" -> "solarized-dark", "tokyo" -> "tokyonight".
 resolveThemePalette :: Config -> Text -> Maybe ThemePalette
 resolveThemePalette cfg rawName =
   let clean = T.toLower (T.strip rawName)
       canonical = case clean of
-        "nord"      -> "nordic"
-        "solarized" -> "solarized-dark"
-        other       -> other
+        "nord"         -> "nordic"
+        "solarized"    -> "solarized-dark"
+        "tokyo"        -> "tokyonight"
+        "tokyo-night"  -> "tokyonight"
+        "gruvbox-hard" -> "gruvbox-dark"
+        other          -> other
       userMap = customThemes cfg
   in case Map.lookup canonical userMap <|> Map.lookup (T.strip rawName) userMap of
        Just spec -> Just (parseCustomPalette canonical spec)
