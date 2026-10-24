@@ -7,6 +7,11 @@ module Lambda.UI.Draw
   , renderSubAgentsSelected
   , renderInlineSubAgent
   , renderCompletionLine
+  , renderPowerlinePrompt
+  , wrapLineWithSpans
+  , wrapLineWithWidths
+  , wrapEditorToVisual
+  , wrapEditorToVisualWithFirstWidth
   ) where
 
 import Brick
@@ -26,7 +31,7 @@ import qualified Data.Text.Encoding as TE
 
 import Data.Time.Format (defaultTimeLocale, formatTime)
 
-import Lambda.Config (Config(..), formatEndpointBadge)
+import Lambda.Config (Config(..), extractProviderAndModel)
 import Lambda.Engine.Compactor (estimateTotalTokens)
 import Lambda.Engine.Session (SessionMeta(..))
 import Lambda.Types
@@ -292,7 +297,7 @@ headerBar workingState mSelected =
         [ withAttr (attrName "titleLogo") (str " λ lambdA ")
         , str " │ "
         , str "Goal: "
-        , txt (extractGoal workingState)
+        , hLimit 55 $ txt (extractGoal workingState)
         , case mSelected of
             Just sId -> hBox [ str " │ ", withAttr (attrName "selectedBadge") (str $ " [SUBAGENT #" <> show sId <> "] ") ]
             Nothing  -> emptyWidget
@@ -441,39 +446,145 @@ renderCompletionLine (Just (CompletionState cands sel))
         then withAttr (attrName "compSelected") (txt ("[" <> candDisplay cand <> "]"))
         else withAttr (attrName "compItem") (txt (candDisplay cand))
 
+-- | Splits a single line into visual lines of custom widths for first slice and rest slices.
+wrapLineWithWidths :: Int -> Int -> Text -> [(Text, Int, Int)]
+wrapLineWithWidths firstW restW line
+  | T.null line = [("", 0, 0)]
+  | otherwise =
+      let go isFirst offset remText
+            | T.null remText = []
+            | otherwise =
+                let w = if isFirst then max 10 firstW else max 10 restW
+                    len = T.length remText
+                in if len <= w
+                     then [(remText, offset, offset + len)]
+                     else
+                       let prefix = T.take w remText
+                       in case T.findIndex (== ' ') (T.reverse prefix) of
+                            Just revSpaceIdx | revSpaceIdx < w - 1 ->
+                              let cutPoint = w - revSpaceIdx
+                                  slice = T.take cutPoint remText
+                                  rest = T.drop cutPoint remText
+                              in (slice, offset, offset + cutPoint) : go False (offset + cutPoint) rest
+                            _ ->
+                              let slice = prefix
+                                  rest = T.drop w remText
+                              in (slice, offset, offset + w) : go False (offset + w) rest
+      in go True 0 line
+
+-- | Splits a single line into visual lines of at most `maxW` width, using word wrapping
+-- when spaces exist, or character slicing for long tokens.
+wrapLineWithSpans :: Int -> Text -> [(Text, Int, Int)]
+wrapLineWithSpans maxW = wrapLineWithWidths maxW maxW
+
+-- | Wraps all logical lines in an editor with separate first-line and rest-line widths,
+-- mapping the logical 2D cursor position (curCol, curRow) onto visual lines.
+wrapEditorToVisualWithFirstWidth :: Int -> Int -> [Text] -> (Int, Int) -> ([Text], (Int, Int))
+wrapEditorToVisualWithFirstWidth firstW restW rawLines (curCol, curRow) =
+  let linesToWrap = if null rawLines then [""] else rawLines
+      clampedCurRow = max 0 (min (length linesToWrap - 1) curRow)
+      
+      processLine rowIdx l =
+        let spans = if rowIdx == 0
+                      then wrapLineWithWidths firstW restW l
+                      else wrapLineWithSpans restW l
+            lastEnd = case reverse spans of
+              ((_, _, e):_) -> e
+              []            -> 0
+            currSpanW = if rowIdx == 0 && null (drop 1 spans) then firstW else restW
+            adjustedSpans =
+              if rowIdx == clampedCurRow && curCol > 0 && curCol == lastEnd && (curCol `mod` max 10 currSpanW == 0)
+                then spans ++ [("", lastEnd, lastEnd)]
+                else spans
+            
+            findPos [] = (0, 0)
+            findPos (s:ss) =
+              let (_, start, end) = s
+              in if null ss || curCol < end
+                   then (max 0 (curCol - start), 0)
+                   else let (c, r) = findPos ss in (c, r + 1)
+                   
+            mCurPos = if rowIdx == clampedCurRow then Just (findPos adjustedSpans) else Nothing
+        in (map (\(t, _, _) -> t) adjustedSpans, mCurPos, length adjustedSpans)
+        
+      results = zipWith processLine [0..] linesToWrap
+      allVisualLines = concat [ vs | (vs, _, _) <- results ]
+      
+      findGlobalCursor _ [] = (0, 0)
+      findGlobalCursor accRow ((_, Just (vc, vr), _):_) = (vc, accRow + vr)
+      findGlobalCursor accRow ((_, Nothing, count):rest) = findGlobalCursor (accRow + count) rest
+      
+      visCursor = findGlobalCursor 0 results
+  in (allVisualLines, visCursor)
+
+-- | Wraps all logical lines in an editor into visual lines of uniform width maxW
+wrapEditorToVisual :: Int -> [Text] -> (Int, Int) -> ([Text], (Int, Int))
+wrapEditorToVisual maxW = wrapEditorToVisualWithFirstWidth maxW maxW
+
 renderPowerlinePrompt :: AgentMode -> Text -> Text -> [Turn] -> Int -> E.Editor Text ResourceName -> Widget ResourceName
 renderPowerlinePrompt mode model baseUrl turns ctxLimit editor =
-  padTop (Pad 1) $
-    hBox
-      [ withAttr (attrName "promptLogo") (str " λ ")
-      , withAttr (attrName "promptDivider") (str " \\ ")
-      , modelWidget
-      , withAttr (attrName "promptDivider") (str " \\ ")
-      , withAttr ctxAttr (str (show pct <> "%"))
-      , withAttr (attrName "promptDivider") (str " \\ ")
-      , modeWidget mode
-      , withAttr (attrName "promptArrow") (str " > ")
-      , E.renderEditor (txt . T.unlines) True editor
-      ]
+  Widget Greedy Fixed $ do
+    c <- getContext
+    let totalW = c ^. availWidthL
+        promptArrowStr = "→ "
+        arrowW = 2
+        firstW = max 10 (totalW - arrowW)
+        restW = max 10 totalW
+        edContents = E.getEditContents editor
+        -- Brick's getCursorPosition returns (row, col)
+        (curRow, curCol) = E.getCursorPosition editor
+        (visualLines, (visCol, visRow)) =
+          wrapEditorToVisualWithFirstWidth firstW restW edContents (curCol, curRow)
+        visHeight = min 6 (max 1 (length visualLines))
+        screenCursorLoc =
+          Location (if visRow == 0 then visCol + arrowW else visCol, visRow)
+        renderVisualLine :: Int -> Text -> Widget ResourceName
+        renderVisualLine 0 l =
+          hBox
+            [ withAttr (attrName "promptArrow") (txt promptArrowStr)
+            , txt (if T.null l then " " else l)
+            ]
+        renderVisualLine _ l =
+          txt (if T.null l then " " else l)
+        edWidget =
+          vLimit visHeight $
+            viewport EditorInput Vertical $
+              showCursor EditorInput screenCursorLoc $
+                vBox (zipWith renderVisualLine [0..] visualLines)
+        topBadgeLine = renderStarshipBadgeLine mode model baseUrl turns ctxLimit totalW
+    render $
+      padTop (Pad 1) $
+        vBox
+          [ topBadgeLine
+          , edWidget
+          ]
   where
-    currentTokens = estimateTotalTokens turns
-    pct = if ctxLimit <= 0 then 0 else (currentTokens * 100) `div` ctxLimit
-    ctxAttr
-      | pct >= 90 = attrName "ctxHigh"
-      | pct >= 70 = attrName "ctxWarn"
-      | otherwise = attrName "ctxNormal"
-    badge = formatEndpointBadge baseUrl
-    modelWidget = case () of
-      _ | T.null baseUrl && T.null model ->
-            withAttr (attrName "toolError") (txt "NO PROVIDER CONFIGURED")
-      _ | T.null baseUrl ->
-            withAttr (attrName "toolError") (txt "NO BASE_URL")
-      _ | T.null model ->
-            withAttr (attrName "thinkingDim") (txt (badge <> "NO MODEL"))
-      _ ->
-            withAttr (attrName "promptModel") (txt (badge <> model))
-    modeWidget PlanMode = withAttr (attrName "promptPlanMode") (str " plan ")
-    modeWidget ExecMode = withAttr (attrName "promptExecMode") (str " exec ")
+    renderStarshipBadgeLine curMode curModel curBaseUrl curTurns curLimit totalW =
+      let currentTokens = estimateTotalTokens curTurns
+          pct = if curLimit <= 0 then 0 else (currentTokens * 100) `div` curLimit
+          ctxAttr
+            | pct >= 90 = attrName "promptCtxHigh"
+            | pct >= 70 = attrName "promptCtxWarn"
+            | otherwise = attrName "promptCtxNormal"
+          (providerStr, modelStr) = extractProviderAndModel curBaseUrl curModel
+
+          leftCap  = withAttr (attrName "promptBarCap") (txt "\xE0B6")
+          rightCap = withAttr (attrName "promptBarCap") (txt "\xE0B4")
+          divider  = withAttr (attrName "promptDivider") (txt " \\ ")
+
+          logoWidget     = withAttr (attrName "promptLogo") (txt " λ")
+          providerWidget = withAttr (attrName "promptProvider") (txt providerStr)
+          modelWidget    = withAttr (attrName "promptModel") (txt modelStr)
+          ctxWidget      = withAttr ctxAttr (txt (T.pack (show pct) <> "%"))
+          modeWidget     = case curMode of
+            PlanMode -> withAttr (attrName "promptPlanMode") (txt "plan ")
+            ExecMode -> withAttr (attrName "promptExecMode") (txt "exec ")
+
+          segments
+            | totalW < 45 = [logoWidget, divider, modelWidget, divider, modeWidget]
+            | totalW < 65 = [logoWidget, divider, providerWidget, divider, modelWidget, divider, modeWidget]
+            | otherwise   = [logoWidget, divider, providerWidget, divider, modelWidget, divider, ctxWidget, divider, modeWidget]
+      in hBox (leftCap : segments ++ [rightCap])
 
 
 renderSubAgents :: Map.Map Int SubAgentTask -> Widget ResourceName

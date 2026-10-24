@@ -31,6 +31,7 @@ allCommands =
   [ "/plan"
   , "/exec"
   , "/mode"
+  , "/goal"
   , "/model"
   , "/models"
   , "/theme"

@@ -27,7 +27,7 @@ import Lambda.Core.ToolProvider (toolsToOpenAISchema)
 import Lambda.Engine.Compactor (compactHistory, estimateTotalTokens)
 import Lambda.Engine.Dispatcher (executeToolDispatch)
 import Lambda.Engine.Security (SecurityState(..))
-import Lambda.Engine.Session (exportSessionTrace, loadSession, forkSession, Session(..))
+import Lambda.Engine.Session (exportSessionTrace, loadSession, forkSession, deriveTitle, Session(..))
 import Lambda.Engine.State
 import Lambda.Types
 
@@ -40,6 +40,21 @@ initEngineChannels :: TQueue EngineEvent -> IO EngineChannels
 initEngineChannels eQueue = do
   cQueue <- newTBQueueIO 64
   pure $ EngineChannels cQueue eQueue
+
+-- | Helper to non-destructively update BLOCKED_ON in the State Vector and notify UI
+updateBlockedOn :: AppEngineState -> Text -> IO ()
+updateBlockedOn AppEngineState{..} status = atomically $ do
+  curVec <- readTVar appStateVector
+  let linesVec = T.lines curVec
+      hasBlocked = any ("BLOCKED_ON:" `T.isPrefixOf`) linesVec
+      updatedVec = if hasBlocked
+        then T.unlines $ map (\l ->
+          if "BLOCKED_ON:" `T.isPrefixOf` l
+            then "BLOCKED_ON: " <> status
+            else l) linesVec
+        else curVec <> "\nBLOCKED_ON: " <> status
+  writeTVar appStateVector updatedVec
+  writeTQueue appEventQueue (EvWorkingStateUpdate updatedVec)
 
 -- | Starts the headless autonomous agent loop in a background thread
 startEngineLoop :: AppEngineState -> ModelDriver -> EngineChannels -> IO ()
@@ -83,13 +98,29 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
           let compacted = compactHistory 0 4 currentTurns
           writeTVar appTurns compacted
         persistCurrentSession engineState
-        emitEngineEvent engineState (EvWorkingStateUpdate "Context compaction auto-triggered on model switch.")
+        updateBlockedOn engineState "Compacting context..."
       persistCurrentSession engineState
       emitEngineEvent engineState (EvModelSwitched targetModel targetLimit)
       _ <- addTurn engineState SystemRole [TextBlock ("Switched active model to " <> targetModel <> " (context limit: " <> T.pack (show targetLimit) <> " tokens)")]
       engineWorkerLoop engineState driver channels activeTaskVar
     CmdCancelSubAgent sId -> do
       updateSubAgentStatus engineState sId (SubAgentBlocked "Cancelled by user")
+      engineWorkerLoop engineState driver channels activeTaskVar
+    CmdSetGoal newGoal -> do
+      atomically $ do
+        curVec <- readTVar appStateVector
+        let linesVec = T.lines curVec
+            hasGoal = any ("GOAL:" `T.isPrefixOf`) linesVec
+            updatedVec = if hasGoal
+              then T.unlines $ map (\l ->
+                if "GOAL:" `T.isPrefixOf` l
+                  then "GOAL: " <> newGoal
+                  else l) linesVec
+              else "GOAL: " <> newGoal <> "\n" <> curVec
+        writeTVar appStateVector updatedVec
+        writeTQueue appEventQueue (EvWorkingStateUpdate updatedVec)
+      persistCurrentSession engineState
+      _ <- addTurn engineState SystemRole [TextBlock ("Goal set to: " <> newGoal)]
       engineWorkerLoop engineState driver channels activeTaskVar
     CmdCompactHistory -> do
       -- Real context compaction trigger
@@ -98,7 +129,7 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
         let compacted = compactHistory 0 4 ts
         writeTVar appTurns compacted
       persistCurrentSession engineState
-      emitEngineEvent engineState (EvWorkingStateUpdate "Context compaction completed.")
+      updateBlockedOn engineState "Context compaction completed"
       engineWorkerLoop engineState driver channels activeTaskVar
     CmdSystemMessage msg -> do
       _ <- addTurn engineState SystemRole [TextBlock msg]
@@ -117,7 +148,7 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       ts <- readTVarIO appTurns
       let dropCount = max 1 (n * 2)
       if length ts <= 1
-        then emitEngineEvent engineState (EvWorkingStateUpdate "Cannot rewind: already at start of session.")
+        then updateBlockedOn engineState "Cannot rewind: at start of session"
         else do
           let remaining = take (max 1 (length ts - dropCount)) ts
               popped = drop (length remaining) ts
@@ -128,7 +159,7 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
             let updatedSubs = Map.map (\t -> if subAgentStatus t == SubAgentRunning then t { subAgentStatus = SubAgentBlocked "Cancelled on session rewind" } else t) subs
             writeTVar appSubAgents updatedSubs
           persistCurrentSession engineState
-          emitEngineEvent engineState (EvWorkingStateUpdate $ "Rewound " <> T.pack (show n) <> " turn(s). Previous turns saved to undo stack.")
+          updateBlockedOn engineState ("Rewound " <> T.pack (show n) <> " turn(s)")
       engineWorkerLoop engineState driver channels activeTaskVar
     CmdForkSession mTitle -> do
       currSess <- snapshotSession engineState
@@ -136,7 +167,7 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       restoreEngineSession engineState childSess
       persistCurrentSession engineState
       emitEngineEvent engineState (EvSessionSwitched (sessionId childSess) (sessionMode childSess) (sessionTurns childSess) (sessionSubAgents childSess))
-      emitEngineEvent engineState (EvWorkingStateUpdate $ "Forked into session " <> sessionId childSess)
+      updateBlockedOn engineState ("Forked into " <> sessionId childSess)
       engineWorkerLoop engineState driver channels activeTaskVar
     CmdSwitchSession sid -> do
       loadRes <- loadSession appSessionDir sid
@@ -159,17 +190,30 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
         Nothing   -> pure ()
 
       -- 1. Reset interrupt flag, update State Vector, and add user turn
-      let goalText = if "/goal " `T.isPrefixOf` promptText
-                       then T.strip (T.drop 6 promptText)
-                       else promptText
       atomically $ do
         writeTVar appInterrupted False
-        let newVec = "GOAL: " <> goalText
-                  <> "\nINVARIANTS: [Safe workspace ops, User grant required]"
-                  <> "\nACTIVE_HYPOTHESIS: Formulating execution path"
-                  <> "\nBLOCKED_ON: Model execution"
-        writeTVar appStateVector newVec
-        writeTQueue appEventQueue (EvWorkingStateUpdate newVec)
+        curVec <- readTVar appStateVector
+        let linesVec = T.lines curVec
+            hasGoal = any ("GOAL:" `T.isPrefixOf`) linesVec
+            currentGoal = case filter ("GOAL:" `T.isPrefixOf`) linesVec of
+              (g:_) -> T.strip (T.drop 5 g)
+              []    -> "Awaiting task"
+            newGoal
+              | "/goal " `T.isPrefixOf` promptText = T.strip (T.drop 6 promptText)
+              | currentGoal == "Awaiting task" || T.null currentGoal = deriveTitle promptText
+              | otherwise = currentGoal
+            updatedVec = if hasGoal
+              then T.unlines $ map (\l ->
+                case () of
+                  _ | "GOAL:" `T.isPrefixOf` l -> "GOAL: " <> newGoal
+                  _ | "BLOCKED_ON:" `T.isPrefixOf` l -> "BLOCKED_ON: Model execution"
+                  _ -> l) linesVec
+              else "GOAL: " <> newGoal
+                <> "\nINVARIANTS: [Safe workspace ops, User grant required]"
+                <> "\nACTIVE_HYPOTHESIS: Formulating execution path"
+                <> "\nBLOCKED_ON: Model execution"
+        writeTVar appStateVector updatedVec
+        writeTQueue appEventQueue (EvWorkingStateUpdate updatedVec)
 
       _ <- addTurn engineState UserRole [TextBlock promptText]
 

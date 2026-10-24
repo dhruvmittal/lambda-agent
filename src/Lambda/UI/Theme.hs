@@ -76,7 +76,7 @@ builtinThemes = Map.fromList
     , ThemePalette
         { tpName     = "default"
         , tpBg       = Nothing
-        , tpBgAlt    = Just V.blue
+        , tpBgAlt    = Just (rgb 0x21 0x26 0x2d) -- Modern elevated dark slate (#21262d)
         , tpFg       = V.white
         , tpFgBright = V.brightWhite
         , tpFgDim    = rgb 0x8b 0x94 0x9e -- Readable mid-slate (#8b949e) instead of broken ANSI 8 (brightBlack)
@@ -298,6 +298,11 @@ buildThemeAttrMap ThemePalette{..} =
       codeBlockAttr = case tpBgAlt of
         Just altBg | tpBg /= Nothing -> tpFgBright `on` altBg
         _                            -> withThemeBg tpFgBright
+      barBg = case tpBgAlt of
+        Just altBg -> altBg
+        Nothing    -> case tpBg of
+          Just b  -> b
+          Nothing -> rgb 0x21 0x26 0x2d
   in attrMap baseAttr
        [ (attrName "planBadge",      badgeTextBg `on` tpAccent1)
        , (attrName "execBadge",      badgeTextBg `on` tpWarn)
@@ -325,12 +330,32 @@ buildThemeAttrMap ThemePalette{..} =
        , (attrName "ctxWarn",        withThemeBg tpWarn `V.withStyle` V.bold)
        , (attrName "ctxHigh",        withThemeBg tpError `V.withStyle` V.bold)
        , (attrName "modelBadge",     withThemeBg tpAccent2)
-       , (attrName "promptLogo",     withThemeBg tpFgBright `V.withStyle` V.bold)
-       , (attrName "promptModel",    withThemeBg tpAccent2)
-       , (attrName "promptDivider",  withThemeBg tpFgDim)
-       , (attrName "promptArrow",    withThemeBg tpAccent1 `V.withStyle` V.bold)
-       , (attrName "promptPlanMode", badgeTextBg `on` tpAccent1)
-       , (attrName "promptExecMode", badgeTextBg `on` tpWarn)
+       , (attrName "promptBarCap",    withThemeBg barBg)
+       , (attrName "promptBarBase",   tpFg `on` barBg)
+       , (attrName "promptLogo",      (tpUser `on` barBg) `V.withStyle` V.bold)
+       , (attrName "promptProvider",  (tpAccent1 `on` barBg) `V.withStyle` V.bold)
+       , (attrName "promptModel",     tpAccent2 `on` barBg)
+       , (attrName "promptDivider",   tpFgDim `on` barBg)
+       , (attrName "promptArrow",     withThemeBg tpAccent1 `V.withStyle` V.bold)
+       , (attrName "promptPlanMode",  (tpAccent1 `on` barBg) `V.withStyle` V.bold)
+       , (attrName "promptExecMode",  (tpWarn `on` barBg) `V.withStyle` V.bold)
+       , (attrName "promptCtxNormal", tpSuccess `on` barBg)
+       , (attrName "promptCtxWarn",   (tpWarn `on` barBg) `V.withStyle` V.bold)
+       , (attrName "promptCtxHigh",   (tpError `on` barBg) `V.withStyle` V.bold)
+       , (attrName "pillLogoCap",       withThemeBg tpUser)
+       , (attrName "pillLogoBody",      badgeTextBg `on` tpUser `V.withStyle` V.bold)
+       , (attrName "pillModelCap",      withThemeBg tpAccent2)
+       , (attrName "pillModelBody",     badgeTextBg `on` tpAccent2)
+       , (attrName "pillCtxNormalCap",  withThemeBg tpAccent1)
+       , (attrName "pillCtxNormalBody", badgeTextBg `on` tpAccent1)
+       , (attrName "pillCtxWarnCap",    withThemeBg tpWarn)
+       , (attrName "pillCtxWarnBody",   badgeTextBg `on` tpWarn `V.withStyle` V.bold)
+       , (attrName "pillCtxHighCap",    withThemeBg tpError)
+       , (attrName "pillCtxHighBody",   badgeTextBg `on` tpError `V.withStyle` V.bold)
+       , (attrName "pillPlanCap",       withThemeBg tpAccent1)
+       , (attrName "pillPlanBody",      badgeTextBg `on` tpAccent1 `V.withStyle` V.bold)
+       , (attrName "pillExecCap",       withThemeBg tpWarn)
+       , (attrName "pillExecBody",      badgeTextBg `on` tpWarn `V.withStyle` V.bold)
        , (attrName "userAccent",     withThemeBg tpUser `V.withStyle` V.bold)
        , (attrName "turnFooter",     withThemeBg tpFgDim)
        , (attrName "hudBorder",      withThemeBg tpAccent1)

@@ -48,6 +48,11 @@ defaultAgentSystemPrompt = T.unlines
   , ""
   , "4. **Communication Style**:"
   , "   - Concise, rigorous, and action-oriented. Synthesize specialist findings and state next architectural steps clearly."
+  , ""
+  , "5. **Persistent Memory & MCP Tools**:"
+  , "   - External MCP tools (like StormDrain persistent memory) are accessed via `call_mcp_tool`."
+  , "   - Available tools and parameters are listed in the `call_mcp_tool` function specification."
+  , "   - Always invoke `call_mcp_tool` with `{\"name\": \"<tool_name>\", \"arguments\": { ... }}`."
   ]
 
 -- | Strips raw internal reasoning blocks from previous turns before remote API wire egress.

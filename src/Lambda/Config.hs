@@ -17,6 +17,8 @@ module Lambda.Config
   , isOpenAiEndpoint
   , isOpenRouterEndpoint
   , formatEndpointBadge
+  , deriveProviderFromUrl
+  , extractProviderAndModel
   , lookupModelContextLimit
   , curatedModels
   , resolveEnvTemplates
@@ -517,6 +519,40 @@ formatEndpointBadge :: Text -> Text
 formatEndpointBadge url
   | isLocalEndpoint url = "[local] "
   | otherwise           = ""
+
+-- | Derive human-readable provider name from API base URL
+deriveProviderFromUrl :: Text -> Text
+deriveProviderFromUrl url
+  | T.null url                  = "none"
+  | isOpenRouterEndpoint url    = "openrouter"
+  | isOpenAiEndpoint url        = "openai"
+  | isLocalEndpoint url         = "local"
+  | "anthropic" `T.isInfixOf` u = "anthropic"
+  | "groq" `T.isInfixOf` u       = "groq"
+  | "deepseek" `T.isInfixOf` u   = "deepseek"
+  | "together" `T.isInfixOf` u   = "together"
+  | otherwise =
+      let stripProto = T.replace "https://" "" (T.replace "http://" "" url)
+          host = T.takeWhile (\c -> c /= '/' && c /= ':') stripProto
+          parts = T.splitOn "." host
+      in case filter (\p -> p /= "api" && p /= "com" && p /= "ai" && p /= "io" && p /= "org") parts of
+           (p:_) -> p
+           _     -> if T.null host then "custom" else host
+  where
+    u = T.toLower url
+
+-- | Extract separate provider and model names from endpoint URL and configured model string
+extractProviderAndModel :: Text -> Text -> (Text, Text)
+extractProviderAndModel baseUrl rawModel
+  | T.null baseUrl && T.null rawModel = ("none", "none")
+  | "/" `T.isInfixOf` rawModel =
+      let (p, mWithSlash) = T.breakOn "/" rawModel
+          m = T.drop 1 mWithSlash
+          prov = if T.null p then deriveProviderFromUrl baseUrl else p
+          modl = if T.null m then "none" else m
+      in (prov, modl)
+  | otherwise =
+      (deriveProviderFromUrl baseUrl, if T.null rawModel then "none" else rawModel)
 
 -- | Resolve model alias taking active Config into account (user aliases, endpoint type)
 resolveModelWithConfig :: Config -> Text -> Text

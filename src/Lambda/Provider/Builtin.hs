@@ -3,6 +3,7 @@
 
 module Lambda.Provider.Builtin
   ( builtinTools
+  , callMcpToolDefinition
   , listDirectoryTool
   , fetchUrlTool
   , bashTool
@@ -45,7 +46,32 @@ builtinTools wsRoot artDir =
   , bashTool wsRoot artDir
   , writeFileTool wsRoot
   , editFileTool wsRoot
+  , callMcpToolDefinition
   ]
+
+-- | Gateway tool to invoke lazily loaded MCP tools with arguments
+callMcpToolDefinition :: ToolDefinition
+callMcpToolDefinition = ToolDefinition
+  { toolName = "call_mcp_tool"
+  , toolDescription = "Invoke a lazily-loaded MCP tool by name with arguments."
+  , toolParameters = Aeson.object
+      [ "type" .= ("object" :: Text)
+      , "properties" .= Aeson.object
+          [ "name" .= Aeson.object
+              [ "type" .= ("string" :: Text)
+              , "description" .= ("The name of the MCP tool to call (e.g. sd_read, sd_recall, sd_memory)" :: Text)
+              ]
+          , "arguments" .= Aeson.object
+              [ "type" .= ("object" :: Text)
+              , "description" .= ("JSON object of arguments for the MCP tool" :: Text)
+              ]
+          ]
+      , "required" .= (["name"] :: [Text])
+      ]
+  , toolCapability = ReadOnly
+  , toolIsMcp = False
+  , toolExecute = \_ _ -> pure (ToolResult "" "" "call_mcp_tool dispatched via engine" Nothing)
+  }
 
 -- | Bash execution tool with timeout and OOB artifact spooling
 bashTool :: FilePath -> FilePath -> ToolDefinition
@@ -67,6 +93,7 @@ bashTool wsRoot artDir = ToolDefinition
       , "required" .= (["command"] :: [Text])
       ]
   , toolCapability = Destructive
+  , toolIsMcp = False
   , toolExecute = \_caller args -> do
       case parseEither (Aeson.withObject "bash" $ \o -> (,) <$> o .: "command" <*> (o .:? "timeout_seconds")) args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
@@ -81,8 +108,11 @@ bashTool wsRoot artDir = ToolDefinition
                     $ shell (T.unpack cmd)
           res <- try $ timeout (effTimeout * 1000000) $ readProcess pConf
           case res of
-            Left (ex :: SomeException) ->
-              pure $ ToolResult "" "" ("Execution exception: " <> T.pack (show ex)) Nothing
+            Left (ex :: SomeException)
+              | "waitForProcess: does not exist" `T.isInfixOf` T.pack (show ex) ->
+                  pure $ ToolResult "" "" ("Command timed out after " <> T.pack (show effTimeout) <> " seconds.") Nothing
+              | otherwise ->
+                  pure $ ToolResult "" "" ("Execution exception: " <> T.pack (show ex)) Nothing
             Right Nothing ->
               pure $ ToolResult "" "" ("Command timed out after " <> T.pack (show effTimeout) <> " seconds.") Nothing
             Right (Just (exitCode, outBs, errBs)) -> do
@@ -124,6 +154,7 @@ listDirectoryTool wsRoot = ToolDefinition
           ]
       ]
   , toolCapability = ReadOnly
+  , toolIsMcp = False
   , toolExecute = \_caller args -> do
       let parseArgs = Aeson.withObject "list_directory" $ \o -> do
             p <- o .:? "path" .!= "."
@@ -167,6 +198,7 @@ readFileTool wsRoot = ToolDefinition
       , "required" .= (["path"] :: [Text])
       ]
   , toolCapability = ReadOnly
+  , toolIsMcp = False
   , toolExecute = \caller args -> do
       let parseArgs = Aeson.withObject "read_file" $ \o -> do
             p <- o .: "path"
@@ -221,6 +253,7 @@ writeFileTool wsRoot = ToolDefinition
       , "required" .= (["path", "content"] :: [Text])
       ]
   , toolCapability = Destructive
+  , toolIsMcp = False
   , toolExecute = \_caller args -> do
       let parseArgs = Aeson.withObject "write_file" $ \o -> do
             p <- o .: "path"
@@ -259,6 +292,7 @@ editFileTool wsRoot = ToolDefinition
       , "required" .= (["path", "target", "replacement"] :: [Text])
       ]
   , toolCapability = Destructive
+  , toolIsMcp = False
   , toolExecute = \_caller args -> do
       let parseArgs = Aeson.withObject "edit_file" $ \o -> do
             p <- o .: "path"
@@ -362,6 +396,7 @@ fetchUrlTool artDir = ToolDefinition
       , "required" .= (["url"] :: [Text])
       ]
   , toolCapability = ReadOnly
+  , toolIsMcp = False
   , toolExecute = \_caller args -> do
       case parseEither (Aeson.withObject "fetch_url" (.: "url")) args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing

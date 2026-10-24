@@ -205,6 +205,7 @@ data EngineEvent
 -- | Frontend to Engine dispatch commands
 data FrontendCommand
   = CmdUserPrompt !Text
+  | CmdSetGoal !Text
   | CmdSystemMessage !Text
   | CmdClearHistory
   | CmdSetMode !AgentMode

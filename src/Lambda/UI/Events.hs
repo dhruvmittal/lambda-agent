@@ -129,7 +129,7 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 'c') [V.MCtrl])) = do
         writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "⚠️ Generation interrupted (Ctrl+C)...")
       put st { uiIsGenerating = False }
     else if not (T.null editorText)
-      then put st { uiEditor = E.editor EditorInput (Just 1) "", uiCompletion = Nothing }
+      then put st { uiEditor = E.editor EditorInput Nothing "", uiCompletion = Nothing }
       else do
         liftIO $ atomically $
           writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "💡 Press Ctrl+D or type /quit to exit lambdA.")
@@ -588,6 +588,23 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 'n') mods))
             , uiEditor       = setEditorText recalled
             }
 
+-- Alt+Enter, Meta+Enter, Shift+Enter, Ctrl+Enter: Insert newline for multi-line prompt editing
+handleAppEvent (VtyEvent (V.EvKey V.KEnter mods))
+  | any (`elem` [V.MMeta, V.MAlt, V.MShift, V.MCtrl]) mods = do
+      modify $ \s -> s
+        { uiEditor     = E.applyEdit Z.breakLine (uiEditor s)
+        , uiCompletion = Nothing
+        }
+      vScrollToEnd (viewportScroll ChatView)
+
+-- Ctrl+J: Standard terminal line feed (insert newline)
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'j') [V.MCtrl])) = do
+  modify $ \s -> s
+    { uiEditor     = E.applyEdit Z.breakLine (uiEditor s)
+    , uiCompletion = Nothing
+    }
+  vScrollToEnd (viewportScroll ChatView)
+
 -- Keyboard Enter: Submit prompt, select session from chooser, or dispatch slash command
 handleAppEvent (VtyEvent (V.EvKey V.KEnter [])) = do
   st <- get
@@ -607,7 +624,7 @@ handleAppEvent (VtyEvent (V.EvKey V.KEnter [])) = do
       Just (CompletionState _ sel) | sel >= 0 -> do
         let fullCmd = T.strip (T.concat (E.getEditContents (uiEditor st)))
         put st
-          { uiEditor        = E.editor EditorInput (Just 1) ""
+          { uiEditor        = E.editor EditorInput Nothing ""
           , uiCompletion    = Nothing
           , uiHistoryIndex  = Nothing
           , uiSavedDraft    = ""
@@ -627,7 +644,7 @@ handleAppEvent (VtyEvent (V.EvKey V.KEnter [])) = do
                   _                      -> inputText : currentHist
             -- Reset input editor and history navigation state
             put st
-              { uiEditor        = E.editor EditorInput (Just 1) ""
+              { uiEditor        = E.editor EditorInput Nothing ""
               , uiPromptHistory = newHist
               , uiHistoryIndex  = Nothing
               , uiSavedDraft    = ""
@@ -745,6 +762,18 @@ handleCommand cmdText = do
       let modeStr = if uiMode st == PlanMode then "Plan (read-only)" else "Exec (full access)"
       liftIO $ atomically $ writeTBQueue (cmdQueue channels)
         (CmdSystemMessage $ "Current mode: " <> modeStr <> "\nUse '/mode plan' or '/mode exec' (or press Alt+M) to switch.")
+    "/goal" -> do
+      let curGoal = case filter ("GOAL:" `T.isPrefixOf`) (T.lines (uiWorkingState st)) of
+                      (g:_) -> T.strip (T.drop 5 g)
+                      []    -> "Awaiting task"
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+        (CmdSystemMessage $ "Current goal: " <> curGoal <> "\nUse '/goal <description>' to update the active goal.")
+    cmd | "/goal " `T.isPrefixOf` cmd -> do
+      let newGoal = T.strip (T.drop 6 cmd)
+      if T.null newGoal
+        then liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+               (CmdSystemMessage "Usage: /goal <description>")
+        else liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSetGoal newGoal)
     cmd | cmd `elem` ["/model", "/models"] -> do
       let baseUrl = apiBaseUrl (uiConfig st)
           providerStr = case () of
@@ -967,7 +996,7 @@ uiEditorLens f s = (\e -> s { uiEditor = e }) <$> f (uiEditor s)
 
 -- | Helper to populate editor content and place cursor at end of line
 setEditorText :: Text -> E.Editor Text ResourceName
-setEditorText strVal = E.applyEdit Z.gotoEOL (E.editor EditorInput (Just 1) strVal)
+setEditorText strVal = E.applyEdit Z.gotoEOL (E.editor EditorInput Nothing strVal)
 
 -- | Explicitly sets visibility of all thinking blocks across turns
 setThinkingVis :: BlockVisibility -> Turn -> Turn

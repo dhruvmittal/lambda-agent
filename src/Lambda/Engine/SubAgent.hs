@@ -77,6 +77,7 @@ submitReportTool reportVar = ToolDefinition
       , "required" .= (["status", "summary", "details"] :: [Text])
       ]
   , toolCapability = ReadOnly
+  , toolIsMcp = False
   , toolExecute = \_caller args -> do
       case parseEither parseReport args of
         Left err -> pure $ ToolResult "" "" ("Invalid submit_report arguments: " <> T.pack err) Nothing
@@ -334,6 +335,7 @@ spawnSpecialistSubAgentTool engineState driver = ToolDefinition
       , "required" .= (["role", "task"] :: [Text])
       ]
   , toolCapability = ReadOnly
+  , toolIsMcp = False
   , toolExecute = \_caller args -> do
       case parseEither parseSpecialistArgs args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
