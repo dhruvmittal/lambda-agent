@@ -6,7 +6,7 @@ module Main where
 import Brick
 import Brick.BChan (newBChan, writeBChan)
 import qualified Brick.Widgets.Edit as E
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.STM (atomically, readTQueue, writeTVar, readTVarIO)
 import Control.Monad (forever)
 import qualified Data.Map.Strict as Map
@@ -190,11 +190,15 @@ main = do
   channels <- initEngineChannels (appEventQueue engineState)
   startEngineLoop engineState driver channels
 
-  -- 7. Setup Brick event channel
+  -- 7. Setup Brick event channel and 80ms animation ticker
   eventChan <- newBChan 256
   _ <- forkIO $ forever $ do
     ev <- atomically $ readTQueue (evQueue channels)
     writeBChan eventChan ev
+
+  _ <- forkIO $ forever $ do
+    threadDelay 80000 -- 80ms tick (~12.5fps spinner)
+    writeBChan eventChan EvTick
 
   -- 8. Setup Vty terminal with bracketed paste enabled and emoji width table
   initVtyUnicodeWidthTable
@@ -240,6 +244,7 @@ main = do
         , uiCompletion       = Nothing
         , uiSessionChooser   = Nothing
         , uiIsGenerating     = False
+        , uiSpinnerStep      = 0
         , uiConfig           = cfg
         }
 

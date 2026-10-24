@@ -75,5 +75,6 @@ data UIState = UIState
   , uiCompletion       :: !(Maybe CompletionState)
   , uiSessionChooser   :: !(Maybe SessionChooserState)
   , uiIsGenerating     :: !Bool
+  , uiSpinnerStep      :: !Int
   , uiConfig           :: !Config
   }

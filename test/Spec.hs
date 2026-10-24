@@ -1363,6 +1363,7 @@ testContextualCompletersAndMruInvariant = do
         , uiCompletion       = Nothing
         , uiSessionChooser   = Nothing
         , uiIsGenerating     = False
+        , uiSpinnerStep      = 0
         , uiConfig           = defaultConfig
         }
 
@@ -1529,6 +1530,7 @@ testDynamicModelSwitching = do
         , uiCompletion       = Nothing
         , uiSessionChooser   = Nothing
         , uiIsGenerating     = False
+        , uiSpinnerStep      = 0
         , uiConfig           = defaultConfig { apiBaseUrl = "https://openrouter.ai/api/v1" }
         }
 
@@ -1740,6 +1742,7 @@ testPromptMacrosAndExpansion = do
         , uiCompletion       = Nothing
         , uiSessionChooser   = Nothing
         , uiIsGenerating     = False
+        , uiSpinnerStep      = 0
         , uiConfig           = cfg
         }
 
@@ -1845,6 +1848,7 @@ testModelSwitchingDeploymentFixes = do
         , uiCompletion       = Nothing
         , uiSessionChooser   = Nothing
         , uiIsGenerating     = False
+        , uiSpinnerStep      = 0
         , uiConfig           = localCfg
         }
 
@@ -1926,6 +1930,7 @@ testNullDefaultsAndProviderTransparency = do
         , uiCompletion       = Nothing
         , uiSessionChooser   = Nothing
         , uiIsGenerating     = False
+        , uiSpinnerStep      = 0
         , uiConfig           = defaultConfig
         }
 
@@ -2230,6 +2235,7 @@ testHeadlessUiEventSmoke = do
         , uiCompletion       = Nothing
         , uiSessionChooser   = Nothing
         , uiIsGenerating     = False
+        , uiSpinnerStep      = 0
         , uiConfig           = cfg
         }
       testApp :: App UIState EngineEvent ResourceName
@@ -2759,6 +2765,7 @@ testThemeEngineAndCompletion = do
         , uiCompletion       = Nothing
         , uiSessionChooser   = Nothing
         , uiIsGenerating     = False
+        , uiSpinnerStep      = 0
         , uiConfig           = customCfg
         }
   mThemeComp <- completeInput "." dummyUI "/theme "
@@ -2827,7 +2834,7 @@ testMultilinePromptAndEditor = do
   assert "Extracts provider local and model llama3" (p3 == "local" && m3 == "llama3")
 
   -- 7. Powerline prompt renders without throwing infinite-width/height exception in Both viewport
-  let promptWidget = renderPowerlinePrompt ExecMode "gpt-4o" "https://api.openai.com/v1" [] 128000 ed
+  let promptWidget = renderPowerlinePrompt ExecMode "gpt-4o" "https://api.openai.com/v1" [] 128000 ed False 0
   assert "Prompt widget instantiated successfully" True
   putStrLn "  -> OK: Multi-line prompt uncapped editor, word wrap, and cursor projection verified."
 

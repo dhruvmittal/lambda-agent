@@ -104,6 +104,11 @@ handleAppEvent (AppEvent engineEv) = do
     EvDone -> do
       modify $ \s -> s { uiIsGenerating = False }
       vScrollToEnd (viewportScroll ChatView)
+    EvTick -> do
+      gen <- gets uiIsGenerating
+      hasRunningSubs <- gets (any (\t -> subAgentStatus t == SubAgentRunning) . Map.elems . uiSubAgents)
+      when (gen || hasRunningSubs) $
+        modify $ \s -> s { uiSpinnerStep = (uiSpinnerStep s + 1) `mod` 10 }
   where
     updateMatchingTurn updatedTurn turns =
       let rev = reverse turns

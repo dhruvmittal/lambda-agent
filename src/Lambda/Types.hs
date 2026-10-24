@@ -201,6 +201,7 @@ data EngineEvent
   | EvModelSwitched !Text !Int
   | EvError !Text
   | EvDone
+  | EvTick
 
 -- | Frontend to Engine dispatch commands
 data FrontendCommand

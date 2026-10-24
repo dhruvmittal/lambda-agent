@@ -233,9 +233,11 @@ subAgentDrawerOverlay _ = emptyWidget
 
 mainLayout :: UIState -> Widget ResourceName
 mainLayout UIState{..} =
-  vBox
+  let hasRunningSubs = any (\t -> subAgentStatus t == SubAgentRunning) (Map.elems uiSubAgents)
+      isWaiting = uiIsGenerating || hasRunningSubs
+  in vBox
     [ headerBar uiWorkingState uiSelectedSubAgent
-    , renderMainPane uiSelectedSubAgent uiTurns uiSubAgents uiCompletion uiMode uiModelName uiContextLimit uiConfig uiEditor
+    , renderMainPane uiSelectedSubAgent uiTurns uiSubAgents uiCompletion uiMode uiModelName uiContextLimit uiConfig uiEditor isWaiting uiSpinnerStep
     ]
 
 renderMainPane
@@ -248,8 +250,10 @@ renderMainPane
   -> Int
   -> Config
   -> E.Editor Text ResourceName
+  -> Bool
+  -> Int
   -> Widget ResourceName
-renderMainPane mSelected turns subs uiComp mode model ctxLimit cfg editor =
+renderMainPane mSelected turns subs uiComp mode model ctxLimit cfg editor isWaiting spinnerStep =
   vBox
     [ viewport ChatView Vertical $
         padLeftRight 1 $
@@ -259,7 +263,7 @@ renderMainPane mSelected turns subs uiComp mode model ctxLimit cfg editor =
                    else renderFleetStrip mSelected subList
             else vBox (map renderTurnPair turnPairs)
     , renderCompletionLine uiComp
-    , renderPowerlinePrompt mode model (apiBaseUrl cfg) turns ctxLimit editor
+    , renderPowerlinePrompt mode model (apiBaseUrl cfg) turns ctxLimit editor isWaiting spinnerStep
     ]
   where
     subList = Map.elems subs
@@ -521,12 +525,16 @@ wrapEditorToVisualWithFirstWidth firstW restW rawLines (curCol, curRow) =
 wrapEditorToVisual :: Int -> [Text] -> (Int, Int) -> ([Text], (Int, Int))
 wrapEditorToVisual maxW = wrapEditorToVisualWithFirstWidth maxW maxW
 
-renderPowerlinePrompt :: AgentMode -> Text -> Text -> [Turn] -> Int -> E.Editor Text ResourceName -> Widget ResourceName
-renderPowerlinePrompt mode model baseUrl turns ctxLimit editor =
+renderPowerlinePrompt :: AgentMode -> Text -> Text -> [Turn] -> Int -> E.Editor Text ResourceName -> Bool -> Int -> Widget ResourceName
+renderPowerlinePrompt mode model baseUrl turns ctxLimit editor isWaiting spinnerStep =
   Widget Greedy Fixed $ do
     c <- getContext
     let totalW = c ^. availWidthL
-        promptArrowStr = "→ "
+        spinnerFrames = ["⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ "]
+        promptArrowStr =
+          if isWaiting
+            then spinnerFrames !! (spinnerStep `mod` length spinnerFrames)
+            else "→ "
         arrowW = 2
         firstW = max 10 (totalW - arrowW)
         restW = max 10 totalW
