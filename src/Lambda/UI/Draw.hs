@@ -14,6 +14,8 @@ import qualified Brick.Widgets.Border as B
 import qualified Brick.Widgets.Border.Style as BS
 import qualified Brick.Widgets.Center as C
 import qualified Brick.Widgets.Edit as E
+import qualified Graphics.Vty as V
+import Lens.Micro ((^.), to)
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString.Lazy as BL
 import Data.List (intersperse)
@@ -33,7 +35,7 @@ import Lambda.UI.Markdown (renderMarkdown)
 import Lambda.UI.Types
 
 drawApp :: UIState -> [Widget ResourceName]
-drawApp st = [modalOverlay st, sessionChooserOverlay st, hudOverlay st, mainLayout st, fill ' ']
+drawApp st = [modalOverlay st, sessionChooserOverlay st, hudOverlay st, subAgentDrawerOverlay st, mainLayout st, fill ' ']
 
 sessionChooserOverlay :: UIState -> Widget ResourceName
 sessionChooserOverlay UIState{ uiSessionChooser = Just SessionChooserState{..} } =
@@ -186,18 +188,50 @@ hudOverlay UIState{ uiShowHud = True, .. } =
         ]
 hudOverlay _ = emptyWidget
 
+rightSideLayer :: Widget n -> Widget n
+rightSideLayer p =
+  Widget Greedy (vSize p) $ do
+    result <- render p
+    c <- getContext
+    let rWidth = result ^. imageL . to V.imageWidth
+        leftPaddingAmount = max 0 (c ^. availWidthL - rWidth)
+        off = Location (leftPaddingAmount, 0)
+    render $ translateBy off $ Widget Fixed Fixed $ return result
+
+subAgentDrawerOverlay :: UIState -> Widget ResourceName
+subAgentDrawerOverlay UIState{ uiSelectedSubAgent = Just sId, .. } =
+  case Map.lookup sId uiSubAgents of
+    Nothing   -> emptyWidget
+    Just task ->
+      rightSideLayer $
+        hLimitPercent 46 $
+          vLimitPercent 100 $
+            withBorderStyle BS.unicodeRounded $
+              B.borderWithLabel (withAttr (attrName "selectedBadge") (str $ " SubAgent #" <> show sId <> " [" <> T.unpack (T.toUpper (subAgentRole task)) <> "] ")) $
+                vBox
+                  [ viewport SubAgentView Vertical $
+                      padLeftRight 1 $
+                        if null (subAgentTurns task)
+                          then padAll 1 (withAttr (attrName "thinkingDim") (str "Awaiting dialogue turns recorded for this subagent..."))
+                          else vBox (map renderTurn (subAgentTurns task))
+                  , vLimit 1 $ withBorderStyle BS.unicodeRounded B.hBorder
+                  , vLimit 1 $ padLeftRight 1 $
+                      hBox
+                        [ withAttr (statusAttr (subAgentStatus task)) (str $ formatStatus (subAgentStatus task))
+                        , str " "
+                        , withAttr (attrName "thinkingDim") (str $ "(" <> show (subAgentTurnCount task) <> "/" <> show (subAgentBudget task) <> "t)")
+                        , vLimit 1 (fill ' ')
+                        , withAttr (attrName "thinkingDim") (str "[Esc] Close  Alt+,/. Next")
+                        ]
+                  ]
+subAgentDrawerOverlay _ = emptyWidget
+
 mainLayout :: UIState -> Widget ResourceName
 mainLayout UIState{..} =
   vBox
     [ headerBar uiWorkingState uiSelectedSubAgent
-    , renderMainPane uiSelectedSubAgent currentDisplayTurns uiSubAgents uiCompletion uiMode uiModelName uiContextLimit uiConfig uiEditor
+    , renderMainPane uiSelectedSubAgent uiTurns uiSubAgents uiCompletion uiMode uiModelName uiContextLimit uiConfig uiEditor
     ]
-  where
-    currentDisplayTurns = case uiSelectedSubAgent of
-      Just sId -> case Map.lookup sId uiSubAgents of
-        Just task -> subAgentTurns task
-        Nothing   -> uiTurns
-      Nothing  -> uiTurns
 
 renderMainPane
   :: Maybe Int
@@ -210,41 +244,45 @@ renderMainPane
   -> Config
   -> E.Editor Text ResourceName
   -> Widget ResourceName
-renderMainPane Nothing turns subs uiComp mode model ctxLimit cfg editor =
+renderMainPane mSelected turns subs uiComp mode model ctxLimit cfg editor =
   vBox
     [ viewport ChatView Vertical $
         padLeftRight 1 $
-          vBox
-            [ vBox (map renderTurn turns)
-            , if Map.null subs
-                then emptyWidget
-                else padTop (Pad 1) $ vBox (map renderInlineSubAgent (Map.elems subs))
-            ]
+          if null turns
+            then if null subList
+                   then emptyWidget
+                   else renderFleetStrip mSelected subList
+            else vBox (map renderTurnPair turnPairs)
     , renderCompletionLine uiComp
     , renderPowerlinePrompt mode model (apiBaseUrl cfg) turns ctxLimit editor
     ]
-renderMainPane (Just sId) _ subs uiComp mode model ctxLimit cfg editor =
-  case Map.lookup sId subs of
-    Just task ->
-      let roleUpper = T.unpack (T.toUpper (subAgentRole task))
-          banner = withAttr (attrName "selectedBadge") $
-            str $ " ◄ SUBAGENT #" <> show sId <> " [" <> roleUpper <> "] DIALOGUE (Press Esc to return to Main Chat) ► "
-          renderedTurns =
-            if null (subAgentTurns task)
-              then padAll 1 (withAttr (attrName "thinkingDim") $ str "No dialogue turns recorded for this subagent yet.")
-              else vBox (map renderTurn (subAgentTurns task))
-      in vBox
-           [ viewport ChatView Vertical $
-               padLeftRight 1 $
-                 vBox
-                   [ C.hCenter banner
-                   , renderedTurns
-                   ]
-           , renderCompletionLine uiComp
-           , renderPowerlinePrompt mode model (apiBaseUrl cfg) (subAgentTurns task) ctxLimit editor
-           ]
-    Nothing ->
-      viewport ChatView Vertical (padAll 1 $ withAttr (attrName "toolError") $ str ("SubAgent #" <> show sId <> " not found."))
+  where
+    subList = Map.elems subs
+    turnPairs = distributeSubAgentsToTurns turns subList
+    renderTurnPair (t, turnSubs) = renderTurnWithSubs mSelected turnSubs t
+
+-- | Partitions subagent tasks across turns according to tool invocation order
+distributeSubAgentsToTurns :: [Turn] -> [SubAgentTask] -> [(Turn, [SubAgentTask])]
+distributeSubAgentsToTurns [] _ = []
+distributeSubAgentsToTurns [lastTurn] remainingSubs = [(lastTurn, remainingSubs)]
+distributeSubAgentsToTurns (t:ts) remainingSubs =
+  let count = turnSubAgentCount t
+      (forThisTurn, forLater) = splitAt count remainingSubs
+  in (t, forThisTurn) : distributeSubAgentsToTurns ts forLater
+
+turnSubAgentCount :: Turn -> Int
+turnSubAgentCount (Turn _ role blks)
+  | role == AssistantRole = length (filter isSubAgentCallBlock blks)
+  | role == ToolRole      = 0
+  | otherwise             = length (filter isSubAgentCallBlock blks)
+
+isSubAgentCallBlock :: ContentBlock -> Bool
+isSubAgentCallBlock (ToolCallBlock tc) =
+  let name = toolCallName tc
+  in name == "spawn_specialist_subagent"
+     || name == "invoke_subagent"
+     || "subagent" `T.isInfixOf` T.toLower name
+isSubAgentCallBlock _ = False
 
 headerBar :: Text -> Maybe Int -> Widget ResourceName
 headerBar workingState mSelected =
@@ -273,19 +311,25 @@ headerBar workingState mSelected =
         []    -> "✓ Ready"
 
 renderTurn :: Turn -> Widget ResourceName
-renderTurn (Turn _ UserRole blocks) =
+renderTurn = renderTurnWithSubs Nothing []
+
+renderTurnWithSubs :: Maybe Int -> [SubAgentTask] -> Turn -> Widget ResourceName
+renderTurnWithSubs _ _ (Turn _ UserRole blocks) =
   padBottom (Pad 1) $
     hBox
       [ withAttr (attrName "userAccent") (str "▎ ")
       , vBox (map renderBlock blocks)
       ]
-renderTurn (Turn tId role blocks) =
+renderTurnWithSubs mSelected turnSubs (Turn tId role blocks) =
   padBottom (Pad 1) $
     vBox
       [ if role == SystemRole
           then withAttr (attrName "systemRole") (str $ "● system (Turn #" <> show tId <> ")")
           else emptyWidget
       , vBox (map renderBlock blocks)
+      , if null turnSubs
+          then emptyWidget
+          else renderFleetStrip mSelected turnSubs
       , if role == AssistantRole
           then padLeft (Pad 2) $ withAttr (attrName "turnFooter") (str "■ Plan · assistant")
           else emptyWidget
@@ -344,25 +388,34 @@ renderDiffLine l
       withAttr (attrName "toolResult") (txt l)
 
 renderInlineSubAgent :: SubAgentTask -> Widget ResourceName
-renderInlineSubAgent SubAgentTask{..} =
+renderInlineSubAgent task = vLimit 1 (renderTaskChip Nothing task)
+
+renderFleetStrip :: Maybe Int -> [SubAgentTask] -> Widget ResourceName
+renderFleetStrip mSelected tasks =
+  padTop (Pad 1) $
+    padLeft (Pad 2) $
+      vLimit 1 $
+        hBox
+          [ withAttr (attrName "thinkingDim") (str "⚡ SubAgents: ")
+          , hBox (intersperse (str "  ") (map (renderTaskChip mSelected) tasks))
+          , vLimit 1 (fill ' ')
+          ]
+
+renderTaskChip :: Maybe Int -> SubAgentTask -> Widget ResourceName
+renderTaskChip mSelected SubAgentTask{..} =
   clickable (SubAgentItem subAgentId) $
-    padBottom (Pad 1) $
-      withBorderStyle BS.unicodeRounded $
-        B.border $
-          padLeftRight 1 $
-            vBox
-              [ vLimit 1 $ hBox
-                  [ withAttr (attrName "subRole") (str $ "◆ SubAgent #" <> show subAgentId <> " [" <> T.unpack (T.toUpper subAgentRole) <> "]")
-                  , str " "
-                  , withAttr (statusAttr subAgentStatus) (str $ "[" <> formatStatus subAgentStatus <> "]")
-                  , vLimit 1 (fill ' ')
-                  , withAttr (attrName "thinkingDim") (str $ show subAgentTurnCount <> "/" <> show subAgentBudget <> "t  [click or /sub " <> show subAgentId <> "]")
-                  ]
-              , padLeft (Pad 2) $ withAttr (attrName "thinkingDim") $ txtWrap (T.take 80 subAgentHypothesis)
-              , case subAgentArtifact of
-                  Just p  -> padLeft (Pad 2) $ withAttr (attrName "artifact") (str $ "-> artifact: " <> take 40 p)
-                  Nothing -> emptyWidget
-              ]
+    let isSelected = mSelected == Just subAgentId
+        glyph = if isSelected then "▶" else statusGlyph subAgentStatus
+        roleShort = T.take 12 (T.toUpper subAgentRole)
+        txtStr = "[" <> glyph <> " #" <> show subAgentId <> " " <> T.unpack roleShort <> " " <> show subAgentTurnCount <> "/" <> show subAgentBudget <> "t]"
+        attr = if isSelected then attrName "selectedBadge" else statusAttr subAgentStatus
+    in withAttr attr (str txtStr)
+
+statusGlyph :: SubAgentStatus -> String
+statusGlyph SubAgentRunning     = "●"
+statusGlyph (SubAgentSuccess _) = "✓"
+statusGlyph (SubAgentBlocked _) = "▲"
+statusGlyph (SubAgentFailed _)  = "✗"
 
 renderCompletionLine :: Maybe CompletionState -> Widget ResourceName
 renderCompletionLine Nothing = emptyWidget

@@ -12,7 +12,7 @@ module Lambda.UI.Events
 import Brick
 import qualified Brick.Widgets.Edit as E
 import Control.Concurrent.STM (atomically, writeTBQueue)
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Char (isSpace)
 import qualified Data.Map.Strict as Map
@@ -74,11 +74,15 @@ handleAppEvent (AppEvent engineEv) = do
         , uiIsGenerating = False
         }
       vScrollToEnd (viewportScroll ChatView)
-    EvSubAgentUpdate task -> modify $ \s ->
-      let vis = uiThinkingVisible s
+    EvSubAgentUpdate task -> do
+      st <- get
+      let vis = uiThinkingVisible st
           adjustedTurns = map (setThinkingVis (if vis then Visible else Collapsed)) (subAgentTurns task)
           adjustedTask = task { subAgentTurns = adjustedTurns }
-      in s { uiSubAgents = Map.insert (subAgentId task) adjustedTask (uiSubAgents s) }
+          sId = subAgentId task
+      put st { uiSubAgents = Map.insert sId adjustedTask (uiSubAgents st) }
+      when (uiSelectedSubAgent st == Just sId) $
+        vScrollToEnd (viewportScroll SubAgentView)
     EvWorkingStateUpdate ws -> modify $ \s ->
       s { uiWorkingState = ws }
     EvPermissionRequired prompt -> modify $ \s ->
@@ -417,9 +421,10 @@ handleAppEvent (MouseDown (SessionItem idx) V.BLeft _ _) = do
       liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) (CmdSwitchSession (metaId selectedMeta))
     _ -> pure ()
 
--- Mouse click on subagent in sidebar
-handleAppEvent (MouseDown (SubAgentItem sId) V.BLeft _ _) =
+-- Mouse click on subagent in sidebar or fleet strip
+handleAppEvent (MouseDown (SubAgentItem sId) V.BLeft _ _) = do
   modify $ \s -> s { uiSelectedSubAgent = Just sId }
+  vScrollToEnd (viewportScroll SubAgentView)
 
 -- Mouse click on thinking accordion fold header
 handleAppEvent (MouseDown (ThinkingFold tId) V.BLeft _ _) =
@@ -437,35 +442,51 @@ handleAppEvent (MouseDown (ThinkingFold tId) V.BLeft _ _) =
     flipVis _ other = other
 
 -- Mouse wheel scrolling
-handleAppEvent (MouseDown _ V.BScrollUp _ _) =
-  vScrollBy (viewportScroll ChatView) (-3)
-handleAppEvent (MouseDown _ V.BScrollDown _ _) =
-  vScrollBy (viewportScroll ChatView) 3
-handleAppEvent (VtyEvent (V.EvMouseDown _ _ V.BScrollUp _)) =
-  vScrollBy (viewportScroll ChatView) (-3)
-handleAppEvent (VtyEvent (V.EvMouseDown _ _ V.BScrollDown _)) =
-  vScrollBy (viewportScroll ChatView) 3
+handleAppEvent (MouseDown _ V.BScrollUp _ _) = do
+  st <- get
+  let vp = if isJust (uiSelectedSubAgent st) then SubAgentView else ChatView
+  vScrollBy (viewportScroll vp) (-3)
+handleAppEvent (MouseDown _ V.BScrollDown _ _) = do
+  st <- get
+  let vp = if isJust (uiSelectedSubAgent st) then SubAgentView else ChatView
+  vScrollBy (viewportScroll vp) 3
+handleAppEvent (VtyEvent (V.EvMouseDown _ _ V.BScrollUp _)) = do
+  st <- get
+  let vp = if isJust (uiSelectedSubAgent st) then SubAgentView else ChatView
+  vScrollBy (viewportScroll vp) (-3)
+handleAppEvent (VtyEvent (V.EvMouseDown _ _ V.BScrollDown _)) = do
+  st <- get
+  let vp = if isJust (uiSelectedSubAgent st) then SubAgentView else ChatView
+  vScrollBy (viewportScroll vp) 3
 
 -- =========================================================================
 -- Keyboard-Centric Viewport Scrolling
 -- =========================================================================
 
 -- PageUp / PageDown: Scroll conversation viewport in large steps
-handleAppEvent (VtyEvent (V.EvKey V.KPageUp _)) =
-  vScrollBy (viewportScroll ChatView) (-12)
+handleAppEvent (VtyEvent (V.EvKey V.KPageUp _)) = do
+  st <- get
+  let vp = if isJust (uiSelectedSubAgent st) then SubAgentView else ChatView
+  vScrollBy (viewportScroll vp) (-12)
 
-handleAppEvent (VtyEvent (V.EvKey V.KPageDown _)) =
-  vScrollBy (viewportScroll ChatView) 12
+handleAppEvent (VtyEvent (V.EvKey V.KPageDown _)) = do
+  st <- get
+  let vp = if isJust (uiSelectedSubAgent st) then SubAgentView else ChatView
+  vScrollBy (viewportScroll vp) 12
 
 -- Alt+Up / Meta+Up / Ctrl+Up / Shift+Up: Scroll conversation up
 handleAppEvent (VtyEvent (V.EvKey V.KUp mods))
-  | any (`elem` [V.MMeta, V.MAlt, V.MCtrl, V.MShift]) mods =
-      vScrollBy (viewportScroll ChatView) (-4)
+  | any (`elem` [V.MMeta, V.MAlt, V.MCtrl, V.MShift]) mods = do
+      st <- get
+      let vp = if isJust (uiSelectedSubAgent st) then SubAgentView else ChatView
+      vScrollBy (viewportScroll vp) (-4)
 
 -- Alt+Down / Meta+Down / Ctrl+Down / Shift+Down: Scroll conversation down
 handleAppEvent (VtyEvent (V.EvKey V.KDown mods))
-  | any (`elem` [V.MMeta, V.MAlt, V.MCtrl, V.MShift]) mods =
-      vScrollBy (viewportScroll ChatView) 4
+  | any (`elem` [V.MMeta, V.MAlt, V.MCtrl, V.MShift]) mods = do
+      st <- get
+      let vp = if isJust (uiSelectedSubAgent st) then SubAgentView else ChatView
+      vScrollBy (viewportScroll vp) 4
 
 -- Up / Down Arrow Keys: Navigate session chooser or autocomplete if active, else scroll conversation
 handleAppEvent (VtyEvent (V.EvKey V.KUp [])) = do
@@ -483,7 +504,9 @@ handleAppEvent (VtyEvent (V.EvKey V.KUp [])) = do
           { uiEditor     = cycleCompletedToken (candInsert prevSelected) (candInsert nextSelected) (uiEditor st)
           , uiCompletion = Just (CompletionState cands prevSel)
           }
-      _ -> vScrollBy (viewportScroll ChatView) (-2)
+      _ -> do
+        let vp = if isJust (uiSelectedSubAgent st) then SubAgentView else ChatView
+        vScrollBy (viewportScroll vp) (-2)
 
 handleAppEvent (VtyEvent (V.EvKey V.KDown [])) = do
   st <- get
@@ -500,14 +523,20 @@ handleAppEvent (VtyEvent (V.EvKey V.KDown [])) = do
           { uiEditor     = cycleCompletedToken (candInsert prevSelected) (candInsert nextSelected) (uiEditor st)
           , uiCompletion = Just (CompletionState cands nextSel)
           }
-      _ -> vScrollBy (viewportScroll ChatView) 2
+      _ -> do
+        let vp = if isJust (uiSelectedSubAgent st) then SubAgentView else ChatView
+        vScrollBy (viewportScroll vp) 2
 
 -- Home / End (with Ctrl): Jump to beginning or end of conversation
-handleAppEvent (VtyEvent (V.EvKey V.KHome [V.MCtrl])) =
-  vScrollToBeginning (viewportScroll ChatView)
+handleAppEvent (VtyEvent (V.EvKey V.KHome [V.MCtrl])) = do
+  st <- get
+  let vp = if isJust (uiSelectedSubAgent st) then SubAgentView else ChatView
+  vScrollToBeginning (viewportScroll vp)
 
-handleAppEvent (VtyEvent (V.EvKey V.KEnd [V.MCtrl])) =
-  vScrollToEnd (viewportScroll ChatView)
+handleAppEvent (VtyEvent (V.EvKey V.KEnd [V.MCtrl])) = do
+  st <- get
+  let vp = if isJust (uiSelectedSubAgent st) then SubAgentView else ChatView
+  vScrollToEnd (viewportScroll vp)
 
 -- =========================================================================
 -- Prompt History Navigation (^P = Previous, ^N = Next)
@@ -843,6 +872,7 @@ handleCommand cmdText = do
               if Map.member sId (uiSubAgents st)
                 then do
                   put st { uiSelectedSubAgent = Just sId }
+                  vScrollToEnd (viewportScroll SubAgentView)
                   liftIO $ atomically $ writeTBQueue (cmdQueue channels)
                     (CmdSystemMessage $ "Viewing SubAgent #" <> T.pack (show sId) <> " Dialogue & CoT. Press Esc or Alt+← to return.")
                 else
@@ -954,17 +984,24 @@ toggleMode = do
   put st { uiMode = nextMode }
   liftIO $ atomically $ writeTBQueue (cmdQueue (uiChannels st)) (CmdSetMode nextMode)
 
--- | Step backward through active subagents or return to Main Chat
+-- | Step backward through active subagents
 stepPrevSubAgent :: EventM ResourceName UIState ()
 stepPrevSubAgent = do
   st <- get
   let subIds = Map.keys (uiSubAgents st)
-  case uiSelectedSubAgent st of
-    Nothing -> pure ()
-    Just currId ->
-      case break (== currId) subIds of
-        ([], _)    -> put st { uiSelectedSubAgent = Nothing }
-        (prevs, _) -> put st { uiSelectedSubAgent = Just (last prevs) }
+  unless (null subIds) $ do
+    case uiSelectedSubAgent st of
+      Nothing -> do
+        put st { uiSelectedSubAgent = Just (last subIds) }
+        vScrollToEnd (viewportScroll SubAgentView)
+      Just currId -> do
+        case break (== currId) subIds of
+          ([], _)    -> do
+            put st { uiSelectedSubAgent = Just (last subIds) }
+            vScrollToEnd (viewportScroll SubAgentView)
+          (prevs, _) -> do
+            put st { uiSelectedSubAgent = Just (last prevs) }
+            vScrollToEnd (viewportScroll SubAgentView)
 
 -- | Step forward through active subagents
 stepNextSubAgent :: EventM ResourceName UIState ()
@@ -973,11 +1010,17 @@ stepNextSubAgent = do
   let subIds = Map.keys (uiSubAgents st)
   unless (null subIds) $ do
     case uiSelectedSubAgent st of
-      Nothing -> put st { uiSelectedSubAgent = Just (head subIds) }
-      Just currId ->
+      Nothing -> do
+        put st { uiSelectedSubAgent = Just (head subIds) }
+        vScrollToEnd (viewportScroll SubAgentView)
+      Just currId -> do
         case dropWhile (/= currId) subIds of
-          (_ : nextId : _) -> put st { uiSelectedSubAgent = Just nextId }
-          _                -> pure ()
+          (_ : nextId : _) -> do
+            put st { uiSelectedSubAgent = Just nextId }
+            vScrollToEnd (viewportScroll SubAgentView)
+          _ -> do
+            put st { uiSelectedSubAgent = Just (head subIds) }
+            vScrollToEnd (viewportScroll SubAgentView)
 
 -- | Replaces current word/token under cursor with completed text
 replaceCurrentToken :: Text -> E.Editor Text ResourceName -> E.Editor Text ResourceName
