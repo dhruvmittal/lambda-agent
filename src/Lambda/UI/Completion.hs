@@ -22,6 +22,7 @@ import Lambda.Config (Config(..), isLocalEndpoint, isOpenAiEndpoint, isOpenRoute
 import Lambda.Engine.PromptMacro (listPromptMacros)
 import Lambda.Engine.Session (listMeaningfulSessions, SessionMeta(..))
 import Lambda.Types
+import Lambda.UI.Theme (builtinThemeNames)
 import Lambda.UI.Types
 
 -- | Canonical list of supported slash commands
@@ -32,6 +33,7 @@ allCommands =
   , "/mode"
   , "/model"
   , "/models"
+  , "/theme"
   , "/think"
   , "/session"
   , "/fork"
@@ -177,7 +179,20 @@ completeInput baseDir st rawInput = do
             matched = [ c | c <- thinkOpts, thinkArg `T.isPrefixOf` candInsert c || T.null thinkArg ]
         pure $ toCompletionState matched
 
-    -- 6. /prompt and /p argument completion (templates from .lambda/prompts/*.md)
+    -- 6. /theme argument completion
+    _ | "/theme " `T.isPrefixOf` clean || "/themes " `T.isPrefixOf` clean -> do
+        let tArg = T.toLower $ if "/themes " `T.isPrefixOf` clean then T.drop 8 clean else T.drop 7 clean
+            cfg = uiConfig st
+            activeTheme = T.toLower (themeName cfg)
+            userNames = Map.keys (customThemes cfg)
+            allNames = builtinThemeNames ++ [ u | u <- userNames, u `notElem` builtinThemeNames ]
+            mkCand t =
+              let disp = if T.toLower t == activeTheme then t <> " (active)" else t
+              in Candidate t disp
+            matched = [ mkCand t | t <- allNames, tArg `T.isPrefixOf` T.toLower t || T.null tArg ]
+        pure $ toCompletionState matched
+
+    -- 7. /prompt and /p argument completion (templates from .lambda/prompts/*.md)
     _ | "/prompt " `T.isPrefixOf` clean || "/p " `T.isPrefixOf` clean -> do
         let pArg = if "/prompt " `T.isPrefixOf` clean then T.drop 8 clean else T.drop 3 clean
         macroNames <- catch (listPromptMacros baseDir) (\(_ :: SomeException) -> pure [])

@@ -33,7 +33,7 @@ import Lambda.UI.Markdown (renderMarkdown)
 import Lambda.UI.Types
 
 drawApp :: UIState -> [Widget ResourceName]
-drawApp st = [modalOverlay st, sessionChooserOverlay st, hudOverlay st, mainLayout st]
+drawApp st = [modalOverlay st, sessionChooserOverlay st, hudOverlay st, mainLayout st, fill ' ']
 
 sessionChooserOverlay :: UIState -> Widget ResourceName
 sessionChooserOverlay UIState{ uiSessionChooser = Just SessionChooserState{..} } =

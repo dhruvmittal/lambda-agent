@@ -50,6 +50,7 @@ library
         Lambda.UI.Markdown
         Lambda.UI.Events
         Lambda.UI.Completion
+        Lambda.UI.Theme
         Lambda.Server.Acp.Types
         Lambda.Server.Acp
     build-depends:

@@ -28,7 +28,7 @@ import qualified Graphics.Vty as V
 import System.Posix.Signals (raiseSignal, sigTSTP)
 import Text.Read (readMaybe)
 
-import Lambda.Config (Config(..), isLocalEndpoint, isOpenAiEndpoint, isOpenRouterEndpoint)
+import Lambda.Config (Config(..), isLocalEndpoint, isOpenAiEndpoint, isOpenRouterEndpoint, persistTheme)
 import Lambda.Core.EngineInterface (EngineChannels(..))
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro)
 import Lambda.Engine.Security (resolvePrompt)
@@ -41,6 +41,7 @@ import Lambda.Engine.Session
   )
 import Lambda.Types
 import Lambda.UI.Completion (completeInput, allCommands, computeCommandCandidates)
+import Lambda.UI.Theme (ThemePalette(..), builtinThemeNames, resolveThemePalette)
 import Lambda.UI.Types
 
 handleAppEvent :: BrickEvent ResourceName EngineEvent -> EventM ResourceName UIState ()
@@ -623,56 +624,57 @@ handleCommand cmdText = do
   case cmdText of
     "/help" -> do
       let helpText = T.unlines
-            [ "lambdA Commands & Navigation Reference:"
+            [ "## lambdA Commands & Navigation Reference"
             , ""
-            , "Core Slash Commands:"
-            , "  /plan          - Switch to Plan mode (read-only inspection, destructive tools disabled)"
-            , "  /exec          - Switch to Exec mode (full tool execution access)"
-            , "  /mode [mode]   - Inspect or switch active mode (/mode plan, /mode exec)"
-            , "  /model [name]  - Inspect or switch active model (/model claude, /model r1, /model 4o)"
-            , "  /think         - Toggle reasoning / thinking block visibility"
-            , "  /session       - List recent sessions (/session <id> to switch, /session prune <N>)"
-            , "  /fork [title]  - Fork active conversation into a new child session"
-            , "  /rewind [N]    - Rewind conversation by N turn pairs (alias: /undo)"
-            , "  /prompt [name] - Run or list prompt templates from .lambda/prompts/*.md (alias: /p)"
-            , "  /sub <id>      - Inspect SubAgent dialogue and thought trace (/sub main to return)"
-            , "  /trace         - Export current session to formatted Markdown artifact"
-            , "  /compact       - Trigger manual context compaction of earlier conversation turns"
-            , "  /clear         - Clear conversation turns in current session"
-            , "  /new           - Start a clean session and persist previous session"
-            , "  /help          - Show this command reference"
-            , "  /quit          - Exit lambdA safely"
+            , "### Core Slash Commands"
+            , "- `/plan` - Switch to Plan mode (read-only inspection, destructive tools disabled)"
+            , "- `/exec` - Switch to Exec mode (full tool execution access)"
+            , "- `/mode [mode]` - Inspect or switch active mode (`/mode plan`, `/mode exec`)"
+            , "- `/model [name]` - Inspect or switch active model (`/model claude`, `/model r1`, `/model 4o`)"
+            , "- `/theme [name]` - Inspect or switch UI colorscheme (`default`, `solarized-dark`, `solarized-light`, `nordic`, `zenburn`, `dracula`)"
+            , "- `/think` - Toggle reasoning / thinking block visibility"
+            , "- `/session` - List recent sessions (`/session <id>` to switch, `/session prune <N>`)"
+            , "- `/fork [title]` - Fork active conversation into a new child session"
+            , "- `/rewind [N]` - Rewind conversation by N turn pairs (alias: `/undo`)"
+            , "- `/prompt [name]` - Run or list prompt templates from `.lambda/prompts/*.md` (alias: `/p`)"
+            , "- `/sub <id>` - Inspect SubAgent dialogue and thought trace (`/sub main` to return)"
+            , "- `/trace` - Export current session to formatted Markdown artifact"
+            , "- `/compact` - Trigger manual context compaction of earlier conversation turns"
+            , "- `/clear` - Clear conversation turns in current session"
+            , "- `/new` - Start a clean session and persist previous session"
+            , "- `/help` - Show this command reference"
+            , "- `/quit` - Exit lambdA safely"
             , ""
-            , "Specialist Subagents:"
-            , "  surveyor       - Large-scale directory maps, AST survey, symbol extraction"
-            , "  debugger       - Failure analysis, sanitizer traces, compiler error triage"
-            , "  profiler       - Performance diagnostics (Valgrind, perf, flamegraphs, benchmarks)"
-            , "  implementer    - Code refactoring, test cascades, localized edits"
-            , "  reviewer       - Adversarial critique, correctness audits, diff inspection"
+            , "### Specialist Subagents"
+            , "- `surveyor` - Large-scale directory maps, AST survey, symbol extraction"
+            , "- `debugger` - Failure analysis, sanitizer traces, compiler error triage"
+            , "- `profiler` - Performance diagnostics (Valgrind, perf, flamegraphs, benchmarks)"
+            , "- `implementer` - Code refactoring, test cascades, localized edits"
+            , "- `reviewer` - Adversarial critique, correctness audits, diff inspection"
             , ""
-            , "Shortcuts & Terminal Conventions:"
-            , "  Ctrl+C         - Cancel draft line / Interrupt active generation"
-            , "  Ctrl+D         - Exit lambdA (on empty line) / forward delete character"
-            , "  Ctrl+Z         - Suspend/background process to shell (fg to resume)"
-            , "  Esc Esc        - Interrupt active turn / cancel pending tools"
-            , "  Alt+M / F2     - Toggle Plan mode (read-only) / Exec mode"
-            , "  Alt+H / F1     - Toggle Intelligence HUD"
-            , "  Tab / Shift+Tab- Autocomplete candidate forward / backward"
-            , "  Alt+, / Alt+.  - Navigate SubAgents (< and >) / Esc to return (also Alt+[/], F3/F4)"
-            , "  ↑ / ↓          - Scroll conversation (or navigate autocomplete when active)"
-            , "  PgUp / PgDn    - Page scroll conversation"
-            , "  Alt+↑ / Alt+↓  - Scroll conversation (also Ctrl+↑/↓, Shift+↑/↓)"
-            , "  Ctrl+P, Ctrl+N - Cycle prompt history (older / newer) (also Alt+P, Alt+N)"
-            , "  Ctrl+W, Ctrl+H - Delete word backward"
-            , "  Alt+D          - Delete word forward"
-            , "  Alt+B, Alt+F   - Move cursor backward / forward by word"
-            , "  Ctrl+U, Ctrl+K - Delete line to start / end"
-            , "  Ctrl+A, Ctrl+E - Move cursor to start / end of line"
-            , "  Ctrl+T         - Toggle thinking/reasoning blocks"
-            , "  Ctrl+S         - Open interactive session chooser modal"
-            , "  Keys 1,2,3,4   - Resolve authorization prompt (Always, Session, Once, Deny)"
-            , "  Mouse Wheel    - Scroll conversation viewport"
-            , "  Mouse Click    - Click on SubAgent #id in sidebar, thinking folds, or session chooser"
+            , "### Shortcuts & Terminal Conventions"
+            , "- `Ctrl+C` - Cancel draft line / Interrupt active generation"
+            , "- `Ctrl+D` - Exit lambdA (on empty line) / forward delete character"
+            , "- `Ctrl+Z` - Suspend/background process to shell (`fg` to resume)"
+            , "- `Esc Esc` - Interrupt active turn / cancel pending tools"
+            , "- `Alt+M` / `F2` - Toggle Plan mode (read-only) / Exec mode"
+            , "- `Alt+H` / `F1` - Toggle Intelligence HUD"
+            , "- `Tab` / `Shift+Tab` - Autocomplete candidate forward / backward"
+            , "- `Alt+,` / `Alt+.` - Navigate SubAgents (`<` and `>`) / `Esc` to return (also `Alt+[/]`, `F3`/`F4`)"
+            , "- `↑` / `↓` - Scroll conversation (or navigate autocomplete when active)"
+            , "- `PgUp` / `PgDn` - Page scroll conversation"
+            , "- `Alt+↑` / `Alt+↓` - Scroll conversation (also `Ctrl+↑/↓`, `Shift+↑/↓`)"
+            , "- `Ctrl+P`, `Ctrl+N` - Cycle prompt history (older / newer) (also `Alt+P`, `Alt+N`)"
+            , "- `Ctrl+W`, `Ctrl+H` - Delete word backward"
+            , "- `Alt+D` - Delete word forward"
+            , "- `Alt+B`, `Alt+F` - Move cursor backward / forward by word"
+            , "- `Ctrl+U`, `Ctrl+K` - Delete line to start / end"
+            , "- `Ctrl+A`, `Ctrl+E` - Move cursor to start / end of line"
+            , "- `Ctrl+T` - Toggle thinking/reasoning blocks"
+            , "- `Ctrl+S` - Open interactive session chooser modal"
+            , "- `Keys 1,2,3,4` - Resolve authorization prompt (Always, Session, Once, Deny)"
+            , "- `Mouse Wheel` - Scroll conversation viewport"
+            , "- `Mouse Click` - Click on SubAgent #id in sidebar, thinking folds, or session chooser"
             ]
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSystemMessage helpText)
     "/new" -> do
@@ -738,6 +740,33 @@ handleCommand cmdText = do
         then liftIO $ atomically $ writeTBQueue (cmdQueue channels)
                (CmdSystemMessage "Usage: /model <model_id_or_alias>")
         else liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSetModel target)
+    cmd | cmd `elem` ["/theme", "/themes"] -> do
+      let cfg = uiConfig st
+          active = themeName cfg
+          userThemes = Map.keys (customThemes cfg)
+          allAvail = builtinThemeNames ++ [ u | u <- userThemes, u `notElem` builtinThemeNames ]
+          msg = T.unlines
+            [ "Active theme: `" <> active <> "`"
+            , "Available themes: " <> T.intercalate ", " (map (\t -> "`" <> t <> "`") allAvail)
+            , "Use `/theme <name>` (or `/theme <Tab>`) to switch."
+            ]
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSystemMessage msg)
+    cmd | "/theme " `T.isPrefixOf` cmd || "/themes " `T.isPrefixOf` cmd -> do
+      let target = T.strip (if "/themes " `T.isPrefixOf` cmd then T.drop 8 cmd else T.drop 7 cmd)
+          cfg = uiConfig st
+      case resolveThemePalette cfg target of
+        Just pal -> do
+          let resolvedName = tpName pal
+              updatedCfg = cfg { themeName = resolvedName }
+          put st { uiConfig = updatedCfg }
+          _ <- liftIO $ persistTheme (workspaceRoot cfg) resolvedName
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+            (CmdSystemMessage $ "Switched theme to `" <> resolvedName <> "`.")
+        Nothing -> do
+          let userThemes = Map.keys (customThemes cfg)
+              allAvail = builtinThemeNames ++ [ u | u <- userThemes, u `notElem` builtinThemeNames ]
+          liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+            (CmdSystemMessage $ "⚠️ Unknown theme `" <> target <> "`. Available: " <> T.intercalate ", " allAvail)
     "/fork" -> do
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdForkSession Nothing)
     cmd | "/fork " `T.isPrefixOf` cmd -> do

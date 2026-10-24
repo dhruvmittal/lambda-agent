@@ -23,7 +23,7 @@ import System.Environment (setEnv, unsetEnv)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
 
-import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, resolveEnvTemplates)
+import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, resolveEnvTemplates, persistTheme)
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro, expandPromptMacro)
 import Lambda.Core.EngineInterface (initEngineChannels, cmdQueue, startEngineLoop, EngineChannels(..))
 import Lambda.Core.ModelDriver (ModelDriver(..))
@@ -92,6 +92,7 @@ import Lambda.UI.Markdown
   , WordToken(..)
   )
 import Lambda.UI.Types (CompletionState(..), Candidate(..), simpleCandidate, ResourceName(..), UIState(..))
+import Lambda.UI.Theme (ThemePalette(..), builtinThemes, builtinThemeNames, parseHexColor, resolveThemePalette, resolveThemeAttrMap)
 import Lambda.Types
 import Lambda.Server.Acp
   ( initAcpServerStateWithSink
@@ -162,6 +163,7 @@ main = do
   testAcpSessionPromptAndStreaming
   testAcpSessionLifecycle
   testAcpFullDuplexRpcAndNotifications
+  testThemeEngineAndCompletion
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -1041,7 +1043,7 @@ testAutocompleteAndTabInvariant = do
 
   -- Check trailing newline from editor does not break matching
   let newlineMatches = computeCommandMatches "/t\n"
-  assert "Trailing newline from editor lines does not break matching" (newlineMatches == ["/think", "/trace"])
+  assert "Trailing newline from editor lines does not break matching" (newlineMatches == ["/theme", "/think", "/trace"])
 
   -- Check commands with spaces are dismissed
   let spaceMatches = computeCommandMatches "/plan "
@@ -2684,6 +2686,95 @@ testAcpFullDuplexRpcAndNotifications = do
   assert "Title update contains Dynamic Title" ("\"title\":\"Dynamic Title\"" `T.isInfixOf` titleTxt)
 
   putStrLn "  -> OK: ACP full-duplex client RPC and rich notification manifests verified."
+
+-- 57. Verify Theme Engine Palettes, Custom Hex Parsing, and /theme Autocomplete
+testThemeEngineAndCompletion :: IO ()
+testThemeEngineAndCompletion = do
+  putStrLn "\n[Test 57] Theme Engine Palettes, Custom Hex Parsing, and /theme Autocomplete"
+  -- 1. Verify all requested built-in themes exist and never use broken ANSI 8 (V.brightBlack) for tpFgDim
+  let expectedBuiltins = ["default", "solarized-dark", "solarized-light", "nordic", "zenburn", "dracula"]
+  mapM_ (\name -> do
+    let mPal = resolveThemePalette defaultConfig name
+    assert ("Built-in theme " <> T.unpack name <> " resolves") (mPal /= Nothing)
+    case mPal of
+      Just pal -> assert ("Theme " <> T.unpack name <> " tpFgDim is not ANSI brightBlack") (tpFgDim pal /= V.brightBlack)
+      Nothing  -> pure ()
+    ) expectedBuiltins
+
+  -- 2. Verify hex color parser and custom user theme fallback resolution
+  assert "Valid hex #2e3440 parses" (parseHexColor "#2e3440" == Just (V.srgbColor 0x2e 0x34 0x40))
+  assert "Valid hex without hash parses" (parseHexColor "ff5555" == Just (V.srgbColor 0xff 0x55 0x55))
+  assert "Invalid hex rejected" (parseHexColor "#12345" == Nothing)
+
+  let customCfg = defaultConfig
+        { themeName = "custom-cyber"
+        , customThemes = Map.fromList
+            [ ("custom-cyber", Map.fromList [("bg", "#101018"), ("fg_dim", "#8899aa")]) ]
+        }
+  case resolveThemePalette customCfg "custom-cyber" of
+    Just pal -> do
+      assert "Custom theme bg parsed" (tpBg pal == Just (V.srgbColor 0x10 0x10 0x18))
+      assert "Custom theme fg_dim parsed" (tpFgDim pal == V.srgbColor 0x88 0x99 0xaa)
+    Nothing -> failTest "Custom theme failed to resolve"
+
+  -- 2b. Verify persistTheme on an existing config.json does not hit lazy ByteString file lock
+  let tempThemeWs = ".lambda/test_theme_ws"
+  createDirectoryIfMissing True (tempThemeWs </> ".lambda")
+  BL.writeFile (tempThemeWs </> ".lambda" </> "config.json") "{\"api_base_url\":\"http://localhost:11434\"}\n"
+  pRes <- persistTheme tempThemeWs "nordic"
+  assert "persistTheme succeeded on existing config.json" (pRes == Right ())
+  reloadedCfg <- loadConfig tempThemeWs
+  assert "persistTheme persisted theme to config.json" (themeName reloadedCfg == "nordic")
+  assert "persistTheme preserved existing api_base_url" (apiBaseUrl reloadedCfg == "http://localhost:11434")
+  removeDirectoryRecursive tempThemeWs
+
+  -- 3. Verify /theme command and argument completion
+  assert "/theme in allCommands" ("/theme" `elem` allCommands)
+  assert "/th prefix completes to /theme" ("/theme" `elem` computeCommandMatches "/th")
+
+  eQueue <- atomically (newTQueue :: STM (TQueue EngineEvent))
+  channels <- initEngineChannels eQueue
+  let dummyUI = UIState
+        { uiTurns            = []
+        , uiSubAgents        = Map.empty
+        , uiCurrentPrompt    = Nothing
+        , uiPendingPrompts   = Seq.Empty
+        , uiMode             = PlanMode
+        , uiEditor           = E.editor EditorInput (Just 1) ""
+        , uiWorkingState     = ""
+        , uiChannels         = channels
+        , uiLastEscTime      = Nothing
+        , uiContextLimit     = 128000
+        , uiPromptHistory    = []
+        , uiHistoryIndex     = Nothing
+        , uiSavedDraft       = ""
+        , uiModelName        = ""
+        , uiThinkingVisible  = True
+        , uiSelectedSubAgent = Nothing
+        , uiShowHud          = False
+        , uiCompletion       = Nothing
+        , uiSessionChooser   = Nothing
+        , uiIsGenerating     = False
+        , uiConfig           = customCfg
+        }
+  mThemeComp <- completeInput "." dummyUI "/theme "
+  case mThemeComp of
+    Just cs -> do
+      let names = map candInsert (compCandidates cs)
+      assert "Built-in solarized-dark in /theme completions" ("solarized-dark" `elem` names)
+      assert "Built-in nordic in /theme completions" ("nordic" `elem` names)
+      assert "Custom theme in /theme completions" ("custom-cyber" `elem` names)
+    Nothing -> failTest "Expected /theme completion candidates"
+
+  mSolarComp <- completeInput "." dummyUI "/theme solar"
+  case mSolarComp of
+    Just cs -> do
+      let names = map candInsert (compCandidates cs)
+      assert "/theme solar completes solarized-dark and solarized-light"
+        (names == ["solarized-dark", "solarized-light"])
+    Nothing -> failTest "Expected /theme solar completion candidates"
+
+  putStrLn "  -> OK: Theme engine palettes, contrast guard, custom hex themes, and /theme autocomplete verified."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

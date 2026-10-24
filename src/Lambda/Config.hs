@@ -22,6 +22,7 @@ module Lambda.Config
   , resolveEnvTemplates
   , loadConfig
   , persistAllowGlob
+  , persistTheme
   ) where
 
 import Control.Applicative ((<|>))
@@ -31,6 +32,7 @@ import Data.Aeson ((.=), (.:?), (.!=))
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KM
 import Data.Aeson.Types (parseMaybe)
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -187,6 +189,8 @@ data Config = Config
   , maxSavedSessions    :: !Int
   , modelAliases        :: !(Map Text Text)
   , configuredModels    :: ![Text]
+  , themeName           :: !Text
+  , customThemes        :: !(Map Text (Map Text Text))
   } deriving stock (Eq, Show, Generic)
 
 instance Aeson.ToJSON Config where
@@ -204,6 +208,8 @@ instance Aeson.ToJSON Config where
     , "max_saved_sessions"  .= maxSavedSessions
     , "model_aliases"       .= modelAliases
     , "models"              .= configuredModels
+    , "theme"               .= themeName
+    , "themes"              .= customThemes
     ]
 
 instance Aeson.FromJSON Config where
@@ -225,6 +231,8 @@ instance Aeson.FromJSON Config where
                             Just a  -> pure a
                             Nothing -> obj .:? "aliases" .!= Map.empty
     configuredModels   <- obj .:? "models" .!= []
+    themeName          <- obj .:? "theme" .!= "default"
+    customThemes       <- obj .:? "themes" .!= Map.empty
     let specialists = Map.union userSpecialists (Map.union userSubagents defaultSpecialists)
         workspaceRoot  = "."
         artifactDir    = ".lambda/artifacts"
@@ -268,6 +276,8 @@ defaultConfig = Config
   , maxSavedSessions    = 50
   , modelAliases        = Map.empty
   , configuredModels    = []
+  , themeName           = "default"
+  , customThemes        = Map.empty
   }
 
 loadConfig :: FilePath -> IO Config
@@ -280,8 +290,8 @@ loadConfig wsRoot = do
     gExists <- doesFileExist globalPath
     if gExists
       then do
-        content <- BL.readFile globalPath
-        pure $ case Aeson.decode content of
+        content <- BS.readFile globalPath
+        pure $ case Aeson.decodeStrict content of
           Just c  -> c
           Nothing -> defaultConfig
       else pure defaultConfig
@@ -290,8 +300,8 @@ loadConfig wsRoot = do
     lExists <- doesFileExist localPath
     if lExists
       then do
-        content <- BL.readFile localPath
-        pure $ case Aeson.decode content of
+        content <- BS.readFile localPath
+        pure $ case Aeson.decodeStrict content of
           Just (Aeson.Object o) ->
             let pick field fallback = case parseMaybe (.:? field) o of
                   Just (Just v) -> v
@@ -321,6 +331,8 @@ loadConfig wsRoot = do
               , maxSavedSessions   = pick "max_saved_sessions" (maxSavedSessions baseCfg)
               , modelAliases       = mAliases
               , configuredModels   = pick "models" (configuredModels baseCfg)
+              , themeName          = pick "theme" (themeName baseCfg)
+              , customThemes       = pickMap "themes" (customThemes baseCfg)
               }
           _ -> baseCfg
       else pure baseCfg
@@ -379,6 +391,11 @@ loadConfig wsRoot = do
         Just l | [(n, "")] <- reads l, n > 0 -> n
         _ -> contextWindowLimit mergedCfg
 
+  mEnvTheme <- lookupVar "LAMBDA_THEME"
+  let finalTheme = case mEnvTheme of
+        Just t | not (null t) -> T.strip (T.pack t)
+        _                     -> themeName mergedCfg
+
   let artDir = wsRoot </> ".lambda" </> "artifacts"
 
   createDirectoryIfMissing True artDir `catch` (\(_ :: IOException) -> pure ())
@@ -392,6 +409,7 @@ loadConfig wsRoot = do
     , workspaceRoot      = wsRoot
     , artifactDir        = artDir
     , contextWindowLimit = finalLimit
+    , themeName          = finalTheme
     }
 
 -- | Resolve "{ENV:VAR_NAME}" or "{env:VAR_NAME}" placeholders using a lookup function
@@ -556,8 +574,8 @@ persistAllowGlob wsRoot newGlob = do
   exists <- doesFileExist confPath
   baseObj <- if exists
     then do
-      content <- BL.readFile confPath
-      pure $ case Aeson.decode content of
+      content <- BS.readFile confPath
+      pure $ case Aeson.decodeStrict content of
         Just (Aeson.Object o) -> o
         _                     -> KM.empty
     else pure KM.empty
@@ -575,3 +593,21 @@ persistAllowGlob wsRoot newGlob = do
           encoded = Aeson.encode newObj
       BL.writeFile confPath encoded
       pure (Right ())
+
+-- | Surgically persist the active theme name to <wsRoot>/.lambda/config.json
+persistTheme :: FilePath -> Text -> IO (Either Text ())
+persistTheme wsRoot newTheme = do
+  let dirPath  = wsRoot </> ".lambda"
+      confPath = dirPath </> "config.json"
+  createDirectoryIfMissing True dirPath
+  exists <- doesFileExist confPath
+  !baseObj <- if exists
+    then do
+      content <- BS.readFile confPath
+      pure $ case Aeson.decodeStrict content of
+        Just (Aeson.Object o) -> o
+        _                     -> KM.empty
+    else pure KM.empty
+  let newObj = KM.insert (Key.fromString "theme") (Aeson.toJSON newTheme) baseObj
+  BL.writeFile confPath (Aeson.encode newObj)
+  pure (Right ())
