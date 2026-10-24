@@ -12,6 +12,7 @@
         pkgs = import nixpkgs { inherit system; };
         ghcVersion = "ghc96";
         hp = pkgs.haskell.packages.${ghcVersion};
+        lambdaPkg = hp.callCabal2nix "lambda" ./. {};
       in {
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
@@ -22,10 +23,16 @@
           ];
         };
 
-        packages.default = hp.callCabal2nix "lambda" ./. {};
+        packages = {
+          lambda = lambdaPkg;
+          default = lambdaPkg;
+        };
 
-        apps.default = flake-utils.lib.mkApp {
-          drv = self.packages.${system}.default;
+        apps = rec {
+          lambda = flake-utils.lib.mkApp {
+            drv = lambdaPkg;
+          };
+          default = lambda;
         };
       }
     );
