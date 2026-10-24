@@ -79,13 +79,13 @@ builtinThemes = Map.fromList
         , tpBgAlt    = Just (rgb 0x21 0x26 0x2d) -- Modern elevated dark slate (#21262d)
         , tpFg       = V.white
         , tpFgBright = V.brightWhite
-        , tpFgDim    = rgb 0x8b 0x94 0x9e -- Readable mid-slate (#8b949e) instead of broken ANSI 8 (brightBlack)
-        , tpAccent1  = V.brightCyan
-        , tpAccent2  = V.brightMagenta
-        , tpUser     = V.brightGreen
-        , tpWarn     = V.brightYellow
-        , tpError    = V.brightRed
-        , tpSuccess  = V.brightGreen
+        , tpFgDim    = rgb 0x8b 0x94 0x9e -- Readable mid-slate (#8b949e)
+        , tpAccent1  = rgb 0x89 0xdc 0xeb -- Pastel cyan / teal (#89dceb)
+        , tpAccent2  = rgb 0xcb 0xa6 0xf7 -- Pastel mauve / violet (#cba6f7)
+        , tpUser     = rgb 0xfa 0xb3 0x87 -- Pastel peach / coral (#fab387)
+        , tpWarn     = rgb 0xf9 0xe2 0xaf -- Pastel yellow (#f9e2af)
+        , tpError    = rgb 0xf3 0x8b 0xa8 -- Pastel red / coral (#f38ba8)
+        , tpSuccess  = rgb 0xa6 0xe3 0xa1 -- Pastel green (#a6e3a1)
         }
     )
   , ( "solarized-dark"
@@ -98,7 +98,7 @@ builtinThemes = Map.fromList
         , tpFgDim    = rgb 0x65 0x7b 0x83        -- base00: comments & muted text (4.5:1 on base03)
         , tpAccent1  = rgb 0x2a 0xa1 0x98        -- cyan
         , tpAccent2  = rgb 0x6c 0x71 0xc4        -- violet
-        , tpUser     = rgb 0x26 0x8b 0xd2        -- blue
+        , tpUser     = rgb 0xcb 0x4b 0x16        -- Solarized orange (#cb4b16)
         , tpWarn     = rgb 0xb5 0x89 0x00        -- yellow
         , tpError    = rgb 0xdc 0x32 0x2f        -- red
         , tpSuccess  = rgb 0x85 0x99 0x00        -- green
@@ -130,7 +130,7 @@ builtinThemes = Map.fromList
         , tpFgDim    = rgb 0x90 0x99 0xab        -- Lifted Frost-Slate (calibrated 4.6:1 against #2e3440)
         , tpAccent1  = rgb 0x88 0xc0 0xd0        -- nord8 (Frost Cyan)
         , tpAccent2  = rgb 0xb4 0x8e 0xad        -- nord15 (Aurora Purple)
-        , tpUser     = rgb 0x81 0xa1 0xc1        -- nord9 (Frost Blue)
+        , tpUser     = rgb 0xd0 0x87 0x70        -- nord12 (Aurora Orange #d08770)
         , tpWarn     = rgb 0xeb 0xcb 0x8b        -- nord13 (Aurora Yellow)
         , tpError    = rgb 0xbf 0x61 0x6a        -- nord11 (Aurora Red)
         , tpSuccess  = rgb 0xa3 0xbe 0x8c        -- nord14 (Aurora Green)
@@ -291,7 +291,9 @@ buildThemeAttrMap ThemePalette{..} =
         Just b  -> c `on` b
       badgeTextBg = case tpBg of
         Nothing -> V.black
-        Just b  -> b
+        Just b
+          | tpName == "solarized-light" -> tpFgBright
+          | otherwise                   -> b
       headerAttr = case tpBgAlt of
         Just altBg -> tpFgBright `on` altBg
         Nothing    -> withThemeBg tpFgBright
@@ -342,6 +344,35 @@ buildThemeAttrMap ThemePalette{..} =
        , (attrName "promptCtxNormal", tpSuccess `on` barBg)
        , (attrName "promptCtxWarn",   (tpWarn `on` barBg) `V.withStyle` V.bold)
        , (attrName "promptCtxHigh",   (tpError `on` barBg) `V.withStyle` V.bold)
+       -- Multi-colored Starship Powerline segments (colored backgrounds, constant dark text)
+       , (attrName "promptCapLeft",         withThemeBg tpUser)
+       , (attrName "promptSeg1",            badgeTextBg `on` tpUser `V.withStyle` V.bold)
+       , (attrName "promptDiv1to2",         tpUser `on` tpWarn)
+       , (attrName "promptSeg2",            badgeTextBg `on` tpWarn `V.withStyle` V.bold)
+       , (attrName "promptDiv2to3",         tpWarn `on` tpAccent2)
+       , (attrName "promptSeg3",            badgeTextBg `on` tpAccent2 `V.withStyle` V.bold)
+       , (attrName "promptDiv3to4",         tpAccent2 `on` tpSuccess)
+       , (attrName "promptDiv3to4Normal",   tpAccent2 `on` tpSuccess)
+       , (attrName "promptDiv3to4Warn",     tpAccent2 `on` tpWarn)
+       , (attrName "promptDiv3to4High",     tpAccent2 `on` tpError)
+       , (attrName "promptSeg4Normal",      badgeTextBg `on` tpSuccess `V.withStyle` V.bold)
+       , (attrName "promptSeg4Warn",        badgeTextBg `on` tpWarn `V.withStyle` V.bold)
+       , (attrName "promptSeg4High",        badgeTextBg `on` tpError `V.withStyle` V.bold)
+       , (attrName "promptDiv4to5Plan",     tpSuccess `on` tpAccent1)
+       , (attrName "promptDiv4to5PlanNormal", tpSuccess `on` tpAccent1)
+       , (attrName "promptDiv4to5PlanWarn",   tpWarn `on` tpAccent1)
+       , (attrName "promptDiv4to5PlanHigh",   tpError `on` tpAccent1)
+       , (attrName "promptDiv4to5Exec",     tpSuccess `on` tpWarn)
+       , (attrName "promptDiv4to5ExecNormal", tpSuccess `on` tpWarn)
+       , (attrName "promptDiv4to5ExecWarn",   tpWarn `on` tpWarn)
+       , (attrName "promptDiv4to5ExecHigh",   tpError `on` tpWarn)
+       , (attrName "promptSeg5Plan",        badgeTextBg `on` tpAccent1 `V.withStyle` V.bold)
+       , (attrName "promptSeg5Exec",        badgeTextBg `on` tpWarn `V.withStyle` V.bold)
+       , (attrName "promptCapRightPlan",    withThemeBg tpAccent1)
+       , (attrName "promptCapRightExec",    withThemeBg tpWarn)
+       , (attrName "promptDiv3to5Plan",     tpAccent2 `on` tpAccent1)
+       , (attrName "promptDiv3to5Exec",     tpAccent2 `on` tpWarn)
+       , (attrName "promptDiv1to3",         tpUser `on` tpAccent2)
        , (attrName "pillLogoCap",       withThemeBg tpUser)
        , (attrName "pillLogoBody",      badgeTextBg `on` tpUser `V.withStyle` V.bold)
        , (attrName "pillModelCap",      withThemeBg tpAccent2)

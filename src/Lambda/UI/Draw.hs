@@ -562,29 +562,51 @@ renderPowerlinePrompt mode model baseUrl turns ctxLimit editor =
     renderStarshipBadgeLine curMode curModel curBaseUrl curTurns curLimit totalW =
       let currentTokens = estimateTotalTokens curTurns
           pct = if curLimit <= 0 then 0 else (currentTokens * 100) `div` curLimit
-          ctxAttr
-            | pct >= 90 = attrName "promptCtxHigh"
-            | pct >= 70 = attrName "promptCtxWarn"
-            | otherwise = attrName "promptCtxNormal"
           (providerStr, modelStr) = extractProviderAndModel curBaseUrl curModel
 
-          leftCap  = withAttr (attrName "promptBarCap") (txt "\xE0B6")
-          rightCap = withAttr (attrName "promptBarCap") (txt "\xE0B4")
-          divider  = withAttr (attrName "promptDivider") (txt " \\ ")
+          slantGlyph    = "\xE0B8"
+          leftCapGlyph  = "\xE0B6"
+          rightCapGlyph = "\xE0B4"
 
-          logoWidget     = withAttr (attrName "promptLogo") (txt " λ")
-          providerWidget = withAttr (attrName "promptProvider") (txt providerStr)
-          modelWidget    = withAttr (attrName "promptModel") (txt modelStr)
-          ctxWidget      = withAttr ctxAttr (txt (T.pack (show pct) <> "%"))
-          modeWidget     = case curMode of
-            PlanMode -> withAttr (attrName "promptPlanMode") (txt "plan ")
-            ExecMode -> withAttr (attrName "promptExecMode") (txt "exec ")
+          capLeft = withAttr (attrName "promptCapLeft") (txt leftCapGlyph)
+
+          seg1 = withAttr (attrName "promptSeg1") (txt " λ ")
+          div1to2 = withAttr (attrName "promptDiv1to2") (txt slantGlyph)
+          div1to3 = withAttr (attrName "promptDiv1to3") (txt slantGlyph)
+
+          seg2 = withAttr (attrName "promptSeg2") (txt (" " <> providerStr <> " "))
+          div2to3 = withAttr (attrName "promptDiv2to3") (txt slantGlyph)
+
+          seg3 = withAttr (attrName "promptSeg3") (txt (" " <> modelStr <> " "))
+          div3to5 = case curMode of
+            PlanMode -> withAttr (attrName "promptDiv3to5Plan") (txt slantGlyph)
+            ExecMode -> withAttr (attrName "promptDiv3to5Exec") (txt slantGlyph)
+
+          (seg4Attr, div3to4Attr, div4to5PlanAttr, div4to5ExecAttr)
+            | pct >= 90 = (attrName "promptSeg4High", attrName "promptDiv3to4High", attrName "promptDiv4to5PlanHigh", attrName "promptDiv4to5ExecHigh")
+            | pct >= 70 = (attrName "promptSeg4Warn", attrName "promptDiv3to4Warn", attrName "promptDiv4to5PlanWarn", attrName "promptDiv4to5ExecWarn")
+            | otherwise = (attrName "promptSeg4Normal", attrName "promptDiv3to4Normal", attrName "promptDiv4to5PlanNormal", attrName "promptDiv4to5ExecNormal")
+          seg4 = withAttr seg4Attr (txt (" " <> T.pack (show pct) <> "% "))
+          div3to4 = withAttr div3to4Attr (txt slantGlyph)
+          div4to5 = case curMode of
+            PlanMode -> withAttr div4to5PlanAttr (txt slantGlyph)
+            ExecMode -> withAttr div4to5ExecAttr (txt slantGlyph)
+
+          (seg5, capRight) = case curMode of
+            PlanMode ->
+              ( withAttr (attrName "promptSeg5Plan") (txt " plan ")
+              , withAttr (attrName "promptCapRightPlan") (txt rightCapGlyph)
+              )
+            ExecMode ->
+              ( withAttr (attrName "promptSeg5Exec") (txt " exec ")
+              , withAttr (attrName "promptCapRightExec") (txt rightCapGlyph)
+              )
 
           segments
-            | totalW < 45 = [logoWidget, divider, modelWidget, divider, modeWidget]
-            | totalW < 65 = [logoWidget, divider, providerWidget, divider, modelWidget, divider, modeWidget]
-            | otherwise   = [logoWidget, divider, providerWidget, divider, modelWidget, divider, ctxWidget, divider, modeWidget]
-      in hBox (leftCap : segments ++ [rightCap])
+            | totalW < 45 = [capLeft, seg1, div1to3, seg3, div3to5, seg5, capRight]
+            | totalW < 65 = [capLeft, seg1, div1to2, seg2, div2to3, seg3, div3to5, seg5, capRight]
+            | otherwise   = [capLeft, seg1, div1to2, seg2, div2to3, seg3, div3to4, seg4, div4to5, seg5, capRight]
+      in hBox segments
 
 
 renderSubAgents :: Map.Map Int SubAgentTask -> Widget ResourceName
