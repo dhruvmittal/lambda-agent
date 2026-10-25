@@ -225,6 +225,8 @@ main = do
           , uiSessionChooser   = Nothing
           , uiIsGenerating     = False
           , uiSpinnerStep      = 0
+          , uiExecutionStart   = Nothing
+          , uiElapsedSeconds   = 0
           , uiConfig           = cfg
           }
 

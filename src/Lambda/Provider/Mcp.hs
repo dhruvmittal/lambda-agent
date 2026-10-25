@@ -135,6 +135,7 @@ parseMcpTool _serverName rpcClient (Aeson.Object obj) = do
         callRes <- sendRequest rpcClient "tools/call" $ Aeson.object
           [ "name"      .= tName
           , "arguments" .= argsVal
+          , "_meta"     .= Aeson.object ["progressToken" .= tName]
           ]
         case callRes of
           Left err -> pure $ ToolResult "" "" ("MCP tool execution error (" <> tName <> "): " <> err) Nothing

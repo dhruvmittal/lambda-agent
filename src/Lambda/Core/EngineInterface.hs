@@ -31,7 +31,7 @@ import Lambda.Engine.Security (SecurityState(..), initSecurityWithRoot)
 import Lambda.Engine.Session (exportSessionTrace, loadSession, forkSession, deriveTitle, Session(..))
 import Lambda.Engine.State
 import Lambda.Engine.SubAgent (spawnSpecialistSubAgentTool, accumulateStreamChunks)
-import Lambda.Provider.Builtin (builtinTools, builtinToolsWithManager)
+import Lambda.Provider.Builtin (builtinToolsWithManager)
 import Lambda.Provider.Mcp (McpClient, startAndLoadMcpServers, stopMcpClient)
 import Lambda.Driver.OpenAI (openAiDynamicDriver)
 import Lambda.Types

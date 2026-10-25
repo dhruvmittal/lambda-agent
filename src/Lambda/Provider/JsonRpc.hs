@@ -10,10 +10,13 @@ module Lambda.Provider.JsonRpc
   , sendNotification
   ) where
 
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (Async, async, cancel)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, try, bracket, mask_)
+import Control.Monad (when)
+import System.Posix.Signals (signalProcessGroup, sigTERM, sigKILL)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:))
 import Data.Aeson.Types (parseEither)
@@ -49,6 +52,7 @@ startRpcClientWithEnv framing cmd args extraEnv = do
       baseProc = setStdin createPipe
                $ setStdout createPipe
                $ setStderr createPipe
+               $ setCreateGroup True
                $ proc cmd (map T.unpack args)
       pConf = if null extraEnv then baseProc else setEnv mergedEnv baseProc
   p <- startProcess pConf
@@ -142,8 +146,17 @@ sendRequest client method params =
       tmvar <- newEmptyTMVar
       modifyTVar' (rpcPending client) (Map.insert currId tmvar)
       pure (currId, tmvar)
-    cleanupReq (reqId, _) =
-      atomically $ modifyTVar' (rpcPending client) (Map.delete reqId)
+    cleanupReq (reqId, _) = do
+      wasUnfinished <- atomically $ do
+        pend <- readTVar (rpcPending client)
+        let unfinished = Map.member reqId pend
+        modifyTVar' (rpcPending client) (Map.delete reqId)
+        pure unfinished
+      when wasUnfinished $ do
+        sendNotification client "notifications/cancelled" $ Aeson.object
+          [ "requestId" .= reqId
+          , "reason"    .= ("User interrupted execution" :: Text)
+          ]
 
 sendNotification :: JsonRpcClient -> Text -> Aeson.Value -> IO ()
 sendNotification client method params = do
@@ -163,6 +176,15 @@ stopRpcClient :: JsonRpcClient -> IO ()
 stopRpcClient client = do
   cancel (rpcReader client)
   cancel (rpcStderrReader client)
+  mPid <- getPid (rpcProcess client)
+  case mPid of
+    Just pid | pid > 1 -> do
+      let pgid = pid
+      _ <- try (signalProcessGroup sigTERM pgid) :: IO (Either SomeException ())
+      threadDelay 50000
+      _ <- try (signalProcessGroup sigKILL pgid) :: IO (Either SomeException ())
+      pure ()
+    _ -> pure ()
   _ <- (try (stopProcess (rpcProcess client)) :: IO (Either SomeException ()))
   pure ()
 

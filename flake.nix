@@ -12,7 +12,7 @@
         pkgs = import nixpkgs { inherit system; };
         ghcVersion = "ghc96";
         hp = pkgs.haskell.packages.${ghcVersion};
-        lambdaPkg = hp.callCabal2nix "lambda" ./. {};
+        lambdaPkg = pkgs.haskell.lib.doCheck (hp.callCabal2nix "lambda" ./. {});
       in {
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [

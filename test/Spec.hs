@@ -98,7 +98,7 @@ import Lambda.UI.Markdown
   , MdBlock(..)
   , WordToken(..)
   )
-import Lambda.UI.Types (CompletionState(..), Candidate(..), simpleCandidate, ResourceName(..), UIState(..), isGeneratingL, spinnerStepL, workingStateL, turnsL)
+import Lambda.UI.Types (CompletionState(..), Candidate(..), simpleCandidate, ResourceName(..), UIState(..), isGeneratingL, spinnerStepL, workingStateL, turnsL, defaultUIState)
 import Lambda.UI.Theme (ThemePalette(..), builtinThemes, builtinThemeNames, parseHexColor, resolveThemePalette, resolveThemeAttrMap)
 import Lambda.Types
 import Lens.Micro ((&), (^.), (.~), (%~))
@@ -185,6 +185,7 @@ main = do
   testSubprocessGroupTerminationEscalation
   testJsonRpcAsyncExceptionSafety
   testWorkingStateBackwardsCompatibility
+  testLongRunningUnboundedAndCancellation
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -1360,29 +1361,10 @@ testContextualCompletersAndMruInvariant = do
   -- Setup dummy UI state
   evQ <- atomically newTQueue
   chans <- initEngineChannels evQ
-  let dummyUI subs = UIState
-        { uiTurns            = []
-        , uiSubAgents        = subs
-        , uiCurrentPrompt    = Nothing
-        , uiPendingPrompts   = Seq.Empty
-        , uiMode             = PlanMode
-        , uiEditor           = E.editor EditorInput (Just 1) ""
-        , uiWorkingState     = ""
-        , uiChannels         = chans
-        , uiLastEscTime      = Nothing
-        , uiContextLimit     = 8192
-        , uiPromptHistory    = []
-        , uiHistoryIndex     = Nothing
-        , uiSavedDraft       = ""
-        , uiModelName        = "test"
-        , uiThinkingVisible  = True
-        , uiSelectedSubAgent = Nothing
-        , uiShowHud          = False
-        , uiCompletion       = Nothing
-        , uiSessionChooser   = Nothing
-        , uiIsGenerating     = False
-        , uiSpinnerStep      = 0
-        , uiConfig           = defaultConfig
+  let dummyUI subs = (defaultUIState chans defaultConfig)
+        { uiSubAgents    = subs
+        , uiContextLimit = 8192
+        , uiModelName    = "test"
         }
 
   -- 2. /mode contextual completion
@@ -1527,29 +1509,9 @@ testDynamicModelSwitching = do
     (updatedLim == 200000)
 
   -- 4. Contextual autocomplete for /model
-  let dummyUI = UIState
-        { uiTurns            = []
-        , uiSubAgents        = Map.empty
-        , uiCurrentPrompt    = Nothing
-        , uiPendingPrompts   = Seq.Empty
-        , uiMode             = PlanMode
-        , uiEditor           = E.editor EditorInput (Just 1) ""
-        , uiWorkingState     = ""
-        , uiChannels         = chans
-        , uiLastEscTime      = Nothing
-        , uiContextLimit     = 8192
-        , uiPromptHistory    = []
-        , uiHistoryIndex     = Nothing
-        , uiSavedDraft       = ""
-        , uiModelName        = "test"
-        , uiThinkingVisible  = True
-        , uiSelectedSubAgent = Nothing
-        , uiShowHud          = False
-        , uiCompletion       = Nothing
-        , uiSessionChooser   = Nothing
-        , uiIsGenerating     = False
-        , uiSpinnerStep      = 0
-        , uiConfig           = defaultConfig { apiBaseUrl = "https://openrouter.ai/api/v1" }
+  let dummyUI = (defaultUIState chans (defaultConfig { apiBaseUrl = "https://openrouter.ai/api/v1" }))
+        { uiContextLimit = 8192
+        , uiModelName    = "test"
         }
 
   mModelComp <- completeInput "." dummyUI "/model "
@@ -1739,29 +1701,9 @@ testPromptMacrosAndExpansion = do
   cfg <- loadConfig "."
   es <- initEngineState cfg emptyRegistry sec
   chans <- initEngineChannels (appEventQueue es)
-  let dummyUI = UIState
-        { uiTurns            = []
-        , uiSubAgents        = Map.empty
-        , uiCurrentPrompt    = Nothing
-        , uiPendingPrompts   = Seq.Empty
-        , uiMode             = PlanMode
-        , uiEditor           = E.editor EditorInput (Just 1) ""
-        , uiWorkingState     = ""
-        , uiChannels         = chans
-        , uiLastEscTime      = Nothing
-        , uiContextLimit     = 8192
-        , uiPromptHistory    = []
-        , uiHistoryIndex     = Nothing
-        , uiSavedDraft       = ""
-        , uiModelName        = "test"
-        , uiThinkingVisible  = True
-        , uiSelectedSubAgent = Nothing
-        , uiShowHud          = False
-        , uiCompletion       = Nothing
-        , uiSessionChooser   = Nothing
-        , uiIsGenerating     = False
-        , uiSpinnerStep      = 0
-        , uiConfig           = cfg
+  let dummyUI = (defaultUIState chans cfg)
+        { uiContextLimit = 8192
+        , uiModelName    = "test"
         }
 
   mPromptComp <- completeInput tempDir dummyUI "/prompt "
@@ -1845,29 +1787,8 @@ testModelSwitchingDeploymentFixes = do
   -- 3. Verify Autocomplete Candidate Filtering (Local vs Cloud)
   evQ <- atomically newTQueue
   chans <- initEngineChannels evQ
-  let localUI = UIState
-        { uiTurns            = []
-        , uiSubAgents        = Map.empty
-        , uiCurrentPrompt    = Nothing
-        , uiPendingPrompts   = Seq.Empty
-        , uiMode             = PlanMode
-        , uiEditor           = E.editor EditorInput (Just 1) ""
-        , uiWorkingState     = ""
-        , uiChannels         = chans
-        , uiLastEscTime      = Nothing
-        , uiContextLimit     = 128000
-        , uiPromptHistory    = []
-        , uiHistoryIndex     = Nothing
-        , uiSavedDraft       = ""
-        , uiModelName        = "qwen2.5-coder:32b"
-        , uiThinkingVisible  = True
-        , uiSelectedSubAgent = Nothing
-        , uiShowHud          = False
-        , uiCompletion       = Nothing
-        , uiSessionChooser   = Nothing
-        , uiIsGenerating     = False
-        , uiSpinnerStep      = 0
-        , uiConfig           = localCfg
+  let localUI = (defaultUIState chans localCfg)
+        { uiModelName = "qwen2.5-coder:32b"
         }
 
   mLocalComp <- completeInput "." localUI "/model "
@@ -1927,29 +1848,8 @@ testNullDefaultsAndProviderTransparency = do
   -- 3. Verify unconfigured endpoint provides 0 cloud candidates in autocomplete
   evQ <- atomically newTQueue
   chans <- initEngineChannels evQ
-  let unconfiguredUI = UIState
-        { uiTurns            = []
-        , uiSubAgents        = Map.empty
-        , uiCurrentPrompt    = Nothing
-        , uiPendingPrompts   = Seq.Empty
-        , uiMode             = PlanMode
-        , uiEditor           = E.editor EditorInput (Just 1) ""
-        , uiWorkingState     = ""
-        , uiChannels         = chans
-        , uiLastEscTime      = Nothing
-        , uiContextLimit     = 128000
-        , uiPromptHistory    = []
-        , uiHistoryIndex     = Nothing
-        , uiSavedDraft       = ""
-        , uiModelName        = ""
-        , uiThinkingVisible  = True
-        , uiSelectedSubAgent = Nothing
-        , uiShowHud          = False
-        , uiCompletion       = Nothing
-        , uiSessionChooser   = Nothing
-        , uiIsGenerating     = False
-        , uiSpinnerStep      = 0
-        , uiConfig           = defaultConfig
+  let unconfiguredUI = (defaultUIState chans defaultConfig)
+        { uiModelName = ""
         }
 
   mUnconfComp <- completeInput "." unconfiguredUI "/model "
@@ -2232,29 +2132,9 @@ testHeadlessUiEventSmoke = do
   channels <- initEngineChannels eQueue
   let cfg = defaultConfig { workspaceRoot = "." }
       initialTurns = [Turn 1 SystemRole [TextBlock "lambdA initialized. Enter a goal or press /help for commands."]]
-      initialUIState = UIState
-        { uiTurns            = initialTurns
-        , uiSubAgents        = Map.empty
-        , uiCurrentPrompt    = Nothing
-        , uiPendingPrompts   = Seq.Empty
-        , uiMode             = PlanMode
-        , uiEditor           = E.editor EditorInput (Just 1) ""
-        , uiWorkingState     = "GOAL: Headless UI Smoke Test"
-        , uiChannels         = channels
-        , uiLastEscTime      = Nothing
-        , uiContextLimit     = 128000
-        , uiPromptHistory    = []
-        , uiHistoryIndex     = Nothing
-        , uiSavedDraft       = ""
-        , uiModelName        = "mock-model"
-        , uiThinkingVisible  = True
-        , uiSelectedSubAgent = Nothing
-        , uiShowHud          = False
-        , uiCompletion       = Nothing
-        , uiSessionChooser   = Nothing
-        , uiIsGenerating     = False
-        , uiSpinnerStep      = 0
-        , uiConfig           = cfg
+      initialUIState = (defaultUIState channels cfg)
+        { uiTurns        = initialTurns
+        , uiWorkingState = "GOAL: Headless UI Smoke Test"
         }
       testApp :: App UIState EngineEvent ResourceName
       testApp = App
@@ -2762,29 +2642,8 @@ testThemeEngineAndCompletion = do
 
   eQueue <- atomically (newTQueue :: STM (TQueue EngineEvent))
   channels <- initEngineChannels eQueue
-  let dummyUI = UIState
-        { uiTurns            = []
-        , uiSubAgents        = Map.empty
-        , uiCurrentPrompt    = Nothing
-        , uiPendingPrompts   = Seq.Empty
-        , uiMode             = PlanMode
-        , uiEditor           = E.editor EditorInput (Just 1) ""
-        , uiWorkingState     = ""
-        , uiChannels         = channels
-        , uiLastEscTime      = Nothing
-        , uiContextLimit     = 128000
-        , uiPromptHistory    = []
-        , uiHistoryIndex     = Nothing
-        , uiSavedDraft       = ""
-        , uiModelName        = ""
-        , uiThinkingVisible  = True
-        , uiSelectedSubAgent = Nothing
-        , uiShowHud          = False
-        , uiCompletion       = Nothing
-        , uiSessionChooser   = Nothing
-        , uiIsGenerating     = False
-        , uiSpinnerStep      = 0
-        , uiConfig           = customCfg
+  let dummyUI = (defaultUIState channels customCfg)
+        { uiModelName = ""
         }
   mThemeComp <- completeInput "." dummyUI "/theme "
   case mThemeComp of
@@ -3037,29 +2896,10 @@ testUiGeneratingEventLifecycleAndIdleTick = do
   channels <- initEngineChannels eQueue
   let cfg = defaultConfig { workspaceRoot = "." }
       initialTurns = [Turn 1 UserRole [TextBlock "Run diagnostic"]]
-      initialUIState = UIState
-        { uiTurns            = initialTurns
-        , uiSubAgents        = Map.empty
-        , uiCurrentPrompt    = Nothing
-        , uiPendingPrompts   = Seq.Empty
-        , uiMode             = PlanMode
-        , uiEditor           = E.editor EditorInput (Just 1) ""
-        , uiWorkingState     = "GOAL: Test Generating State"
-        , uiChannels         = channels
-        , uiLastEscTime      = Nothing
-        , uiContextLimit     = 128000
-        , uiPromptHistory    = []
-        , uiHistoryIndex     = Nothing
-        , uiSavedDraft       = ""
-        , uiModelName        = "mock-model"
-        , uiThinkingVisible  = True
-        , uiSelectedSubAgent = Nothing
-        , uiShowHud          = False
-        , uiCompletion       = Nothing
-        , uiSessionChooser   = Nothing
-        , uiIsGenerating     = True
-        , uiSpinnerStep      = 0
-        , uiConfig           = cfg
+      initialUIState = (defaultUIState channels cfg)
+        { uiTurns        = initialTurns
+        , uiWorkingState = "GOAL: Test Generating State"
+        , uiIsGenerating = True
         }
       testApp :: App UIState EngineEvent ResourceName
       testApp = App
@@ -3350,6 +3190,8 @@ testWorkingStateBackwardsCompatibility = do
         , uiSessionChooser = Nothing
         , uiIsGenerating = False
         , uiSpinnerStep = 0
+        , uiExecutionStart = Nothing
+        , uiElapsedSeconds = 0
         , uiConfig = cfg
         }
   let modifiedState = baseState
@@ -3371,6 +3213,45 @@ testWorkingStateBackwardsCompatibility = do
   assert "fetchUrlToolWithManager created tool definition" (toolName fetchTool == "fetch_url")
 
   putStrLn "  -> OK: WorkingState ADT backwards compatibility, lens ergonomics, and HTTP manager injection verified."
+
+-- 68. Unbounded Compute, Output File Redirection & Cooperative Cancellation
+testLongRunningUnboundedAndCancellation :: IO ()
+testLongRunningUnboundedAndCancellation = do
+  putStrLn "\n[Test 68] Unbounded Compute, Direct File Redirection & Cooperative Cancellation"
+
+  -- 1. Test bashTool with timeout_seconds = 0 (unbounded)
+  let bash = bashTool "." ".lambda/test_artifacts_68"
+      unboundedArgs = Aeson.object
+        [ "command" .= ("echo 'unbounded task completed'" :: Text)
+        , "timeout_seconds" .= (0 :: Int)
+        ]
+  resUnbounded <- toolExecute bash MainAgent unboundedArgs
+  assert "Unbounded task runs without timeout error" ("unbounded task completed" `T.isInfixOf` resultStdout resUnbounded)
+  assert "Small task does not produce artifact" (resultArtifactPath resUnbounded == Nothing)
+
+  -- 2. Test large output (> 40 lines) spools directly to disk artifact and generates pointer
+  let largeCmd = "for i in $(seq 1 60); do echo \"Log line $i generated by compute task\"; done"
+      largeArgs = Aeson.object
+        [ "command" .= (largeCmd :: Text)
+        , "timeout_seconds" .= (10 :: Int)
+        ]
+  resLarge <- toolExecute bash MainAgent largeArgs
+  assert "Large task generates artifact file on disk" (resultArtifactPath resLarge /= Nothing)
+  assert "Large task generates artifact_pointer" ("<artifact_pointer" `T.isInfixOf` resultStdout resLarge)
+  case resultArtifactPath resLarge of
+    Just path -> do
+      exists <- doesFileExist path
+      assert "Artifact file physically exists on disk" exists
+    Nothing -> failTest "Expected artifact path for 60-line output"
+
+  -- 3. Test Cooperative Cancellation in JsonRpc
+  client <- startRpcClient LineFramed "cat" []
+  _ <- timeout 20000 $ sendRequest client "long_running_mcp_task" (Aeson.object ["k" .= ("v" :: Text)])
+  pendingAfter <- readTVarIO (rpcPending client)
+  assert "Cancelled request was cleanly removed from pending map" (Map.null pendingAfter)
+  stopRpcClient client
+
+  putStrLn "  -> OK: Unbounded execution, direct OS artifact redirection, and cooperative cancellation verified."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

@@ -8,6 +8,10 @@ module Lambda.UI.Draw
   , renderInlineSubAgent
   , renderCompletionLine
   , renderPowerlinePrompt
+  , renderPowerlinePromptWithElapsed
+  , headerBar
+  , headerBarWithElapsed
+  , formatElapsed
   , wrapLineWithSpans
   , wrapLineWithWidths
   , wrapEditorToVisual
@@ -38,7 +42,7 @@ import Lambda.Engine.Compactor (estimateTotalTokens)
 import Lambda.Engine.Session (SessionMeta(..))
 import Lambda.Types
 import Lambda.UI.Completion (slidingCandidateWindow)
-import Lambda.UI.Markdown (renderMarkdown)
+import Lambda.UI.Markdown (renderMarkdown, textVisualWidth)
 import Lambda.UI.Types
 
 drawApp :: UIState -> [Widget ResourceName]
@@ -237,9 +241,12 @@ mainLayout :: UIState -> Widget ResourceName
 mainLayout UIState{..} =
   let hasRunningSubs = any (\t -> subAgentStatus t == SubAgentRunning) (Map.elems uiSubAgents)
       isWaiting = uiIsGenerating || hasRunningSubs
+      mElapsed = if isWaiting && uiElapsedSeconds > 0
+                   then Just (formatElapsed uiElapsedSeconds)
+                   else Nothing
   in vBox
-    [ headerBar uiWorkingState uiSelectedSubAgent
-    , renderMainPane uiSelectedSubAgent uiTurns uiSubAgents uiCompletion uiMode uiModelName uiContextLimit uiConfig uiEditor isWaiting uiSpinnerStep
+    [ headerBarWithElapsed uiWorkingState uiSelectedSubAgent mElapsed
+    , renderMainPane uiSelectedSubAgent uiTurns uiSubAgents uiCompletion uiMode uiModelName uiContextLimit uiConfig uiEditor isWaiting uiSpinnerStep mElapsed
     ]
 
 renderMainPane
@@ -254,8 +261,9 @@ renderMainPane
   -> E.Editor Text ResourceName
   -> Bool
   -> Int
+  -> Maybe Text
   -> Widget ResourceName
-renderMainPane mSelected turns subs uiComp mode model ctxLimit cfg editor isWaiting spinnerStep =
+renderMainPane mSelected turns subs uiComp mode model ctxLimit cfg editor isWaiting spinnerStep mElapsed =
   vBox
     [ viewport ChatView Vertical $
         padLeftRight 1 $
@@ -265,7 +273,7 @@ renderMainPane mSelected turns subs uiComp mode model ctxLimit cfg editor isWait
                    else renderFleetStrip mSelected subList
             else vBox (map renderTurnPair turnPairs)
     , renderCompletionLine uiComp
-    , renderPowerlinePrompt mode model (apiBaseUrl cfg) turns ctxLimit editor isWaiting spinnerStep
+    , renderPowerlinePromptWithElapsed mode model (apiBaseUrl cfg) turns ctxLimit editor isWaiting spinnerStep mElapsed
     ]
   where
     subList = Map.elems subs
@@ -288,7 +296,10 @@ distributeSubAgentsToTurns turns subList =
          reverse ((lastT, lastSubs ++ unanchored) : older)
 
 headerBar :: Text -> Maybe Int -> Widget ResourceName
-headerBar workingStateText mSelected =
+headerBar workingStateText mSelected = headerBarWithElapsed workingStateText mSelected Nothing
+
+headerBarWithElapsed :: Text -> Maybe Int -> Maybe Text -> Widget ResourceName
+headerBarWithElapsed workingStateText mSelected mElapsed =
   vLimit 1 $
     withAttr (attrName "headerBar") $
       hBox
@@ -300,6 +311,9 @@ headerBar workingStateText mSelected =
             Just sId -> hBox [ str " │ ", withAttr (attrName "selectedBadge") (str $ " [SUBAGENT #" <> show sId <> "] ") ]
             Nothing  -> emptyWidget
         , fill ' '
+        , case mElapsed of
+            Just el -> hBox [ withAttr (attrName "selectedBadge") (txt $ " [⚙ " <> el <> " elapsed · Esc to cancel] "), str " " ]
+            Nothing -> emptyWidget
         , txt (case wsBlockedOn ws of
                  Just b  -> "● BLOCKED_ON: " <> b
                  Nothing -> "✓ Ready")
@@ -514,17 +528,36 @@ wrapEditorToVisualWithFirstWidth firstW restW rawLines (curCol, curRow) =
 wrapEditorToVisual :: Int -> [Text] -> (Int, Int) -> ([Text], (Int, Int))
 wrapEditorToVisual maxW = wrapEditorToVisualWithFirstWidth maxW maxW
 
+-- | Formats elapsed seconds into human-readable duration
+formatElapsed :: Int -> Text
+formatElapsed secs =
+  let m = secs `div` 60
+      s = secs `mod` 60
+      h = m `div` 60
+      remM = m `mod` 60
+  in if h > 0
+       then T.pack (show h) <> "h " <> T.pack (show remM) <> "m " <> T.pack (show s) <> "s"
+       else if m > 0
+         then T.pack (show m) <> "m " <> T.pack (show s) <> "s"
+         else T.pack (show s) <> "s"
+
 renderPowerlinePrompt :: AgentMode -> Text -> Text -> [Turn] -> Int -> E.Editor Text ResourceName -> Bool -> Int -> Widget ResourceName
 renderPowerlinePrompt mode model baseUrl turns ctxLimit editor isWaiting spinnerStep =
+  renderPowerlinePromptWithElapsed mode model baseUrl turns ctxLimit editor isWaiting spinnerStep Nothing
+
+renderPowerlinePromptWithElapsed :: AgentMode -> Text -> Text -> [Turn] -> Int -> E.Editor Text ResourceName -> Bool -> Int -> Maybe Text -> Widget ResourceName
+renderPowerlinePromptWithElapsed mode model baseUrl turns ctxLimit editor isWaiting spinnerStep mElapsed =
   Widget Greedy Fixed $ do
     c <- getContext
     let totalW = c ^. availWidthL
         spinnerFrames = ["⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ "]
         promptArrowStr =
           if isWaiting
-            then spinnerFrames !! (spinnerStep `mod` length spinnerFrames)
+            then case mElapsed of
+                   Just el -> (spinnerFrames !! (spinnerStep `mod` length spinnerFrames)) <> "[" <> T.unpack el <> "] "
+                   Nothing -> spinnerFrames !! (spinnerStep `mod` length spinnerFrames)
             else "→ "
-        arrowW = 2
+        arrowW = max 2 (textVisualWidth (T.pack promptArrowStr))
         firstW = max 10 (totalW - arrowW)
         restW = max 10 totalW
         edContents = E.getEditContents editor
@@ -538,7 +571,7 @@ renderPowerlinePrompt mode model baseUrl turns ctxLimit editor isWaiting spinner
         renderVisualLine :: Int -> Text -> Widget ResourceName
         renderVisualLine 0 l =
           hBox
-            [ withAttr (attrName "promptArrow") (txt promptArrowStr)
+            [ withAttr (attrName "promptArrow") (str promptArrowStr)
             , txt (if T.null l then " " else l)
             ]
         renderVisualLine _ l =

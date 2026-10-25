@@ -69,6 +69,7 @@ handleAppEvent (AppEvent engineEv) = do
         , uiMode = mode
         , uiSelectedSubAgent = Nothing
         , uiIsGenerating = False
+        , uiExecutionStart = Nothing
         }
       vScrollToEnd (viewportScroll ChatView)
     EvSubAgentUpdate task -> do
@@ -94,17 +95,34 @@ handleAppEvent (AppEvent engineEv) = do
       modify $ \s -> s
         { uiTurns = uiTurns s ++ [Turn tId SystemRole [TextBlock ("⚠️ Error: " <> err)]]
         , uiIsGenerating = False
+        , uiExecutionStart = Nothing
+        , uiElapsedSeconds = 0
         }
       vScrollToEnd (viewportScroll ChatView)
     EvStreamChunk _ -> continueWithoutRedraw
     EvDone -> do
-      modify (isGeneratingL .~ False)
+      modify $ \s -> s { uiIsGenerating = False, uiExecutionStart = Nothing, uiElapsedSeconds = 0 }
       vScrollToEnd (viewportScroll ChatView)
     EvTick -> do
       gen <- gets uiIsGenerating
       hasRunningSubs <- gets (any (\t -> subAgentStatus t == SubAgentRunning) . Map.elems . uiSubAgents)
       if gen || hasRunningSubs
-        then modify (spinnerStepL %~ (\x -> (x + 1) `mod` 10))
+        then do
+          now <- liftIO getCurrentTime
+          mStart <- gets uiExecutionStart
+          case mStart of
+            Just start -> do
+              let elapsed = round (diffUTCTime now start) :: Int
+              if elapsed > 3
+                then do
+                  step <- gets uiSpinnerStep
+                  if step `mod` 12 == 0
+                    then modify $ \s -> s { uiSpinnerStep = (uiSpinnerStep s + 1) `mod` 120, uiElapsedSeconds = elapsed }
+                    else continueWithoutRedraw
+                else
+                  modify $ \s -> s { uiSpinnerStep = (uiSpinnerStep s + 1) `mod` 10, uiElapsedSeconds = elapsed }
+            Nothing ->
+              modify (spinnerStepL %~ (\x -> (x + 1) `mod` 10))
         else continueWithoutRedraw
   where
     updateMatchingTurn updatedTurn turns =
@@ -129,7 +147,7 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 'c') [V.MCtrl])) = do
       liftIO $ atomically $ do
         writeTBQueue (cmdQueue (uiChannels st)) CmdInterrupt
         writeTBQueue (cmdQueue (uiChannels st)) (CmdSystemMessage "⚠️ Generation interrupted (Ctrl+C)...")
-      put st { uiIsGenerating = False }
+      put st { uiIsGenerating = False, uiExecutionStart = Nothing, uiElapsedSeconds = 0 }
     else if not (T.null editorText)
       then put st { uiEditor = E.editor EditorInput Nothing "", uiCompletion = Nothing }
       else do
@@ -921,7 +939,8 @@ handleCommand cmdText = do
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdQuit
       halt
     _ -> do
-      put st { uiIsGenerating = True }
+      now <- liftIO getCurrentTime
+      put st { uiIsGenerating = True, uiExecutionStart = Just now, uiElapsedSeconds = 0 }
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdUserPrompt cmdText)
 
 resolveActiveModal :: PermissionLevel -> EventM ResourceName UIState ()

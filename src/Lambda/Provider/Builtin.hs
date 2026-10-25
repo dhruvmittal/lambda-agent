@@ -23,7 +23,6 @@ import System.Posix.Signals (signalProcessGroup, sigTERM, sigKILL)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?), (.!=))
 import Data.Aeson.Types (parseEither)
-import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -32,13 +31,16 @@ import qualified Data.Text.IO as TIO
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS (newTlsManager)
 import Network.HTTP.Types.Header (hUserAgent, hAccept)
-import System.Directory (doesFileExist, doesDirectoryExist, listDirectory, createDirectoryIfMissing)
+import System.Directory (doesFileExist, doesDirectoryExist, listDirectory, createDirectoryIfMissing, getFileSize, removeFile)
 import System.FilePath (takeDirectory, isAbsolute, (</>))
+import System.IO (withFile, IOMode(..), hSetBuffering, BufferMode(..), hFlush)
 import System.Process.Typed
 import System.Timeout (timeout)
+import Data.Time.Clock (getCurrentTime)
+import Data.Time.Format (defaultTimeLocale, formatTime)
 
 import Lambda.Core.ToolProvider
-import Lambda.Engine.Artifacts (spoolDiagnosticArtifact)
+import Lambda.Engine.Artifacts (spoolDiagnosticArtifact, formatArtifactPointer)
 import Lambda.Types
 
 builtinTools :: FilePath -> FilePath -> [ToolDefinition]
@@ -104,14 +106,19 @@ bashTool wsRoot artDir = ToolDefinition
       case parseEither (Aeson.withObject "bash" $ \o -> (,) <$> o .: "command" <*> (o .:? "timeout_seconds")) args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
         Right (cmd, mTimeout) -> do
-          let reqTimeout = maybe 120 id mTimeout
+          let isUnbounded = case mTimeout of
+                Just t  -> t <= 0
+                Nothing -> False
+              reqTimeout = maybe 120 id mTimeout
               effTimeout = max 1 (min 7200 reqTimeout)
-              pConf = setStdin closed
-                    $ setStdout byteStringOutput
-                    $ setStderr byteStringOutput
-                    $ setWorkingDir wsRoot
-                    $ setCreateGroup True
-                    $ shell (T.unpack cmd)
+
+          createDirectoryIfMissing True artDir
+          now <- getCurrentTime
+          let ts = formatTime defaultTimeLocale "%Y%m%d_%H%M%S" now
+              pico = take 6 (formatTime defaultTimeLocale "%q" now)
+              filename = "bash_" <> ts <> "_" <> pico <> ".log"
+              logPath = artDir </> filename
+
           let killProcessGroup p = do
                 mPid <- getPid p
                 case mPid of
@@ -122,42 +129,77 @@ bashTool wsRoot artDir = ToolDefinition
                     _ <- try (signalProcessGroup sigKILL pgid) :: IO (Either SomeException ())
                     pure ()
                   _ -> pure ()
-          res <- try $ withProcessTerm pConf $ \p -> do
-            let runProc = do
-                  mRes <- timeout (effTimeout * 1000000) $
-                    atomically $ (,,) <$> waitExitCodeSTM p <*> getStdout p <*> getStderr p
-                  case mRes of
-                    Nothing -> do
-                      killProcessGroup p
-                      pure Nothing
-                    Just ok -> pure (Just ok)
-            runProc `onException` killProcessGroup p
+
+          res <- withFile logPath WriteMode $ \hLog -> do
+            hSetBuffering hLog LineBuffering
+            let pConf = setStdin closed
+                      $ setStdout (useHandleOpen hLog)
+                      $ setStderr (useHandleOpen hLog)
+                      $ setWorkingDir wsRoot
+                      $ setCreateGroup True
+                      $ shell (T.unpack cmd)
+            try $ withProcessTerm pConf $ \p -> do
+              let runProc = do
+                    let waitExit = atomically $ waitExitCodeSTM p
+                    mRes <- if isUnbounded
+                              then Just <$> waitExit
+                              else timeout (effTimeout * 1000000) waitExit
+                    case mRes of
+                      Nothing -> do
+                        killProcessGroup p
+                        pure Nothing
+                      Just code -> do
+                        hFlush hLog
+                        pure (Just code)
+              runProc `onException` killProcessGroup p
+
+          fSize <- getFileSize logPath
           case res of
             Left (ex :: SomeException)
               | "waitForProcess: does not exist" `T.isInfixOf` T.pack (show ex) ->
-                  pure $ ToolResult "" "" ("Command timed out after " <> T.pack (show effTimeout) <> " seconds.") Nothing
+                  pure $ ToolResult "" "" ("Command timed out after " <> T.pack (show effTimeout) <> " seconds.") (if fSize > 0 then Just logPath else Nothing)
               | otherwise ->
-                  pure $ ToolResult "" "" ("Execution exception: " <> T.pack (show ex)) Nothing
+                  pure $ ToolResult "" "" ("Execution exception: " <> T.pack (show ex)) (if fSize > 0 then Just logPath else Nothing)
             Right Nothing ->
-              pure $ ToolResult "" "" ("Command timed out after " <> T.pack (show effTimeout) <> " seconds.") Nothing
-            Right (Just (exitCode, outBs, errBs)) -> do
-              let outText = TE.decodeUtf8Lenient (BS.toStrict outBs)
-                  errText = TE.decodeUtf8Lenient (BS.toStrict errBs)
-                  combined = if T.null errText then outText else outText <> "\nSTDERR:\n" <> errText
-
-              (compactOutput, mArtifact) <- spoolDiagnosticArtifact artDir "bash" combined
+              pure $ ToolResult "" "" ("Command timed out after " <> T.pack (show effTimeout) <> " seconds.") (if fSize > 0 then Just logPath else Nothing)
+            Right (Just exitCode) -> do
+              (compactOutput, mArtifact) <-
+                if fSize <= 2000
+                  then do
+                    content <- TIO.readFile logPath
+                    let ls = T.lines content
+                    if length ls <= 40
+                      then do
+                        _ <- try (removeFile logPath) :: IO (Either SomeException ())
+                        pure (content, Nothing)
+                      else do
+                        let headLines = take 15 ls
+                            tailLines = drop (max 0 (length ls - 25)) ls
+                            summaryText = T.unlines
+                              [ T.unlines headLines
+                              , "... [" <> T.pack (show (length ls - 40)) <> " lines omitted. Full dump spooled out-of-band] ..."
+                              , T.unlines tailLines
+                              ]
+                            pointer = formatArtifactPointer (T.pack filename) logPath summaryText (length ls)
+                        pure (pointer, Just logPath)
+                  else do
+                    content <- TIO.readFile logPath
+                    let ls = T.lines content
+                        headLines = take 15 ls
+                        tailLines = drop (max 0 (length ls - 25)) ls
+                        summaryText = T.unlines
+                          [ T.unlines headLines
+                          , "... [" <> T.pack (show (length ls - 40)) <> " lines omitted. Full dump spooled out-of-band] ..."
+                          , T.unlines tailLines
+                          ]
+                        pointer = formatArtifactPointer (T.pack filename) logPath summaryText (length ls)
+                    pure (pointer, Just logPath)
 
               let exitStatus = case exitCode of
                     ExitSuccess -> ""
                     ExitFailure code -> "\n[Process exited with code " <> T.pack (show code) <> "]"
 
-              -- When output is spooled, compactOutput already captures the combined stdout/stderr summary.
-              -- Cap resultStderr so raw unspooled megabytes never bypass compaction to remote API payloads.
-              let boundedErr = case mArtifact of
-                    Just _ -> ""
-                    Nothing -> if T.length errText > 2000 then T.takeEnd 2000 errText else errText
-
-              pure $ ToolResult "" (compactOutput <> exitStatus) boundedErr mArtifact
+              pure $ ToolResult "" (compactOutput <> exitStatus) "" mArtifact
   }
 
 -- | Resolves a path, preserving absolute paths and making relative paths workspace-relative
