@@ -28,6 +28,8 @@ import qualified Graphics.Vty as V
 import System.Posix.Signals (raiseSignal, sigTSTP)
 import Text.Read (readMaybe)
 
+import Lens.Micro ((.~), (%~))
+
 import Lambda.Config (Config(..), isLocalEndpoint, isOpenAiEndpoint, isOpenRouterEndpoint, persistTheme)
 import Lambda.Core.EngineInterface (EngineChannels(..))
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro)
@@ -50,17 +52,12 @@ handleAppEvent (AppEvent engineEv) = do
     EvTurnAdded turn -> do
       vis <- gets uiThinkingVisible
       let adjusted = setThinkingVis (if vis then Visible else Collapsed) turn
-          genDone = turnRole turn == AssistantRole
-      modify $ \s -> s
-        { uiTurns = uiTurns s ++ [adjusted]
-        , uiIsGenerating = if genDone then False else uiIsGenerating s
-        }
+      modify (turnsL %~ (++ [adjusted]))
       vScrollToEnd (viewportScroll ChatView)
     EvTurnUpdated turn -> do
       vis <- gets uiThinkingVisible
       let adjusted = setThinkingVis (if vis then Visible else Collapsed) turn
-      modify $ \s ->
-        s { uiTurns = updateMatchingTurn adjusted (uiTurns s) }
+      modify (turnsL %~ updateMatchingTurn adjusted)
       vScrollToEnd (viewportScroll ChatView)
     EvSessionSwitched _ mode turns subs -> do
       vis <- gets uiThinkingVisible
@@ -83,15 +80,14 @@ handleAppEvent (AppEvent engineEv) = do
       put st { uiSubAgents = Map.insert sId adjustedTask (uiSubAgents st) }
       when (uiSelectedSubAgent st == Just sId) $
         vScrollToEnd (viewportScroll SubAgentView)
-    EvWorkingStateUpdate ws -> modify $ \s ->
-      s { uiWorkingState = ws }
+    EvWorkingStateUpdate ws -> modify (workingStateL .~ ws)
     EvPermissionRequired prompt -> modify $ \s ->
       case uiCurrentPrompt s of
         Nothing -> s { uiCurrentPrompt = Just prompt }
         Just _  -> s { uiPendingPrompts = uiPendingPrompts s |> prompt }
     EvPermissionResolved _ _ -> pure ()
     EvModelSwitched newModel newLimit -> do
-      modify $ \s -> s { uiModelName = newModel, uiContextLimit = newLimit }
+      modify ((modelNameL .~ newModel) . (contextLimitL .~ newLimit))
       vScrollToEnd (viewportScroll ChatView)
     EvError err -> do
       tId <- gets (\s -> negate (1000 + length (uiTurns s)))
@@ -100,15 +96,16 @@ handleAppEvent (AppEvent engineEv) = do
         , uiIsGenerating = False
         }
       vScrollToEnd (viewportScroll ChatView)
-    EvStreamChunk _ -> pure ()
+    EvStreamChunk _ -> continueWithoutRedraw
     EvDone -> do
-      modify $ \s -> s { uiIsGenerating = False }
+      modify (isGeneratingL .~ False)
       vScrollToEnd (viewportScroll ChatView)
     EvTick -> do
       gen <- gets uiIsGenerating
       hasRunningSubs <- gets (any (\t -> subAgentStatus t == SubAgentRunning) . Map.elems . uiSubAgents)
-      when (gen || hasRunningSubs) $
-        modify $ \s -> s { uiSpinnerStep = (uiSpinnerStep s + 1) `mod` 10 }
+      if gen || hasRunningSubs
+        then modify (spinnerStepL %~ (\x -> (x + 1) `mod` 10))
+        else continueWithoutRedraw
   where
     updateMatchingTurn updatedTurn turns =
       let rev = reverse turns

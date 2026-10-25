@@ -2,7 +2,7 @@
 {-# LANGUAGE RecordWildCards #-}
 
 module Lambda.Provider.JsonRpc
-  ( JsonRpcClient
+  ( JsonRpcClient(..)
   , startRpcClient
   , startRpcClientWithEnv
   , stopRpcClient
@@ -13,7 +13,7 @@ module Lambda.Provider.JsonRpc
 import Control.Concurrent.Async (Async, async, cancel)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Concurrent.STM
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, try, bracket, mask_)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:))
 import Data.Aeson.Types (parseEither)
@@ -116,32 +116,34 @@ handleIncomingJson rawJson pendingVar = do
     _ -> pure ()
 
 sendRequest :: JsonRpcClient -> Text -> Aeson.Value -> IO (Either Text Aeson.Value)
-sendRequest client method params = do
-  (reqId, replyVar) <- atomically $ do
-    currId <- readTVar (rpcReqId client)
-    writeTVar (rpcReqId client) (currId + 1)
-    tmvar <- newEmptyTMVar
-    modifyTVar' (rpcPending client) (Map.insert currId tmvar)
-    pure (currId, tmvar)
+sendRequest client method params =
+  bracket allocReq cleanupReq $ \(reqId, replyVar) -> do
+    let payload = Aeson.object
+          [ "jsonrpc" .= ("2.0" :: Text)
+          , "id"      .= reqId
+          , "method"  .= method
+          , "params"  .= params
+          ]
+        encoded = Aeson.encode payload
+        wireBytes = encoded <> "\n"
 
-  let payload = Aeson.object
-        [ "jsonrpc" .= ("2.0" :: Text)
-        , "id"      .= reqId
-        , "method"  .= method
-        , "params"  .= params
-        ]
-      encoded = Aeson.encode payload
-      wireBytes = encoded <> "\n"
+    writeResult <- withMVar (rpcWriteLock client) $ \() ->
+      mask_ $ try (BL.hPut (getStdin $ rpcProcess client) wireBytes >> hFlush (getStdin $ rpcProcess client))
 
-  writeResult <- withMVar (rpcWriteLock client) $ \() -> do
-    try (BL.hPut (getStdin $ rpcProcess client) wireBytes >> hFlush (getStdin $ rpcProcess client))
-
-  case writeResult of
-    Left (_ :: SomeException) -> do
+    case writeResult of
+      Left (_ :: SomeException) ->
+        pure $ Left "MCP client disconnected: process exited or pipe closed"
+      Right () ->
+        atomically $ takeTMVar replyVar
+  where
+    allocReq = atomically $ do
+      currId <- readTVar (rpcReqId client)
+      writeTVar (rpcReqId client) (currId + 1)
+      tmvar <- newEmptyTMVar
+      modifyTVar' (rpcPending client) (Map.insert currId tmvar)
+      pure (currId, tmvar)
+    cleanupReq (reqId, _) =
       atomically $ modifyTVar' (rpcPending client) (Map.delete reqId)
-      pure $ Left "MCP client disconnected: process exited or pipe closed"
-    Right () ->
-      atomically $ takeTMVar replyVar
 
 sendNotification :: JsonRpcClient -> Text -> Aeson.Value -> IO ()
 sendNotification client method params = do

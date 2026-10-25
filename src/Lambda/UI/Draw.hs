@@ -12,6 +12,7 @@ module Lambda.UI.Draw
   , wrapLineWithWidths
   , wrapEditorToVisual
   , wrapEditorToVisualWithFirstWidth
+  , distributeSubAgentsToTurns
   ) where
 
 import Brick
@@ -23,8 +24,9 @@ import qualified Graphics.Vty as V
 import Lens.Micro ((^.), to)
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString.Lazy as BL
-import Data.List (intersperse)
+import Data.List (intersperse, partition)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -270,54 +272,41 @@ renderMainPane mSelected turns subs uiComp mode model ctxLimit cfg editor isWait
     turnPairs = distributeSubAgentsToTurns turns subList
     renderTurnPair (t, turnSubs) = renderTurnWithSubs mSelected turnSubs t
 
--- | Partitions subagent tasks across turns according to tool invocation order
+-- | Partitions subagent tasks across turns according to parent turn attribution
 distributeSubAgentsToTurns :: [Turn] -> [SubAgentTask] -> [(Turn, [SubAgentTask])]
 distributeSubAgentsToTurns [] _ = []
-distributeSubAgentsToTurns [lastTurn] remainingSubs = [(lastTurn, remainingSubs)]
-distributeSubAgentsToTurns (t:ts) remainingSubs =
-  let count = turnSubAgentCount t
-      (forThisTurn, forLater) = splitAt count remainingSubs
-  in (t, forThisTurn) : distributeSubAgentsToTurns ts forLater
-
-turnSubAgentCount :: Turn -> Int
-turnSubAgentCount (Turn _ role blks)
-  | role == AssistantRole = length (filter isSubAgentCallBlock blks)
-  | role == ToolRole      = 0
-  | otherwise             = length (filter isSubAgentCallBlock blks)
-
-isSubAgentCallBlock :: ContentBlock -> Bool
-isSubAgentCallBlock (ToolCallBlock tc) =
-  let name = toolCallName tc
-  in name == "spawn_specialist_subagent"
-     || name == "invoke_subagent"
-     || "subagent" `T.isInfixOf` T.toLower name
-isSubAgentCallBlock _ = False
+distributeSubAgentsToTurns turns subList =
+  let turnIds = map turnId turns
+      knownTurnSet = Set.fromList turnIds
+      (attributed, unanchored) = partition (\s -> maybe False (`Set.member` knownTurnSet) (subAgentParentTurnId s)) subList
+      subsByTurn = Map.fromListWith (flip (++)) [ (pId, [s]) | s <- attributed, Just pId <- [subAgentParentTurnId s] ]
+      attachSubs t = (t, Map.findWithDefault [] (turnId t) subsByTurn)
+      pairs = map attachSubs turns
+  in case reverse pairs of
+       [] -> []
+       ((lastT, lastSubs) : older) ->
+         reverse ((lastT, lastSubs ++ unanchored) : older)
 
 headerBar :: Text -> Maybe Int -> Widget ResourceName
-headerBar workingState mSelected =
+headerBar workingStateText mSelected =
   vLimit 1 $
     withAttr (attrName "headerBar") $
       hBox
         [ withAttr (attrName "titleLogo") (str " λ lambdA ")
         , str " │ "
         , str "Goal: "
-        , hLimit 55 $ txt (extractGoal workingState)
+        , hLimit 55 $ txt (wsGoal ws)
         , case mSelected of
             Just sId -> hBox [ str " │ ", withAttr (attrName "selectedBadge") (str $ " [SUBAGENT #" <> show sId <> "] ") ]
             Nothing  -> emptyWidget
         , fill ' '
-        , txt (extractBlocked workingState)
+        , txt (case wsBlockedOn ws of
+                 Just b  -> "● BLOCKED_ON: " <> b
+                 Nothing -> "✓ Ready")
         , str " "
         ]
   where
-    extractGoal st =
-      case filter ("GOAL:" `T.isPrefixOf`) (T.lines st) of
-        (g:_) -> T.strip (T.drop 5 g)
-        []    -> "Awaiting task"
-    extractBlocked st =
-      case filter ("BLOCKED_ON:" `T.isPrefixOf`) (T.lines st) of
-        (b:_) -> "● " <> T.strip b
-        []    -> "✓ Ready"
+    ws = parseWorkingState workingStateText
 
 renderTurn :: Turn -> Widget ResourceName
 renderTurn = renderTurnWithSubs Nothing []

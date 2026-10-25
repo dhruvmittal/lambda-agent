@@ -10,10 +10,14 @@ module Lambda.Engine.SubAgent
   , submitReportTool
   , filterSubAgentRegistry
   , subAgentLoop
+  , accumulateStreamChunks
+  , appendArgs
+  , finalizeToolArgs
   ) where
 
-import Control.Concurrent.Async (mapConcurrently)
+import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.STM
+import Control.Monad (unless)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?))
 import Data.Aeson.Types (parseEither)
@@ -108,7 +112,9 @@ runEphemeralSubAgent
   -> SubAgentSpec
   -> IO (Either Text SubAgentReport)
 runEphemeralSubAgent engineState@AppEngineState{..} driver SubAgentSpec{..} = do
-  task <- registerSubAgentTask engineState subAgentRoleName subTaskDescription subTurnBudget
+  turns <- readTVarIO appTurns
+  let parentTurnId = if null turns then Nothing else Just (turnId (last turns))
+  task <- registerSubAgentTaskWithParent engineState subAgentRoleName subTaskDescription subTurnBudget parentTurnId
   let sId = subAgentId task
 
   curMode <- readTVarIO appMode
@@ -201,110 +207,154 @@ subAgentLoop engineState@AppEngineState{..} driver sId grants turnsVar attempted
       mode <- readTVarIO appMode
       let toolSchemas = toolsToOpenAISchema mode reg
 
-      accumTextVar <- newTVarIO ("" :: Text)
-      accumThinkingVar <- newTVarIO ("" :: Text)
-      toolCallsVar <- newTVarIO ([] :: [ToolCall])
+      (fullText, fullThinking, toolCalls, wasInterrupted) <-
+        accumulateStreamChunks appInterrupted driver turns toolSchemas (\_ _ -> pure ()) (\_ -> pure ())
 
-      -- Stream LLM response
-      streamCompletion driver turns toolSchemas $ \case
-        ChunkText txt -> atomically $ modifyTVar' accumTextVar (<> txt)
-        ChunkThinking th -> atomically $ modifyTVar' accumThinkingVar (<> th)
+      if wasInterrupted
+        then pure $ Left "Subagent execution cancelled by user."
+        else do
+          let assistantBlocks =
+                [ ThinkingBlock currentTurn fullThinking Visible | not (T.null fullThinking) ]
+                ++ [ TextBlock fullText | not (T.null fullText) ]
+                ++ map ToolCallBlock toolCalls
+
+          let newAssistantTurn = Turn (currentTurn * 2 + 1) AssistantRole assistantBlocks
+          asstTurns <- atomically $ do
+            modifyTVar' turnsVar (\ts -> ts ++ [newAssistantTurn])
+            readTVar turnsVar
+          updateSubAgentTurns engineState sId asstTurns
+
+          if null toolCalls
+            then do
+              mReport <- readTVarIO reportVar
+              case mReport of
+                Just rep -> pure $ Right rep
+                Nothing  -> pure $ Right $ SubAgentReport "COMPLETED" fullText "" Nothing
+            else do
+              -- Record attempted tools
+              let formatCall tc =
+                    let argSummary = case toolCallArgs tc of
+                          Aeson.Object o ->
+                            let parseArgs = parseEither (\obj -> do
+                                  c <- obj .:? "command"
+                                  p <- obj .:? "path"
+                                  q <- obj .:? "query"
+                                  pat <- obj .:? "pattern"
+                                  pure (c, p, q, pat)
+                                  ) o
+                            in case parseArgs of
+                                 Right (Just (c :: Text), _, _, _) -> "(" <> c <> ")"
+                                 Right (_, Just (p :: Text), _, _) -> "(" <> p <> ")"
+                                 Right (_, _, Just (q :: Text), _) -> "(" <> q <> ")"
+                                 Right (_, _, _, Just (pat :: Text)) -> "(" <> pat <> ")"
+                                 _ -> "()"
+                          _ -> "()"
+                    in toolCallName tc <> argSummary
+              atomically $ modifyTVar' attemptedToolsVar (\prev -> map formatCall toolCalls ++ prev)
+
+              -- Execute tool calls concurrently in subagent context with interrupt checking
+              toolResults <- mapConcurrently (runSingleSubTool (SubAgentId sId subTaskDescription)) toolCalls
+              let toolTurn = Turn (currentTurn * 2 + 2) ToolRole (map ToolResultBlock toolResults)
+              toolTurns <- atomically $ do
+                modifyTVar' turnsVar (\ts -> ts ++ [toolTurn])
+                readTVar turnsVar
+              updateSubAgentTurns engineState sId toolTurns
+
+              stillActive <- not <$> readTVarIO appInterrupted
+              if not stillActive
+                then pure $ Left "Subagent execution cancelled by user."
+                else do
+                  mReport <- readTVarIO reportVar
+                  case mReport of
+                    Just rep -> pure $ Right rep
+                    Nothing  -> subAgentLoop engineState driver sId grants turnsVar attemptedToolsVar reportVar (currentTurn + 1) budget
+  where
+    subTaskDescription = "SubAgent #" <> T.pack (show sId)
+
+    runSingleSubTool caller tc = do
+      res <- race
+        (atomically $ do
+          intr <- readTVar appInterrupted
+          check intr)
+        (executeToolDispatch engineState caller grants tc)
+      case res of
+        Left () -> pure $ ToolResult (toolCallId tc) "" "Subagent tool execution cancelled by user." Nothing
+        Right r -> pure r
+
+-- | Shared low-level stream chunk accumulator for orchestrator and subagents
+accumulateStreamChunks
+  :: TVar Bool
+  -> ModelDriver
+  -> [Turn]
+  -> [Aeson.Value]
+  -> (Text -> Text -> IO ())
+  -> (StreamChunk -> IO ())
+  -> IO (Text, Text, [ToolCall], Bool)
+accumulateStreamChunks intrVar driver turns toolSchemas onProgress onChunk = do
+  accumTextVar <- newTVarIO ("" :: Text)
+  accumThinkingVar <- newTVarIO ("" :: Text)
+  toolCallsVar <- newTVarIO ([] :: [ToolCall])
+
+  streamCompletion driver turns toolSchemas $ \chunk -> do
+    intr <- readTVarIO intrVar
+    unless intr $ do
+      onChunk chunk
+      case chunk of
+        ChunkText txt -> do
+          atomically $ modifyTVar' accumTextVar (<> txt)
+          t <- readTVarIO accumTextVar
+          th <- readTVarIO accumThinkingVar
+          onProgress t th
+        ChunkThinking th -> do
+          atomically $ modifyTVar' accumThinkingVar (<> th)
+          t <- readTVarIO accumTextVar
+          th' <- readTVarIO accumThinkingVar
+          onProgress t th'
         ChunkToolCallStart cid name -> atomically $
           modifyTVar' toolCallsVar (\tcs -> tcs ++ [ToolCall cid name (Aeson.String "")])
         ChunkToolCallArgs cid argsChunk -> atomically $
           modifyTVar' toolCallsVar (appendArgs cid argsChunk)
         ChunkDone -> pure ()
 
-      fullText <- readTVarIO accumTextVar
-      fullThinking <- readTVarIO accumThinkingVar
-      rawToolCalls <- readTVarIO toolCallsVar
-      let toolCalls = map finalizeToolArgs rawToolCalls
+  fullText <- readTVarIO accumTextVar
+  fullThinking <- readTVarIO accumThinkingVar
+  rawToolCalls <- readTVarIO toolCallsVar
+  wasInterrupted <- readTVarIO intrVar
+  pure (fullText, fullThinking, map finalizeToolArgs rawToolCalls, wasInterrupted)
 
-      let assistantBlocks =
-            [ ThinkingBlock currentTurn fullThinking Visible | not (T.null fullThinking) ]
-            ++ [ TextBlock fullText | not (T.null fullText) ]
-            ++ map ToolCallBlock toolCalls
-
-      let newAssistantTurn = Turn (currentTurn * 2 + 1) AssistantRole assistantBlocks
-      asstTurns <- atomically $ do
-        modifyTVar' turnsVar (\ts -> ts ++ [newAssistantTurn])
-        readTVar turnsVar
-      updateSubAgentTurns engineState sId asstTurns
-
-      if null toolCalls
-        then do
-          mReport <- readTVarIO reportVar
-          case mReport of
-            Just rep -> pure $ Right rep
-            Nothing  -> pure $ Right $ SubAgentReport "COMPLETED" fullText "" Nothing
-        else do
-          -- Record attempted tools
-          let formatCall tc =
-                let argSummary = case toolCallArgs tc of
-                      Aeson.Object o ->
-                        let parseArgs = parseEither (\obj -> do
-                              c <- obj .:? "command"
-                              p <- obj .:? "path"
-                              q <- obj .:? "query"
-                              pat <- obj .:? "pattern"
-                              pure (c, p, q, pat)
-                              ) o
-                        in case parseArgs of
-                             Right (Just (c :: Text), _, _, _) -> "(" <> c <> ")"
-                             Right (_, Just (p :: Text), _, _) -> "(" <> p <> ")"
-                             Right (_, _, Just (q :: Text), _) -> "(" <> q <> ")"
-                             Right (_, _, _, Just (pat :: Text)) -> "(" <> pat <> ")"
-                             _ -> "()"
-                      _ -> "()"
-                in toolCallName tc <> argSummary
-          atomically $ modifyTVar' attemptedToolsVar (\prev -> map formatCall toolCalls ++ prev)
-
-          -- Execute tool calls concurrently in subagent context
-          toolResults <- mapConcurrently (executeToolDispatch engineState (SubAgentId sId subTaskDescription) grants) toolCalls
-          let toolTurn = Turn (currentTurn * 2 + 2) ToolRole (map ToolResultBlock toolResults)
-          toolTurns <- atomically $ do
-            modifyTVar' turnsVar (\ts -> ts ++ [toolTurn])
-            readTVar turnsVar
-          updateSubAgentTurns engineState sId toolTurns
-
-          -- Check if submit_report was called during this turn
-          mReport <- readTVarIO reportVar
-          case mReport of
-            Just rep -> pure $ Right rep
-            Nothing  -> subAgentLoop engineState driver sId grants turnsVar attemptedToolsVar reportVar (currentTurn + 1) budget
-  where
-    subTaskDescription = "SubAgent #" <> T.pack (show sId)
-    appendArgs targetId chunk tcs
-      | T.null targetId =
-          if null tcs
-            then []
-            else let (prev, lastTc) = (init tcs, last tcs)
-                 in prev ++ [addChunk chunk lastTc]
-      | "idx_" `T.isPrefixOf` targetId =
-          case (readMaybe (T.unpack (T.drop 4 targetId)) :: Maybe Int) of
-            Just idx | idx >= 0 && idx < length tcs ->
-              case splitAt idx tcs of
-                (before, target : after) -> before ++ [addChunk chunk target] ++ after
-                _ -> map (\tc -> if toolCallId tc == targetId then addChunk chunk tc else tc) tcs
+appendArgs :: Text -> Text -> [ToolCall] -> [ToolCall]
+appendArgs targetId chunk tcs
+  | T.null targetId =
+      if null tcs
+        then []
+        else let (prev, lastTc) = (init tcs, last tcs)
+             in prev ++ [addChunk chunk lastTc]
+  | "idx_" `T.isPrefixOf` targetId =
+      case (readMaybe (T.unpack (T.drop 4 targetId)) :: Maybe Int) of
+        Just idx | idx >= 0 && idx < length tcs ->
+          case splitAt idx tcs of
+            (before, target : after) -> before ++ [addChunk chunk target] ++ after
             _ -> map (\tc -> if toolCallId tc == targetId then addChunk chunk tc else tc) tcs
-      | otherwise =
-          map (\tc -> if toolCallId tc == targetId then addChunk chunk tc else tc) tcs
-      where
-        addChunk ch tc =
-          let existing = case toolCallArgs tc of
-                Aeson.String s -> s
-                _              -> ""
-          in tc { toolCallArgs = Aeson.String (existing <> ch) }
+        _ -> map (\tc -> if toolCallId tc == targetId then addChunk chunk tc else tc) tcs
+  | otherwise =
+      map (\tc -> if toolCallId tc == targetId then addChunk chunk tc else tc) tcs
+  where
+    addChunk ch tc =
+      let existing = case toolCallArgs tc of
+            Aeson.String s -> s
+            _              -> ""
+      in tc { toolCallArgs = Aeson.String (existing <> ch) }
 
-    finalizeToolArgs tc@ToolCall{..} =
-      case toolCallArgs of
-        Aeson.String s
-          | T.null (T.strip s) -> tc { toolCallArgs = Aeson.object [] }
-          | otherwise ->
-              case Aeson.decode (BL.fromStrict $ TE.encodeUtf8 s) of
-                Just val -> tc { toolCallArgs = val }
-                Nothing  -> tc { toolCallArgs = Aeson.object ["raw" .= s] }
-        _ -> tc
+finalizeToolArgs :: ToolCall -> ToolCall
+finalizeToolArgs tc@ToolCall{..} =
+  case toolCallArgs of
+    Aeson.String s
+      | T.null (T.strip s) -> tc { toolCallArgs = Aeson.object [] }
+      | otherwise ->
+          case Aeson.decode (BL.fromStrict $ TE.encodeUtf8 s) of
+            Just val -> tc { toolCallArgs = val }
+            Nothing  -> tc { toolCallArgs = Aeson.object ["raw" .= s] }
+    _ -> tc
 
 -- | Tool to spawn specialist subagents
 spawnSpecialistSubAgentTool :: AppEngineState -> ModelDriver -> ToolDefinition

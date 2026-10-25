@@ -3,9 +3,11 @@
 
 module Lambda.Provider.Builtin
   ( builtinTools
+  , builtinToolsWithManager
   , callMcpToolDefinition
   , listDirectoryTool
   , fetchUrlTool
+  , fetchUrlToolWithManager
   , bashTool
   , readFileTool
   , writeFileTool
@@ -14,7 +16,10 @@ module Lambda.Provider.Builtin
   , applyWhitespaceTolerantEdit
   ) where
 
-import Control.Exception (SomeException, try)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.STM (atomically)
+import Control.Exception (SomeException, try, onException)
+import System.Posix.Signals (signalProcessGroup, sigTERM, sigKILL)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?), (.!=))
 import Data.Aeson.Types (parseEither)
@@ -29,8 +34,6 @@ import Network.HTTP.Client.TLS (newTlsManager)
 import Network.HTTP.Types.Header (hUserAgent, hAccept)
 import System.Directory (doesFileExist, doesDirectoryExist, listDirectory, createDirectoryIfMissing)
 import System.FilePath (takeDirectory, isAbsolute, (</>))
-import System.IO.Unsafe (unsafePerformIO)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import System.Process.Typed
 import System.Timeout (timeout)
 
@@ -39,10 +42,13 @@ import Lambda.Engine.Artifacts (spoolDiagnosticArtifact)
 import Lambda.Types
 
 builtinTools :: FilePath -> FilePath -> [ToolDefinition]
-builtinTools wsRoot artDir =
+builtinTools = builtinToolsWithManager Nothing
+
+builtinToolsWithManager :: Maybe Manager -> FilePath -> FilePath -> [ToolDefinition]
+builtinToolsWithManager mMgr wsRoot artDir =
   [ listDirectoryTool wsRoot
   , readFileTool wsRoot
-  , fetchUrlTool artDir
+  , fetchUrlToolWithManager mMgr artDir
   , bashTool wsRoot artDir
   , writeFileTool wsRoot
   , editFileTool wsRoot
@@ -99,14 +105,33 @@ bashTool wsRoot artDir = ToolDefinition
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
         Right (cmd, mTimeout) -> do
           let reqTimeout = maybe 120 id mTimeout
-              effTimeout = max 5 (min 7200 reqTimeout)
+              effTimeout = max 1 (min 7200 reqTimeout)
               pConf = setStdin closed
                     $ setStdout byteStringOutput
                     $ setStderr byteStringOutput
                     $ setWorkingDir wsRoot
                     $ setCreateGroup True
                     $ shell (T.unpack cmd)
-          res <- try $ timeout (effTimeout * 1000000) $ readProcess pConf
+          let killProcessGroup p = do
+                mPid <- getPid p
+                case mPid of
+                  Just pid | pid > 1 -> do
+                    let pgid = pid
+                    _ <- try (signalProcessGroup sigTERM pgid) :: IO (Either SomeException ())
+                    threadDelay 50000
+                    _ <- try (signalProcessGroup sigKILL pgid) :: IO (Either SomeException ())
+                    pure ()
+                  _ -> pure ()
+          res <- try $ withProcessTerm pConf $ \p -> do
+            let runProc = do
+                  mRes <- timeout (effTimeout * 1000000) $
+                    atomically $ (,,) <$> waitExitCodeSTM p <*> getStdout p <*> getStderr p
+                  case mRes of
+                    Nothing -> do
+                      killProcessGroup p
+                      pure Nothing
+                    Just ok -> pure (Just ok)
+            runProc `onException` killProcessGroup p
           case res of
             Left (ex :: SomeException)
               | "waitForProcess: does not exist" `T.isInfixOf` T.pack (show ex) ->
@@ -365,24 +390,13 @@ applyWhitespaceTolerantEdit content target replacement =
          in Right resultText
        ms  -> Left $ "Ambiguous target string after whitespace normalization: found " <> T.pack (show (length ms)) <> " occurrences in file. Please provide more surrounding context."
 
--- | Global connection manager cache for HTTP connection pooling
-globalHttpManager :: IORef (Maybe Manager)
-globalHttpManager = unsafePerformIO (newIORef Nothing)
-{-# NOINLINE globalHttpManager #-}
-
-getSharedHttpManager :: IO Manager
-getSharedHttpManager = do
-  m <- readIORef globalHttpManager
-  case m of
-    Just mgr -> pure mgr
-    Nothing -> do
-      mgr <- newTlsManager
-      writeIORef globalHttpManager (Just mgr)
-      pure mgr
-
 -- | Web URL fetching tool with HTML stripping and OOB artifact spooling
 fetchUrlTool :: FilePath -> ToolDefinition
-fetchUrlTool artDir = ToolDefinition
+fetchUrlTool = fetchUrlToolWithManager Nothing
+
+-- | Web URL fetching tool with connection manager injection
+fetchUrlToolWithManager :: Maybe Manager -> FilePath -> ToolDefinition
+fetchUrlToolWithManager mMgr artDir = ToolDefinition
   { toolName = "fetch_url"
   , toolDescription = "Fetch web page or API content via HTTP/HTTPS GET. Cleans HTML markup into text, and spools large responses to disk."
   , toolParameters = Aeson.object
@@ -402,7 +416,7 @@ fetchUrlTool artDir = ToolDefinition
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
         Right rawUrl -> do
           res <- try $ do
-            manager <- getSharedHttpManager
+            manager <- maybe newTlsManager pure mMgr
             req <- parseRequest (T.unpack rawUrl)
             let req' = req
                   { requestHeaders =

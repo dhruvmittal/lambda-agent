@@ -3,8 +3,12 @@
 
 module Lambda.Core.EngineInterface
   ( EngineChannels(..)
+  , EngineRuntime(..)
   , initEngineChannels
   , startEngineLoop
+  , startEngineRuntime
+  , stopEngineRuntime
+  , runAgentTurnLoop
   ) where
 
 import Control.Concurrent (forkIO)
@@ -12,23 +16,24 @@ import Control.Concurrent.Async (Async, async, cancel, mapConcurrently, race)
 import Control.Concurrent.STM
 import Control.Exception (try, SomeException)
 import Control.Monad (forever, when, unless)
-import qualified Data.Aeson as Aeson
-import Data.Aeson ((.=))
-import qualified Data.ByteString.Lazy as BL
 import Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Text.Encoding as TE
-import Text.Read (readMaybe)
 
 import qualified Data.Map.Strict as Map
 import Lambda.Config (Config(..), resolveModelWithConfig, lookupModelContextLimit)
 import Lambda.Core.ModelDriver (ModelDriver(..))
-import Lambda.Core.ToolProvider (toolsToOpenAISchema)
+import Network.HTTP.Client.TLS (newTlsManager)
+
+import Lambda.Core.ToolProvider (emptyRegistry, registerTools, registerTool, toolsToOpenAISchema)
 import Lambda.Engine.Compactor (compactHistory, estimateTotalTokens)
 import Lambda.Engine.Dispatcher (executeToolDispatch)
-import Lambda.Engine.Security (SecurityState(..))
+import Lambda.Engine.Security (SecurityState(..), initSecurityWithRoot)
 import Lambda.Engine.Session (exportSessionTrace, loadSession, forkSession, deriveTitle, Session(..))
 import Lambda.Engine.State
+import Lambda.Engine.SubAgent (spawnSpecialistSubAgentTool, accumulateStreamChunks)
+import Lambda.Provider.Builtin (builtinTools, builtinToolsWithManager)
+import Lambda.Provider.Mcp (McpClient, startAndLoadMcpServers, stopMcpClient)
+import Lambda.Driver.OpenAI (openAiDynamicDriver)
 import Lambda.Types
 
 data EngineChannels = EngineChannels
@@ -55,6 +60,55 @@ updateBlockedOn AppEngineState{..} status = atomically $ do
         else curVec <> "\nBLOCKED_ON: " <> status
   writeTVar appStateVector updatedVec
   writeTQueue appEventQueue (EvWorkingStateUpdate updatedVec)
+
+-- | First-class lifecycle container for the autonomous agent engine and background workers
+data EngineRuntime = EngineRuntime
+  { erEngineState :: !AppEngineState
+  , erChannels    :: !EngineChannels
+  , erWorkerAsync :: !(Async ())
+  , erPromptAsync :: !(Async ())
+  , erMcpClients  :: ![McpClient]
+  }
+
+-- | Bootstraps and starts a complete autonomous engine runtime with background tasks
+startEngineRuntime :: Config -> Maybe Session -> Maybe ModelDriver -> IO EngineRuntime
+startEngineRuntime cfg maybeSess mOverrideDriver = do
+  httpMgr <- newTlsManager
+  let builtinReg = registerTools (builtinToolsWithManager (Just httpMgr) (workspaceRoot cfg) (artifactDir cfg)) emptyRegistry
+  (mcpClients, mcpTools) <- startAndLoadMcpServers (mcpServers cfg)
+  let baseRegistry = registerTools mcpTools builtinReg
+
+  secState <- initSecurityWithRoot (workspaceRoot cfg) (alwaysAllowGlobs cfg) (alwaysDenyGlobs cfg)
+  engineState <- initEngineStateWithSession cfg baseRegistry secState maybeSess
+
+  driver <- case mOverrideDriver of
+    Just d  -> pure d
+    Nothing -> openAiDynamicDriver cfg (readTVarIO (appActiveModel engineState))
+
+  let fullRegistry = registerTool (spawnSpecialistSubAgentTool engineState driver) baseRegistry
+  atomically $ writeTVar (appToolRegistry engineState) fullRegistry
+
+  channels <- initEngineChannels (appEventQueue engineState)
+  activeTaskVar <- newTVarIO Nothing
+  workerAsync <- async $ engineWorkerLoop engineState driver channels activeTaskVar
+  promptAsync <- async $ forever $ do
+    prompt <- atomically $ readTBQueue (uiPromptQueue (appSecurity engineState))
+    emitEngineEvent engineState (EvPermissionRequired prompt)
+
+  pure EngineRuntime
+    { erEngineState = engineState
+    , erChannels    = channels
+    , erWorkerAsync = workerAsync
+    , erPromptAsync = promptAsync
+    , erMcpClients  = mcpClients
+    }
+
+-- | Safely shuts down background workers and spawned MCP server child processes
+stopEngineRuntime :: EngineRuntime -> IO ()
+stopEngineRuntime EngineRuntime{..} = do
+  cancel erWorkerAsync
+  cancel erPromptAsync
+  mapM_ stopMcpClient erMcpClients
 
 -- | Starts the headless autonomous agent loop in a background thread
 startEngineLoop :: AppEngineState -> ModelDriver -> EngineChannels -> IO ()
@@ -145,19 +199,23 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       _ <- resetEngineSession engineState
       engineWorkerLoop engineState driver channels activeTaskVar
     CmdRewindTurns n -> do
-      ts <- readTVarIO appTurns
-      let dropCount = max 1 (n * 2)
-      if length ts <= 1
-        then updateBlockedOn engineState "Cannot rewind: at start of session"
-        else do
-          let remaining = take (max 1 (length ts - dropCount)) ts
-              popped = drop (length remaining) ts
-          atomically $ do
+      mRewound <- atomically $ do
+        ts <- readTVar appTurns
+        if length ts <= 1
+          then pure Nothing
+          else do
+            let dropCount = max 1 (n * 2)
+                remaining = take (max 1 (length ts - dropCount)) ts
+                popped = drop (length remaining) ts
             modifyTVar' appUndoStack (\s -> popped : s)
             writeTVar appTurns remaining
             subs <- readTVar appSubAgents
             let updatedSubs = Map.map (\t -> if subAgentStatus t == SubAgentRunning then t { subAgentStatus = SubAgentBlocked "Cancelled on session rewind" } else t) subs
             writeTVar appSubAgents updatedSubs
+            pure (Just remaining)
+      case mRewound of
+        Nothing -> updateBlockedOn engineState "Cannot rewind: at start of session"
+        Just _ -> do
           persistCurrentSession engineState
           updateBlockedOn engineState ("Rewound " <> T.pack (show n) <> " turn(s)")
       engineWorkerLoop engineState driver channels activeTaskVar
@@ -265,44 +323,18 @@ runAgentTurnLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       reg <- readTVarIO appToolRegistry
       let toolSchemas = toolsToOpenAISchema mode reg
 
-      accumTextVar <- newTVarIO ("" :: Text)
-      accumThinkingVar <- newTVarIO ("" :: Text)
-      toolCallsVar <- newTVarIO ([] :: [ToolCall])
-
       -- Add in-flight Assistant turn immediately for instant user feedback
       asstTurn <- addTurn engineState AssistantRole [TextBlock "Thinking..."]
 
-      -- Stream LLM response
-      streamCompletion driver turns toolSchemas $ \chunk -> do
-        intr <- readTVarIO appInterrupted
-        unless intr $ do
-          atomically $ writeTQueue evQueue (EvStreamChunk chunk)
-          case chunk of
-            ChunkText txt -> do
-              atomically $ modifyTVar' accumTextVar (<> txt)
-              t <- readTVarIO accumTextVar
-              th <- readTVarIO accumThinkingVar
-              let blks = [ ThinkingBlock turnIdx th Visible | not (T.null th) ]
-                      ++ [ TextBlock t ]
-              updateTurnBlocks engineState (turnId asstTurn) blks
-            ChunkThinking th -> do
-              atomically $ modifyTVar' accumThinkingVar (<> th)
-              t <- readTVarIO accumTextVar
-              th' <- readTVarIO accumThinkingVar
-              let blks = [ ThinkingBlock turnIdx th' Visible ]
-                      ++ [ TextBlock t | not (T.null t) ]
-              updateTurnBlocks engineState (turnId asstTurn) blks
-            ChunkToolCallStart cid name -> atomically $
-              modifyTVar' toolCallsVar (\tcs -> tcs ++ [ToolCall cid name (Aeson.String "")])
-            ChunkToolCallArgs cid argsChunk -> atomically $
-              modifyTVar' toolCallsVar (appendArgs cid argsChunk)
-            ChunkDone -> pure ()
+      let onProgress t th = do
+            let blks = [ ThinkingBlock turnIdx th Visible | not (T.null th) ]
+                    ++ [ TextBlock t | not (T.null t) ]
+            updateTurnBlocks engineState (turnId asstTurn) blks
+          onChunk chunk =
+            atomically $ writeTQueue evQueue (EvStreamChunk chunk)
 
-      fullText <- readTVarIO accumTextVar
-      fullThinking <- readTVarIO accumThinkingVar
-      rawToolCalls <- readTVarIO toolCallsVar
-      let toolCalls = map finalizeToolArgs rawToolCalls
-      wasInterrupted <- readTVarIO appInterrupted
+      (fullText, fullThinking, toolCalls, wasInterrupted) <-
+        accumulateStreamChunks appInterrupted driver turns toolSchemas onProgress onChunk
 
       if wasInterrupted
         then do
@@ -354,35 +386,3 @@ runAgentTurnLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       case res of
         Left () -> pure $ ToolResult (toolCallId tc) "" "Execution cancelled by user." Nothing
         Right r -> pure r
-
-    appendArgs targetId chunk tcs
-      | T.null targetId =
-          if null tcs
-            then []
-            else let (prev, lastTc) = (init tcs, last tcs)
-                 in prev ++ [addChunk chunk lastTc]
-      | "idx_" `T.isPrefixOf` targetId =
-          case (readMaybe (T.unpack (T.drop 4 targetId)) :: Maybe Int) of
-            Just idx | idx >= 0 && idx < length tcs ->
-              case splitAt idx tcs of
-                (before, target : after) -> before ++ [addChunk chunk target] ++ after
-                _ -> map (\tc -> if toolCallId tc == targetId then addChunk chunk tc else tc) tcs
-            _ -> map (\tc -> if toolCallId tc == targetId then addChunk chunk tc else tc) tcs
-      | otherwise =
-          map (\tc -> if toolCallId tc == targetId then addChunk chunk tc else tc) tcs
-      where
-        addChunk ch tc =
-          let existing = case toolCallArgs tc of
-                Aeson.String s -> s
-                _              -> ""
-          in tc { toolCallArgs = Aeson.String (existing <> ch) }
-
-    finalizeToolArgs tc@ToolCall{..} =
-      case toolCallArgs of
-        Aeson.String s
-          | T.null (T.strip s) -> tc { toolCallArgs = Aeson.object [] }
-          | otherwise ->
-              case Aeson.decode (BL.fromStrict $ TE.encodeUtf8 s) of
-                Just val -> tc { toolCallArgs = val }
-                Nothing  -> tc { toolCallArgs = Aeson.object ["raw" .= s] }
-        _ -> tc

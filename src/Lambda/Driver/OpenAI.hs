@@ -6,6 +6,7 @@ module Lambda.Driver.OpenAI
   , openAiDynamicDriver
   , parseSseChunk
   , splitThinkingChunks
+  , processSseStream
   ) where
 
 import Control.Exception (try, SomeException)
@@ -101,8 +102,20 @@ processSseStream :: BodyReader -> (StreamChunk -> IO ()) -> IO ()
 processSseStream reader callback = do
   inThinkingRef <- newIORef False
   tagBufRef <- newIORef ("" :: Text)
+  doneRef <- newIORef False
 
   let emitChunk c = callback c
+
+      flushAndFinish = do
+        isDone <- readIORef doneRef
+        unless isDone $ do
+          writeIORef doneRef True
+          buf <- readIORef tagBufRef
+          unless (T.null buf) $ do
+            inTh <- readIORef inThinkingRef
+            let (_, chunks) = splitThinkingChunks inTh buf
+            mapM_ emitChunk chunks
+          emitChunk ChunkDone
 
       processTextContent raw = do
         prevBuf <- readIORef tagBufRef
@@ -128,33 +141,28 @@ processSseStream reader callback = do
       handleLine line =
         let trimmed = T.strip line
         in case parseSseItems trimmed of
-             Left isDone -> when isDone $ do
-               buf <- readIORef tagBufRef
-               unless (T.null buf) $ do
-                 inTh <- readIORef inThinkingRef
-                 let (_, chunks) = splitThinkingChunks inTh buf
-                 mapM_ emitChunk chunks
-               emitChunk ChunkDone
+             Left isDone -> when isDone flushAndFinish
              Right items ->
                forM_ items $ \case
                  Left chunk  -> emitChunk chunk
                  Right contentTxt -> processTextContent contentTxt
 
-      loop acc = do
-        bs <- brRead reader
-        if BS.null bs
-          then do
-            buf <- readIORef tagBufRef
-            unless (T.null buf) $ do
-              inTh <- readIORef inThinkingRef
-              let (_, chunks) = splitThinkingChunks inTh buf
-              mapM_ emitChunk chunks
-            emitChunk ChunkDone
-          else do
-            let chunk = acc <> TE.decodeUtf8Lenient bs
-                (lines', rest) = splitLines chunk
-            mapM_ handleLine lines'
-            loop rest
+      loop decoder acc = do
+        isDone <- readIORef doneRef
+        unless isDone $ do
+          bs <- brRead reader
+          if BS.null bs
+            then do
+              let TE.Some finalTxt _ _ = decoder BS.empty
+                  finalChunk = acc <> finalTxt
+              unless (T.null finalChunk) $ handleLine finalChunk
+              flushAndFinish
+            else do
+              let TE.Some textChunk _ nextDecoder = decoder bs
+                  chunk = acc <> textChunk
+                  (lines', rest) = splitLines chunk
+              mapM_ handleLine lines'
+              loop nextDecoder rest
 
       splitLines txt =
         let ls = T.splitOn "\n" txt
@@ -162,7 +170,7 @@ processSseStream reader callback = do
              then ([], "")
              else (init ls, last ls)
 
-  loop ("" :: Text)
+  loop TE.streamDecodeUtf8 ("" :: Text)
 
 -- | Intermediate representation of SSE deltas
 parseSseItems :: Text -> Either Bool [Either StreamChunk Text]

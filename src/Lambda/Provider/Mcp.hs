@@ -12,7 +12,7 @@ module Lambda.Provider.Mcp
   , parseMcpCallResult
   ) where
 
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, try, bracketOnError)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:))
 import Data.Aeson.Types (parseEither)
@@ -70,31 +70,30 @@ startMcpClient name cmd args envMap = do
   case rpcClientRes of
     Left (ex :: SomeException) ->
       pure $ Left $ "Failed to spawn MCP server process '" <> name <> "': " <> T.pack (show ex)
-    Right rpcClient -> do
-      -- Step 1: Send initialize request
-      let initParams = Aeson.object
-            [ "protocolVersion" .= ("2024-11-05" :: Text)
-            , "capabilities"    .= Aeson.object
-                [ "roots"    .= Aeson.object [ "listChanged" .= True ]
-                , "sampling" .= Aeson.object []
-                ]
-            , "clientInfo"      .= Aeson.object
-                [ "name"    .= ("lambdA" :: Text)
-                , "version" .= ("0.1.0" :: Text)
-                ]
-            ]
-      initRes <- sendRequest rpcClient "initialize" initParams
-      case initRes of
-        Left err -> do
-          stopRpcClient rpcClient
-          pure $ Left $ "MCP handshake failed for server '" <> name <> "': " <> err
-        Right _ -> do
-          -- Step 2: Send notifications/initialized
-          sendNotification rpcClient "notifications/initialized" (Aeson.object [])
-          pure $ Right McpClient
-            { mcpRpcClient  = rpcClient
-            , mcpServerName = name
-            }
+    Right rpcClient ->
+      bracketOnError (pure rpcClient) stopRpcClient $ \client -> do
+        let initParams = Aeson.object
+              [ "protocolVersion" .= ("2024-11-05" :: Text)
+              , "capabilities"    .= Aeson.object
+                  [ "roots"    .= Aeson.object [ "listChanged" .= True ]
+                  , "sampling" .= Aeson.object []
+                  ]
+              , "clientInfo"      .= Aeson.object
+                  [ "name"    .= ("lambdA" :: Text)
+                  , "version" .= ("0.1.0" :: Text)
+                  ]
+              ]
+        initRes <- sendRequest client "initialize" initParams
+        case initRes of
+          Left err -> do
+            stopRpcClient client
+            pure $ Left $ "MCP handshake failed for server '" <> name <> "': " <> err
+          Right _ -> do
+            sendNotification client "notifications/initialized" (Aeson.object [])
+            pure $ Right McpClient
+              { mcpRpcClient  = client
+              , mcpServerName = name
+              }
 
 stopMcpClient :: McpClient -> IO ()
 stopMcpClient McpClient{..} = stopRpcClient mcpRpcClient

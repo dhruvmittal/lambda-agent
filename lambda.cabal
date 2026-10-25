@@ -125,4 +125,7 @@ test-suite lambda-test
         async,
         time,
         Glob,
-        vty
+        vty,
+        microlens,
+        http-client,
+        http-client-tls

@@ -3,15 +3,17 @@
 module Main where
 
 import Control.Concurrent (threadDelay, forkIO)
-import Control.Concurrent.Async (mapConcurrently, race, async, wait)
+import Control.Concurrent.Async (mapConcurrently, race, async, wait, poll)
 import Control.Concurrent.STM
 import Control.Monad (unless)
+import System.Timeout (timeout)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:?), (.:))
 import Data.Aeson.Types (parseEither, parseMaybe)
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
-import Data.IORef (newIORef, readIORef, modifyIORef')
-import Data.Maybe (mapMaybe)
+import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef')
+import Data.Maybe (mapMaybe, isNothing, isJust)
 import qualified Data.Sequence as Seq
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -25,11 +27,11 @@ import System.FilePath ((</>))
 
 import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, resolveEnvTemplates, persistTheme, extractProviderAndModel)
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro, expandPromptMacro)
-import Lambda.Core.EngineInterface (initEngineChannels, cmdQueue, startEngineLoop, EngineChannels(..))
+import Lambda.Core.EngineInterface (initEngineChannels, cmdQueue, startEngineLoop, EngineChannels(..), EngineRuntime(..), startEngineRuntime, stopEngineRuntime)
 import Lambda.Core.ModelDriver (ModelDriver(..))
 import Lambda.Core.ToolProvider
-import Lambda.Provider.JsonRpc (startRpcClient, stopRpcClient, sendRequest)
-import Lambda.Driver.OpenAI (openAiDynamicDriver, parseSseChunk, splitThinkingChunks)
+import Lambda.Provider.JsonRpc (startRpcClient, stopRpcClient, sendRequest, JsonRpcClient(..))
+import Lambda.Driver.OpenAI (openAiDynamicDriver, parseSseChunk, splitThinkingChunks, processSseStream)
 import Lambda.Engine.Artifacts
 import Lambda.Engine.Compactor
 import Lambda.Engine.Dispatcher (executeToolDispatch)
@@ -45,15 +47,18 @@ import Lambda.Engine.Session
   , getLatestSession
   , pruneSessions
   , renderSessionTraceMarkdown
+  , newSession
   , Session(..)
   , SessionMeta(..)
   )
 import Lambda.Engine.State
   ( initEngineState
   , initEngineStateWithSession
+  , addTurn
   , registerSubAgentTask
   , updateSubAgentTurns
   , resetEngineSession
+  , restoreEngineSession
   , appInterrupted
   , appStateVector
   , appSubAgents
@@ -69,6 +74,7 @@ import Lambda.Engine.State
   )
 import Lambda.Engine.SubAgent (submitReportTool, filterSubAgentRegistry, subAgentLoop, runEphemeralSubAgent, SubAgentSpec(..), SubAgentReport(..))
 import qualified Data.Map.Strict as Map
+import Brick.BChan (newBChan, writeBChan)
 import Brick.AttrMap (attrName, attrMap)
 import Brick.Main (customMainWithVty, App(..), showFirstCursor)
 import Brick.Types (vSize, Size(..))
@@ -76,10 +82,10 @@ import qualified Brick.Widgets.Edit as E
 import qualified Graphics.Vty as V
 import Graphics.Vty.Output.Mock (mockTerminal)
 import Graphics.Vty.Input (Input(..), InternalEvent(..))
-import Lambda.Provider.Builtin (builtinTools, callMcpToolDefinition, listDirectoryTool, readFileTool, fetchUrlTool, bashTool, editFileTool, renderDiffBlock, applyWhitespaceTolerantEdit)
+import Lambda.Provider.Builtin (builtinTools, builtinToolsWithManager, callMcpToolDefinition, listDirectoryTool, readFileTool, fetchUrlTool, fetchUrlToolWithManager, bashTool, editFileTool, renderDiffBlock, applyWhitespaceTolerantEdit)
 import Lambda.Provider.Mcp (inferCapability, parseMcpCallResult, startAndLoadMcpServers, stopMcpClient)
 import Lambda.UI.Completion (completeInput, allCommands, computeCommandCandidates, slidingCandidateWindow)
-import Lambda.UI.Draw (drawApp, renderSubAgents, renderSubAgentsSelected, renderInlineSubAgent, renderCompletionLine, renderPowerlinePrompt, wrapLineWithSpans, wrapEditorToVisual, wrapEditorToVisualWithFirstWidth)
+import Lambda.UI.Draw (drawApp, renderSubAgents, renderSubAgentsSelected, renderInlineSubAgent, renderCompletionLine, renderPowerlinePrompt, wrapLineWithSpans, wrapEditorToVisual, wrapEditorToVisualWithFirstWidth, distributeSubAgentsToTurns)
 import Lambda.UI.Events (handleAppEvent, computeCommandMatches, replaceCurrentToken, cycleCompletedToken)
 import Lambda.UI.Markdown
   ( parseMarkdownBlocks
@@ -92,9 +98,11 @@ import Lambda.UI.Markdown
   , MdBlock(..)
   , WordToken(..)
   )
-import Lambda.UI.Types (CompletionState(..), Candidate(..), simpleCandidate, ResourceName(..), UIState(..))
+import Lambda.UI.Types (CompletionState(..), Candidate(..), simpleCandidate, ResourceName(..), UIState(..), isGeneratingL, spinnerStepL, workingStateL, turnsL)
 import Lambda.UI.Theme (ThemePalette(..), builtinThemes, builtinThemeNames, parseHexColor, resolveThemePalette, resolveThemeAttrMap)
 import Lambda.Types
+import Lens.Micro ((&), (^.), (.~), (%~))
+import Network.HTTP.Client.TLS (newTlsManager)
 import Lambda.Server.Acp
   ( initAcpServerStateWithSink
   , handleAcpRequest
@@ -168,6 +176,15 @@ main = do
   testMultilinePromptAndEditor
   testStickyGoalAndGoalCommand
   testLazyMcpGatewayAndModeEnforcement
+  testAcpSessionLoadRestoration
+  testUiGeneratingEventLifecycleAndIdleTick
+  testAtomicSessionResetUndoHygiene
+  testStreamUtf8BoundarySafety
+  testSubAgentParentTurnAttribution
+  testEngineRuntimeLifecycleCleanup
+  testSubprocessGroupTerminationEscalation
+  testJsonRpcAsyncExceptionSafety
+  testWorkingStateBackwardsCompatibility
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -455,6 +472,7 @@ testSubAgentViewportInvariant = do
         , subAgentStatus = SubAgentRunning
         , subAgentArtifact = Just ".lambda/artifacts/subagent_1.log"
         , subAgentTurns = []
+        , subAgentParentTurnId = Nothing
         }
       sampleMap = Map.singleton 1 sampleTask
       widget = renderSubAgents sampleMap
@@ -822,7 +840,7 @@ testSessionSerialization = do
         [ Turn 1 UserRole [TextBlock "Explore files"]
         , Turn 2 AssistantRole [TextBlock "Files explored successfully"]
         ]
-      subTask = SubAgentTask 1 "surveyor" "Verify workspace structure" 1 16 (SubAgentSuccess "Structure OK") Nothing subTurns
+      subTask = SubAgentTask 1 "surveyor" "Verify workspace structure" 1 16 (SubAgentSuccess "Structure OK") Nothing subTurns Nothing
       sess = Session
         { sessionId           = "session_test_24"
         , sessionCreatedAt     = now
@@ -860,7 +878,7 @@ testSessionResumptionAndRestoration = do
   sec <- initSecurity [] []
   cfg <- loadConfig "."
   now <- getCurrentTime
-  let subTask = SubAgentTask 2 "debugger" "Investigate crash" 3 14 (SubAgentSuccess "Found bug") Nothing []
+  let subTask = SubAgentTask 2 "debugger" "Investigate crash" 3 14 (SubAgentSuccess "Found bug") Nothing [] Nothing
       sess = Session
         { sessionId           = "session_test_25"
         , sessionCreatedAt     = now
@@ -988,7 +1006,7 @@ testOnDemandMarkdownTraceGeneration = do
             , ToolResultBlock (ToolResult "c1" "1000 instructions" "" Nothing)
             , TextBlock "Hotspot identified."
             ]
-        ]
+        ] Nothing
       sess = Session
         { sessionId           = "session_test_28"
         , sessionCreatedAt     = now
@@ -1379,8 +1397,8 @@ testContextualCompletersAndMruInvariant = do
 
   -- 4. /sub contextual completion from active subagent map
   let subMap = Map.fromList
-        [ (1, SubAgentTask 1 "reviewer" "Reviewing" 0 5 SubAgentRunning Nothing [])
-        , (3, SubAgentTask 3 "tester" "Testing" 0 5 SubAgentRunning Nothing [])
+        [ (1, SubAgentTask 1 "reviewer" "Reviewing" 0 5 SubAgentRunning Nothing [] Nothing)
+        , (3, SubAgentTask 3 "tester" "Testing" 0 5 SubAgentRunning Nothing [] Nothing)
         ]
   mSubComp <- completeInput "." (dummyUI subMap) "/sub "
   assert "/sub completion returns active subagent IDs plus main"
@@ -2964,6 +2982,395 @@ testLazyMcpGatewayAndModeEnforcement = do
     ("Recursive call_mcp_tool invocation is not permitted" `T.isInfixOf` resultStderr resRecurse)
 
   putStrLn "  -> OK: Lazy MCP gateway schemas, catalog generation, dispatch, mode safety, and recursion guard verified."
+
+-- 59. ACP session/load Restores Historical Turns
+testAcpSessionLoadRestoration :: IO ()
+testAcpSessionLoadRestoration = do
+  putStrLn "\n[Test 59] ACP session/load Restores Historical Turns"
+  let tmpDir = "/tmp/lambda-test-acp-load"
+  createDirectoryIfMissing True (tmpDir </> ".lambda" </> "sessions")
+  let sId = "test-session-load-id"
+      t1 = Turn 1 UserRole [TextBlock "Initial prompt"]
+      t2 = Turn 2 AssistantRole [TextBlock "Answer 1"]
+      t3 = Turn 3 UserRole [TextBlock "Follow up"]
+      t4 = Turn 4 AssistantRole [TextBlock "Answer 2"]
+  baseSess <- newSession
+  let savedSess = baseSess
+        { sessionId = sId
+        , sessionTitle = "Restoration Test"
+        , sessionMode = PlanMode
+        , sessionTurns = [t1, t2, t3, t4]
+        , sessionSubAgents = Map.empty
+        , sessionStateVector = Map.singleton "state_vector" "GOAL: Preserved goal"
+        }
+  saveSession (tmpDir </> ".lambda" </> "sessions") 10 savedSess
+  cfg <- loadConfig tmpDir
+  outQueue <- newTQueueIO
+  state <- initAcpServerStateWithSink cfg (\bytes -> atomically $ writeTQueue outQueue bytes)
+
+  let loadReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (901 :: Int))
+        , reqMethod = "session/load"
+        , reqParams = Just (Aeson.object
+            [ "sessionId" .= sId
+            , "cwd" .= T.pack tmpDir
+            ])
+        }
+  handleAcpRequest state loadReq
+  mEng <- readTVarIO (acpActiveEngine state)
+  case mEng of
+    Just eng -> do
+      restoredTurns <- readTVarIO (appTurns eng)
+      assert "Restored session has all 4 turns" (length restoredTurns == 4)
+      assert "Restored turn 4 matches" (turnId (last restoredTurns) == 4)
+      currSId <- readTVarIO (acpActiveSessionId state)
+      assert "Active session ID matches loaded session" (currSId == sId)
+    Nothing -> failTest "No active engine found after session/load"
+  removeDirectoryRecursive tmpDir
+  putStrLn "  -> OK: ACP session/load correctly loaded and restored historical turns."
+
+-- 60. UI Generating State Machine & Idle Tick Invariants
+testUiGeneratingEventLifecycleAndIdleTick :: IO ()
+testUiGeneratingEventLifecycleAndIdleTick = do
+  putStrLn "\n[Test 60] UI Generating State Machine & Idle Tick Invariants"
+  eQueue <- atomically (newTQueue :: STM (TQueue EngineEvent))
+  channels <- initEngineChannels eQueue
+  let cfg = defaultConfig { workspaceRoot = "." }
+      initialTurns = [Turn 1 UserRole [TextBlock "Run diagnostic"]]
+      initialUIState = UIState
+        { uiTurns            = initialTurns
+        , uiSubAgents        = Map.empty
+        , uiCurrentPrompt    = Nothing
+        , uiPendingPrompts   = Seq.Empty
+        , uiMode             = PlanMode
+        , uiEditor           = E.editor EditorInput (Just 1) ""
+        , uiWorkingState     = "GOAL: Test Generating State"
+        , uiChannels         = channels
+        , uiLastEscTime      = Nothing
+        , uiContextLimit     = 128000
+        , uiPromptHistory    = []
+        , uiHistoryIndex     = Nothing
+        , uiSavedDraft       = ""
+        , uiModelName        = "mock-model"
+        , uiThinkingVisible  = True
+        , uiSelectedSubAgent = Nothing
+        , uiShowHud          = False
+        , uiCompletion       = Nothing
+        , uiSessionChooser   = Nothing
+        , uiIsGenerating     = True
+        , uiSpinnerStep      = 0
+        , uiConfig           = cfg
+        }
+      testApp :: App UIState EngineEvent ResourceName
+      testApp = App
+        { appDraw         = drawApp
+        , appChooseCursor = showFirstCursor
+        , appHandleEvent  = handleAppEvent
+        , appStartEvent   = pure ()
+        , appAttrMap      = const $ attrMap V.defAttr []
+        }
+
+  inChan <- atomically (newTChan :: STM (TChan InternalEvent))
+  let mockIn = Input
+        { eventChannel      = inChan
+        , shutdownInput     = pure ()
+        , restoreInputState = pure ()
+        , inputLogMsg       = const (pure ())
+        }
+  (_, mockOut) <- mockTerminal (80, 24)
+  mockVty <- V.mkVtyFromPair mockIn mockOut
+
+  bchan <- newBChan 10
+  -- 1. Ingest EvTurnAdded for assistant turn. Must NOT reset uiIsGenerating to False.
+  let asstTurn = Turn 2 AssistantRole [TextBlock "Thinking..."]
+  writeBChan bchan (EvTurnAdded asstTurn)
+
+  -- 2. Ingest EvTick. Must advance spinner because uiIsGenerating is still True.
+  writeBChan bchan EvTick
+
+  -- 3. Ingest EvDone. Must reset uiIsGenerating to False.
+  writeBChan bchan EvDone
+
+  -- 4. Ingest EvTick while idle. Must not advance spinner (it calls continueWithoutRedraw).
+  writeBChan bchan EvTick
+
+  -- 5. Terminate Brick event loop after bchan events are processed
+  let sendKey :: V.Key -> [V.Modifier] -> IO ()
+      sendKey k mods = atomically $ writeTChan inChan (InputEvent (V.EvKey k mods))
+      sendStr :: String -> IO ()
+      sendStr s = mapM_ (\c -> sendKey (V.KChar c) []) s
+  _ <- forkIO $ do
+    threadDelay 50000 -- 50ms to ensure bchan events are processed by event loop
+    sendStr "/quit"
+    sendKey V.KEnter []
+
+  (finalSt, _) <- customMainWithVty mockVty (pure mockVty) (Just bchan) testApp initialUIState
+
+  assert "Assistant turn was added" (length (uiTurns finalSt) == 2)
+  assert "uiIsGenerating is False after completion" (uiIsGenerating finalSt == False)
+  assert "Spinner stepped during generation and paused on idle tick" (uiSpinnerStep finalSt == 1)
+
+  putStrLn "  -> OK: UI generating state machine correctly preserves spinner during generation and halts on idle tick."
+
+-- 61. Atomic Session Reset Undo Hygiene
+testAtomicSessionResetUndoHygiene :: IO ()
+testAtomicSessionResetUndoHygiene = do
+  putStrLn "\n[Test 61] Atomic Session Reset Undo Hygiene"
+  cfg <- loadConfig "."
+  sec <- initSecurity [] []
+  es <- initEngineState cfg emptyRegistry sec
+
+  _ <- addTurn es UserRole [TextBlock "Turn 1"]
+  _ <- addTurn es AssistantRole [TextBlock "Turn 2"]
+  _ <- addTurn es UserRole [TextBlock "Turn 3"]
+  _ <- addTurn es AssistantRole [TextBlock "Turn 4"]
+
+  let popped = [Turn 4 AssistantRole [TextBlock "Turn 4"]]
+  atomically $ modifyTVar' (appUndoStack es) (\s -> popped : s)
+
+  undoBefore <- readTVarIO (appUndoStack es)
+  assert "Undo stack populated prior to reset" (not (null undoBefore))
+
+  _ <- resetEngineSession es
+  undoAfterReset <- readTVarIO (appUndoStack es)
+  assert "Undo stack is strictly cleared on resetEngineSession" (null undoAfterReset)
+
+  atomically $ modifyTVar' (appUndoStack es) (\s -> popped : s)
+  undoBeforeRestore <- readTVarIO (appUndoStack es)
+  assert "Undo stack re-populated" (not (null undoBeforeRestore))
+
+  baseRestoreSess <- newSession
+  let dummySess = baseRestoreSess
+        { sessionId = "test-restore-id"
+        , sessionTitle = "Restored"
+        , sessionMode = PlanMode
+        , sessionTurns = []
+        , sessionSubAgents = Map.empty
+        , sessionStateVector = Map.empty
+        }
+  restoreEngineSession es dummySess
+  undoAfterRestore <- readTVarIO (appUndoStack es)
+  assert "Undo stack is strictly cleared on restoreEngineSession" (null undoAfterRestore)
+
+  putStrLn "  -> OK: Undo stack is reset atomically across resetEngineSession and restoreEngineSession."
+
+-- 62. Multi-byte UTF-8 Boundary and Single ChunkDone Invariant
+testStreamUtf8BoundarySafety :: IO ()
+testStreamUtf8BoundarySafety = do
+  putStrLn "\n[Test 62] Multi-byte UTF-8 Boundary and Single ChunkDone Invariant"
+  let chunk1 = BS.concat
+        [ "data: {\"choices\":[{\"delta\":{\"content\":\"Rocket: "
+        , BS.pack [0xF0, 0x9F]
+        ]
+      chunk2 = BS.concat
+        [ BS.pack [0x9A, 0x80]
+        , "\"}}]}\n\ndata: [DONE]\n\n"
+        ]
+  chunksRef <- newIORef [chunk1, chunk2]
+  let mockReader = do
+        cs <- readIORef chunksRef
+        case cs of
+          [] -> pure BS.empty
+          (c:rest) -> do
+            writeIORef chunksRef rest
+            pure c
+
+  emittedChunksVar <- newTVarIO []
+  processSseStream mockReader $ \sc ->
+    atomically $ modifyTVar' emittedChunksVar (\l -> l ++ [sc])
+
+  emitted <- readTVarIO emittedChunksVar
+  let textChunks = [ txt | ChunkText txt <- emitted ]
+      fullEmittedText = T.concat textChunks
+      doneCount = length [ () | ChunkDone <- emitted ]
+
+  assert "Stream decoded intact multi-byte UTF-8 character (🚀)"
+    ("Rocket: 🚀" `T.isInfixOf` fullEmittedText)
+  assert "Stream did not emit replacement characters (\xFFFD)"
+    (not ("\xFFFD" `T.isInfixOf` fullEmittedText))
+  assert "ChunkDone was emitted exactly once"
+    (doneCount == 1)
+
+  putStrLn "  -> OK: Multi-byte UTF-8 stream boundary decoding preserved emojis and emitted ChunkDone once."
+
+-- 63. SubAgent Parent Turn Attribution and Turn Anchoring
+testSubAgentParentTurnAttribution :: IO ()
+testSubAgentParentTurnAttribution = do
+  putStrLn "\n[Test 63] SubAgent Parent Turn Attribution and Turn Anchoring"
+  let turn1 = Turn 1 UserRole [TextBlock "Start query"]
+      turn2 = Turn 2 AssistantRole [TextBlock "Executing subtasks"]
+      turn3 = Turn 3 UserRole [TextBlock "Follow-up question"]
+      turn4 = Turn 4 AssistantRole [TextBlock "Answering follow-up"]
+
+      sub1 = SubAgentTask 1 "Researcher" "Find facts" 0 5 SubAgentRunning Nothing [] (Just 2)
+      sub2 = SubAgentTask 2 "Coder" "Write code" 0 5 (SubAgentSuccess "Done") Nothing [] (Just 2)
+      sub3 = SubAgentTask 3 "Reviewer" "Review diff" 0 5 SubAgentRunning Nothing [] (Just 4)
+      subUnanchored = SubAgentTask 4 "Worker" "Floating task" 0 5 SubAgentRunning Nothing [] Nothing
+
+      allSubs = [sub1, sub2, sub3, subUnanchored]
+      turns = [turn1, turn2, turn3, turn4]
+
+      distributed = distributeSubAgentsToTurns turns allSubs
+
+  let subsTurn1 = concat [ subs | (t, subs) <- distributed, turnId t == 1 ]
+  assert "Turn 1 has no anchored subagents" (null subsTurn1)
+
+  let subsTurn2 = concat [ subs | (t, subs) <- distributed, turnId t == 2 ]
+  assert "Turn 2 has sub-1 and sub-2" (map subAgentId subsTurn2 == [1, 2])
+
+  let subsTurn3 = concat [ subs | (t, subs) <- distributed, turnId t == 3 ]
+  assert "Turn 3 has no anchored subagents" (null subsTurn3)
+
+  let subsTurn4 = concat [ subs | (t, subs) <- distributed, turnId t == 4 ]
+  assert "Turn 4 has sub-3 and fallback unanchored sub-4" (map subAgentId subsTurn4 == [3, 4])
+
+  putStrLn "  -> OK: SubAgent tasks are correctly attributed by parentTurnId across arbitrary turns."
+
+-- 64. EngineRuntime Lifecycle & Worker Cancellation
+testEngineRuntimeLifecycleCleanup :: IO ()
+testEngineRuntimeLifecycleCleanup = do
+  putStrLn "\n[Test 64] EngineRuntime Lifecycle & Worker Cancellation"
+  cfg <- loadConfig "."
+  let dummyDriver = ModelDriver { streamCompletion = \_ _ cb -> cb ChunkDone }
+  runtime <- startEngineRuntime cfg Nothing (Just dummyDriver)
+  let worker = erWorkerAsync runtime
+
+  workerRunningBefore <- poll worker
+  assert "EngineRuntime worker thread is actively running after start" (isNothing workerRunningBefore)
+
+  stopEngineRuntime runtime
+
+  workerResultAfter <- poll worker
+  assert "EngineRuntime worker thread is cancelled after stopEngineRuntime" (isJust workerResultAfter)
+
+  putStrLn "  -> OK: startEngineRuntime boots background loop and stopEngineRuntime cancels workers cleanly."
+
+-- 65. Subprocess Group Termination and Escalation
+testSubprocessGroupTerminationEscalation :: IO ()
+testSubprocessGroupTerminationEscalation = do
+  putStrLn "\n[Test 65] Subprocess Group Termination and Escalation"
+  let bash = bashTool "." "/tmp"
+      args = Aeson.object
+        [ "command" .= ("sleep 10" :: Text)
+        , "timeout_seconds" .= (1 :: Int)
+        ]
+
+  startT <- getCurrentTime
+  res <- toolExecute bash MainAgent args
+  endT <- getCurrentTime
+  let elapsed = diffUTCTime endT startT
+
+  assert "bashTool timed out within ~2.5 seconds instead of hanging for 10s" (elapsed < 3)
+  assert "Stderr indicates command timed out" ("Command timed out" `T.isInfixOf` resultStderr res)
+
+  putStrLn "  -> OK: bashTool terminated long-running process group on timeout without zombie hanging."
+
+-- 66. JsonRpc Async Exception Safety & Pending Request Cleanup
+testJsonRpcAsyncExceptionSafety :: IO ()
+testJsonRpcAsyncExceptionSafety = do
+  putStrLn "\n[Test 66] JsonRpc Async Exception Safety & Pending Request Cleanup"
+  client <- startRpcClient LineFramed "cat" []
+
+  let pendingVar = rpcPending client
+  pendingInitial <- readTVarIO pendingVar
+  assert "Initial pending requests map is empty" (Map.null pendingInitial)
+
+  _ <- timeout 50000 $ sendRequest client "test_method" (Aeson.object ["k" .= ("v" :: Text)])
+
+  pendingAfter <- readTVarIO pendingVar
+  assert "Pending map cleaned up via bracket on timeout / async cancellation" (Map.null pendingAfter)
+
+  stopRpcClient client
+  putStrLn "  -> OK: JsonRpc sendRequest cleans up rpcPending under asynchronous cancellation."
+
+-- 67. WorkingState ADT Backwards Compatibility, Lens Updates & HTTP Manager
+testWorkingStateBackwardsCompatibility :: IO ()
+testWorkingStateBackwardsCompatibility = do
+  putStrLn "\n[Test 67] WorkingState ADT Backwards Compatibility, Lens Updates & HTTP Manager"
+
+  -- 1. Parse legacy text state vector
+  let legacyText = "GOAL: Refactor model layer\nINVARIANTS: [No unsafePerformIO, Hermetic nix builds]\nACTIVE_HYPOTHESIS: Memory leak in worker\nBLOCKED_ON: Database migration"
+      ws1 = parseWorkingState legacyText
+  assert "wsGoal correctly extracted from legacy string" (wsGoal ws1 == "Refactor model layer")
+  assert "wsInvariants parsed as list" (wsInvariants ws1 == ["No unsafePerformIO", "Hermetic nix builds"])
+  assert "wsActiveHypothesis parsed as Just" (wsActiveHypothesis ws1 == Just "Memory leak in worker")
+  assert "wsBlockedOn parsed as Just" (wsBlockedOn ws1 == Just "Database migration")
+
+  -- 2. Backwards-compatible FromJSON parser for legacy JSON String
+  let jsonStringPayload = "\"GOAL: Legacy Task\\nINVARIANTS: [Safety first]\\nACTIVE_HYPOTHESIS: None\\nBLOCKED_ON: Ready\""
+      mDecodedString = Aeson.decode jsonStringPayload :: Maybe WorkingState
+  case mDecodedString of
+    Nothing -> failTest "Failed to decode WorkingState from legacy JSON string"
+    Just ws -> do
+      assert "JSON string decoded goal" (wsGoal ws == "Legacy Task")
+      assert "JSON string decoded invariants" (wsInvariants ws == ["Safety first"])
+      assert "JSON string hypothesis is Nothing when 'None'" (isNothing (wsActiveHypothesis ws))
+      assert "JSON string blocked is Nothing when 'Ready'" (isNothing (wsBlockedOn ws))
+
+  -- 3. Structured FromJSON parser for modern JSON Object
+  let jsonObjectPayload = "{\"goal\":\"Modern Goal\",\"invariants\":[\"Inv1\",\"Inv2\"],\"active_hypothesis\":\"Hypo1\",\"blocked_on\":null}"
+      mDecodedObject = Aeson.decode jsonObjectPayload :: Maybe WorkingState
+  case mDecodedObject of
+    Nothing -> failTest "Failed to decode WorkingState from structured JSON object"
+    Just ws -> do
+      assert "JSON object decoded goal" (wsGoal ws == "Modern Goal")
+      assert "JSON object decoded invariants" (wsInvariants ws == ["Inv1", "Inv2"])
+      assert "JSON object decoded hypothesis" (wsActiveHypothesis ws == Just "Hypo1")
+      assert "JSON object decoded null blocked_on" (isNothing (wsBlockedOn ws))
+
+  -- 4. Formatting produces valid roundtrip lines
+  let formatted = formatWorkingState ws1
+  assert "formatWorkingState produces GOAL line" ("GOAL: Refactor model layer" `T.isInfixOf` formatted)
+  assert "formatWorkingState produces INVARIANTS line" ("INVARIANTS: [No unsafePerformIO, Hermetic nix builds]" `T.isInfixOf` formatted)
+
+  -- 5. Lens Ergonomics on UIState
+  sec <- initSecurity [] []
+  cfg <- loadConfig "."
+  es <- initEngineState cfg emptyRegistry sec
+  chans <- initEngineChannels (appEventQueue es)
+  let baseState = UIState
+        { uiTurns = []
+        , uiSubAgents = Map.empty
+        , uiCurrentPrompt = Nothing
+        , uiPendingPrompts = Seq.empty
+        , uiMode = PlanMode
+        , uiEditor = E.editor EditorInput (Just 1) ""
+        , uiWorkingState = ""
+        , uiChannels = chans
+        , uiLastEscTime = Nothing
+        , uiContextLimit = 200000
+        , uiPromptHistory = []
+        , uiHistoryIndex = Nothing
+        , uiSavedDraft = ""
+        , uiModelName = "test-model"
+        , uiThinkingVisible = False
+        , uiSelectedSubAgent = Nothing
+        , uiShowHud = False
+        , uiCompletion = Nothing
+        , uiSessionChooser = Nothing
+        , uiIsGenerating = False
+        , uiSpinnerStep = 0
+        , uiConfig = cfg
+        }
+  let modifiedState = baseState
+        & isGeneratingL .~ True
+        & spinnerStepL %~ (+ 1)
+        & workingStateL .~ "GOAL: Lens updated"
+        & turnsL %~ (++ [Turn 1 UserRole [TextBlock "Lens Turn"]])
+
+  assert "Lens isGeneratingL updated correctly" (modifiedState ^. isGeneratingL == True)
+  assert "Lens spinnerStepL incremented correctly" (modifiedState ^. spinnerStepL == 1)
+  assert "Lens workingStateL updated correctly" (modifiedState ^. workingStateL == "GOAL: Lens updated")
+  assert "Lens turnsL updated correctly" (length (modifiedState ^. turnsL) == 1)
+
+  -- 6. Shared HTTP Manager Injection without unsafePerformIO
+  httpMgr <- newTlsManager
+  let tools = builtinToolsWithManager (Just httpMgr) "." ".lambda/artifacts"
+  assert "builtinToolsWithManager produced standard builtin tools" (length tools >= 6)
+  let fetchTool = fetchUrlToolWithManager (Just httpMgr) ".lambda/artifacts"
+  assert "fetchUrlToolWithManager created tool definition" (toolName fetchTool == "fetch_url")
+
+  putStrLn "  -> OK: WorkingState ADT backwards compatibility, lens ergonomics, and HTTP manager injection verified."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

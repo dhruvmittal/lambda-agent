@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 module Lambda.UI.Types where
 
@@ -7,6 +8,7 @@ import Data.Map.Strict (Map)
 import Data.Sequence (Seq)
 import Data.Text (Text)
 import Data.Time.Clock (UTCTime)
+import Lens.Micro.TH (makeLensesFor)
 
 import Lambda.Config (Config)
 import Lambda.Core.EngineInterface (EngineChannels)
@@ -78,3 +80,18 @@ data UIState = UIState
   , uiSpinnerStep      :: !Int
   , uiConfig           :: !Config
   }
+
+makeLensesFor
+  [ ("uiTurns", "turnsL")
+  , ("uiSubAgents", "subAgentsL")
+  , ("uiWorkingState", "workingStateL")
+  , ("uiMode", "modeL")
+  , ("uiThinkingVisible", "thinkingVisibleL")
+  , ("uiIsGenerating", "isGeneratingL")
+  , ("uiSpinnerStep", "spinnerStepL")
+  , ("uiModelName", "modelNameL")
+  , ("uiContextLimit", "contextLimitL")
+  , ("uiShowHud", "showHudL")
+  , ("uiSelectedSubAgent", "selectedSubAgentL")
+  , ("uiPromptHistory", "promptHistoryL")
+  ] ''UIState

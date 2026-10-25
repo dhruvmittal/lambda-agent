@@ -8,6 +8,7 @@ module Lambda.Engine.State
   , addTurn
   , updateTurnBlocks
   , registerSubAgentTask
+  , registerSubAgentTaskWithParent
   , updateSubAgentStatus
   , updateSubAgentTurns
   , emitEngineEvent
@@ -124,10 +125,14 @@ updateTurnBlocks AppEngineState{..} tId blocks = atomically $ do
     []    -> pure ()
 
 registerSubAgentTask :: AppEngineState -> Text -> Text -> Int -> IO SubAgentTask
-registerSubAgentTask AppEngineState{..} role hypothesis budget = atomically $ do
+registerSubAgentTask state role hypothesis budget =
+  registerSubAgentTaskWithParent state role hypothesis budget Nothing
+
+registerSubAgentTaskWithParent :: AppEngineState -> Text -> Text -> Int -> Maybe Int -> IO SubAgentTask
+registerSubAgentTaskWithParent AppEngineState{..} role hypothesis budget mParentTurnId = atomically $ do
   sId <- readTVar appSubAgentSeq
   writeTVar appSubAgentSeq (sId + 1)
-  let task = SubAgentTask sId role hypothesis 0 budget SubAgentRunning Nothing []
+  let task = SubAgentTask sId role hypothesis 0 budget SubAgentRunning Nothing [] mParentTurnId
   modifyTVar' appSubAgents (Map.insert sId task)
   writeTQueue appEventQueue (EvSubAgentUpdate task)
   pure task
@@ -204,6 +209,7 @@ resetEngineSession state@AppEngineState{..} = do
     writeTVar appSubAgents Map.empty
     writeTVar appSubAgentSeq 1
     writeTVar appStateVector "GOAL: Awaiting task\nINVARIANTS: [Safe workspace ops, User grant required]\nACTIVE_HYPOTHESIS: None\nBLOCKED_ON: User input"
+    writeTVar appUndoStack []
     writeTQueue appEventQueue (EvSessionSwitched (sessionId freshSess) PlanMode initTurns Map.empty)
   pure freshSess
 
@@ -227,4 +233,5 @@ restoreEngineSession state@AppEngineState{..} s = do
     writeTVar appSubAgents subs
     writeTVar appSubAgentSeq nextSubId
     writeTVar appStateVector stVec
+    writeTVar appUndoStack []
     writeTQueue appEventQueue (EvSessionSwitched (sessionId s) (sessionMode s) turns subs)

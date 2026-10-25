@@ -12,6 +12,7 @@ module Lambda.Server.Acp
   , initAcpServerState
   , initAcpServerStateWithSink
   , startAcpSession
+  , startAcpSessionWithSession
   ) where
 
 import Control.Concurrent (forkIO)
@@ -48,24 +49,21 @@ import System.Timeout (timeout)
 
 import Lambda.Config (Config(..), loadConfig)
 import Lambda.Core.EngineInterface
-  ( initEngineChannels
-  , startEngineLoop
-  , EngineChannels(..)
+  ( EngineChannels(..)
+  , EngineRuntime(..)
+  , startEngineRuntime
+  , stopEngineRuntime
   )
 import Lambda.Core.ModelDriver (ModelDriver(..))
-import Lambda.Core.ToolProvider (registerTools, registerTool, emptyRegistry)
-import Lambda.Driver.OpenAI (openAiDynamicDriver)
-import Lambda.Engine.Security (initSecurityWithRoot, resolvePrompt)
+import Lambda.Engine.Security (resolvePrompt)
 import Lambda.Engine.Session (loadSession, listMeaningfulSessions, Session(..), SessionMeta(..))
-import Lambda.Engine.State (initEngineStateWithSession, AppEngineState(..))
-import Lambda.Engine.SubAgent (spawnSpecialistSubAgentTool)
-import Lambda.Provider.Builtin (builtinTools)
-import Lambda.Provider.Mcp (startAndLoadMcpServers)
+import Lambda.Engine.State (AppEngineState(..))
 import Lambda.Server.Acp.Types
 import Lambda.Types
 
 data AcpServerState = AcpServerState
   { acpConfig           :: !(TVar Config)
+  , acpActiveRuntime    :: !(TVar (Maybe EngineRuntime))
   , acpActiveEngine     :: !(TVar (Maybe AppEngineState))
   , acpActiveChannels   :: !(TVar (Maybe EngineChannels))
   , acpActiveSessionId  :: !(TVar Text)
@@ -90,6 +88,7 @@ initAcpServerState cfg = initAcpServerStateWithSink cfg defaultSink
 initAcpServerStateWithSink :: Config -> (BL.ByteString -> IO ()) -> IO AcpServerState
 initAcpServerStateWithSink cfg sink = do
   cfgVar    <- newTVarIO cfg
+  rtVar     <- newTVarIO Nothing
   engVar    <- newTVarIO Nothing
   chanVar   <- newTVarIO Nothing
   sessVar   <- newTVarIO "sess_default"
@@ -102,6 +101,7 @@ initAcpServerStateWithSink cfg sink = do
   rpcMapVar <- newTVarIO Map.empty
   pure $ AcpServerState
     { acpConfig           = cfgVar
+    , acpActiveRuntime    = rtVar
     , acpActiveEngine     = engVar
     , acpActiveChannels   = chanVar
     , acpActiveSessionId  = sessVar
@@ -209,43 +209,37 @@ calculateSessionTokens turns =
 
 -- | Starts a new session or sets up workspace
 startAcpSession :: AcpServerState -> Maybe FilePath -> IO Text
-startAcpSession state mCwd = do
+startAcpSession state mCwd = startAcpSessionWithSession state mCwd Nothing
+
+-- | Starts a session with an optional existing Session restored
+startAcpSessionWithSession :: AcpServerState -> Maybe FilePath -> Maybe Session -> IO Text
+startAcpSessionWithSession state mCwd maybeSess = do
   baseCfg <- readTVarIO (acpConfig state)
   let effectiveRoot = fromMaybe (workspaceRoot baseCfg) mCwd
   cfg <- loadConfig effectiveRoot
   atomically $ writeTVar (acpConfig state) cfg
 
-  -- 1. Initialize tool registry with builtins and MCP servers
-  let builtinReg = registerTools (builtinTools (workspaceRoot cfg) (artifactDir cfg)) emptyRegistry
-  (_mcpClients, mcpTools) <- startAndLoadMcpServers (mcpServers cfg)
-  let baseRegistry = registerTools mcpTools builtinReg
+  -- Stop any previous runtime before bootstrapping the new session
+  mPrevRuntime <- readTVarIO (acpActiveRuntime state)
+  case mPrevRuntime of
+    Just prevRt -> stopEngineRuntime prevRt
+    Nothing     -> pure ()
 
-  -- 2. Initialize security state
-  secState <- initSecurityWithRoot (workspaceRoot cfg) (alwaysAllowGlobs cfg) (alwaysDenyGlobs cfg)
-
-  -- 3. Initialize engine state and model driver
-  engineState <- initEngineStateWithSession cfg baseRegistry secState Nothing
   mOverrideDriver <- readTVarIO (acpDriverOverride state)
-  driver <- case mOverrideDriver of
-    Just d  -> pure d
-    Nothing -> openAiDynamicDriver cfg (readTVarIO (appActiveModel engineState))
+  runtime <- startEngineRuntime cfg maybeSess mOverrideDriver
 
-  -- 4. Register SubAgent spawning tool
-  let fullRegistry = registerTool (spawnSpecialistSubAgentTool engineState driver) baseRegistry
-  atomically $ writeTVar (appToolRegistry engineState) fullRegistry
-
-  -- 5. Setup frontend/engine channels
-  channels <- initEngineChannels (appEventQueue engineState)
-  startEngineLoop engineState driver channels
+  let engineState = erEngineState runtime
+      channels    = erChannels runtime
 
   sess <- readTVarIO (appSession engineState)
   let sId = sessionId sess
   atomically $ do
+    writeTVar (acpActiveRuntime state) (Just runtime)
     writeTVar (acpActiveEngine state) (Just engineState)
     writeTVar (acpActiveChannels state) (Just channels)
     writeTVar (acpActiveSessionId state) sId
 
-  -- 6. Forward engine events to ACP session/update
+  -- Forward engine events to ACP session/update
   _ <- forkIO $ forwardEngineEvents state channels sId
 
   -- 7. Broadcast available commands update and initial title
@@ -461,13 +455,15 @@ handleAcpRequest state AcpJsonRpcRequest{..} = do
         (Just rId, Just v) -> do
           case Aeson.fromJSON v of
             Aeson.Success (AcpSessionCloseParams _sId) -> do
-              mChannels <- readTVarIO (acpActiveChannels state)
-              case mChannels of
-                Just ch -> atomically $ writeTBQueue (cmdQueue ch) CmdInterrupt
+              mRuntime <- readTVarIO (acpActiveRuntime state)
+              case mRuntime of
+                Just rt -> stopEngineRuntime rt
                 Nothing -> pure ()
               atomically $ do
+                writeTVar (acpActiveRuntime state) Nothing
                 writeTVar (acpActiveEngine state) Nothing
                 writeTVar (acpActiveChannels state) Nothing
+                writeTVar (acpActiveSessionId state) ""
               sendAcpResponse state rId (Just (Aeson.object ["status" .= ("closed" :: Text)])) Nothing
             Aeson.Error err ->
               sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= err ]))
@@ -556,9 +552,9 @@ handleAcpRequest state AcpJsonRpcRequest{..} = do
                   sessDir = effectiveRoot </> ".lambda" </> "sessions"
               loadRes <- loadSession sessDir sId
               case loadRes of
-                Right _sess -> do
+                Right sess -> do
                   -- Restored successfully
-                  _ <- startAcpSession state mCwd
+                  _ <- startAcpSessionWithSession state mCwd (Just sess)
                   sendAcpResponse state rId (Just (Aeson.object ["sessionId" .= sId, "status" .= ("loaded" :: Text)])) Nothing
                 Left err ->
                   sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32000 :: Int), "message" .= err ]))

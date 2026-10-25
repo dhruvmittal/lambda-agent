@@ -7,7 +7,7 @@ import Brick
 import Brick.BChan (newBChan, writeBChan)
 import qualified Brick.Widgets.Edit as E
 import Control.Concurrent (forkIO, threadDelay)
-import Control.Concurrent.STM (atomically, readTQueue, writeTVar, readTVarIO)
+import Control.Concurrent.STM (atomically, readTQueue)
 import Control.Monad (forever)
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
@@ -16,15 +16,13 @@ import qualified Data.Text.IO as TIO
 import Data.Time.Format (defaultTimeLocale, formatTime)
 import qualified Graphics.Vty as V
 import qualified Graphics.Vty.CrossPlatform as VCross
+import Control.Exception (bracket)
 import System.Environment (getArgs)
 import System.Exit (exitFailure, exitSuccess)
 import System.FilePath ((</>))
 
 import Lambda.Config (loadConfig, Config(..))
-import Lambda.Core.EngineInterface (initEngineChannels, startEngineLoop, EngineChannels(..))
-import Lambda.Core.ToolProvider (emptyRegistry, registerTools, registerTool)
-import Lambda.Driver.OpenAI (openAiDynamicDriver)
-import Lambda.Engine.Security (initSecurityWithRoot)
+import Lambda.Core.EngineInterface (EngineChannels(..), EngineRuntime(..), startEngineRuntime, stopEngineRuntime)
 import Lambda.Engine.Session
   ( Session(..)
   , SessionMeta(..)
@@ -35,10 +33,6 @@ import Lambda.Engine.Session
   , loadSession
   , renderSessionTraceMarkdown
   )
-import Lambda.Engine.State (initEngineStateWithSession, AppEngineState(..))
-import Lambda.Engine.SubAgent (spawnSpecialistSubAgentTool)
-import Lambda.Provider.Builtin (builtinTools)
-import Lambda.Provider.Mcp (startAndLoadMcpServers)
 import Lambda.Server.Acp (runAcpServer)
 import Lambda.Types
 import Lambda.UI.Draw (drawApp)
@@ -170,89 +164,75 @@ main = do
       putStrLn "Usage: lambda [--acp|-a] [--continue|-c] [--session|-s <id>] [--list-sessions] [--clean-sessions] [--inspect [id]] [--export-trace [id]]"
       exitFailure
 
-  -- 2. Initialize tool registry with builtins and configured MCP servers
-  let builtinReg = registerTools (builtinTools (workspaceRoot cfg) (artifactDir cfg)) emptyRegistry
-  (_mcpClients, mcpTools) <- startAndLoadMcpServers (mcpServers cfg)
-  let baseRegistry = registerTools mcpTools builtinReg
+  -- 2. Bootstrap autonomous engine runtime and background workers
+  bracket (startEngineRuntime cfg loadedSession Nothing) stopEngineRuntime $ \runtime -> do
+    let channels = erChannels runtime
 
-  -- 3. Initialize security state
-  secState <- initSecurityWithRoot (workspaceRoot cfg) (alwaysAllowGlobs cfg) (alwaysDenyGlobs cfg)
+    -- 3. Setup Brick event channel and 80ms animation ticker
+    eventChan <- newBChan 256
+    _ <- forkIO $ forever $ do
+      ev <- atomically $ readTQueue (evQueue channels)
+      case ev of
+        EvStreamChunk _ -> pure () -- Consumed by ACP; filtered out from Brick BChan
+        _               -> writeBChan eventChan ev
 
-  -- 4. Initialize engine state and model driver
-  engineState <- initEngineStateWithSession cfg baseRegistry secState loadedSession
-  driver <- openAiDynamicDriver cfg (readTVarIO (appActiveModel engineState))
+    _ <- forkIO $ forever $ do
+      threadDelay 80000 -- 80ms tick (~12.5fps spinner)
+      writeBChan eventChan EvTick
 
-  -- 5. Register SubAgent spawning tools (which require engine state & driver)
-  let fullRegistry = registerTool (spawnSpecialistSubAgentTool engineState driver) baseRegistry
-  atomically $ writeTVar (appToolRegistry engineState) fullRegistry
+    -- 4. Setup Vty terminal with bracketed paste enabled and emoji width table
+    initVtyUnicodeWidthTable
+    initialVty <- VCross.mkVty V.defaultConfig
+    V.setMode (V.outputIface initialVty) V.BracketedPaste True
+    V.setMode (V.outputIface initialVty) V.Mouse True
 
-  -- 6. Setup frontend/engine communication channels sharing appEventQueue
-  channels <- initEngineChannels (appEventQueue engineState)
-  startEngineLoop engineState driver channels
+    -- 5. Initialize UI State from loaded session
+    let initialTurns = case loadedSession of
+          Just s | not (null (sessionTurns s)) -> sessionTurns s
+          _ -> [Turn 1 SystemRole [TextBlock "lambdA initialized. Enter a goal or press /help for commands."]]
+        initialSubs = case loadedSession of
+          Just s  -> sessionSubAgents s
+          Nothing -> Map.empty
+        initialMode = case loadedSession of
+          Just s  -> sessionMode s
+          Nothing -> PlanMode
+        initialStVec = case loadedSession of
+          Just s | Just sv <- Map.lookup "state_vector" (sessionStateVector s) -> sv
+          _ -> "GOAL: Awaiting task\nINVARIANTS: []\nACTIVE_HYPOTHESIS: None\nBLOCKED_ON: User"
+        initialPrompts = case loadedSession of
+          Just s  -> sessionPromptHistory s
+          Nothing -> []
 
-  -- 7. Setup Brick event channel and 80ms animation ticker
-  eventChan <- newBChan 256
-  _ <- forkIO $ forever $ do
-    ev <- atomically $ readTQueue (evQueue channels)
-    writeBChan eventChan ev
+    let initialUIState = UIState
+          { uiTurns          = initialTurns
+          , uiSubAgents      = initialSubs
+          , uiCurrentPrompt  = Nothing
+          , uiPendingPrompts = Seq.Empty
+          , uiMode           = initialMode
+          , uiEditor         = E.editor EditorInput Nothing ""
+          , uiWorkingState   = initialStVec
+          , uiChannels       = channels
+          , uiLastEscTime    = Nothing
+          , uiContextLimit   = contextWindowLimit cfg
+          , uiPromptHistory  = initialPrompts
+          , uiHistoryIndex   = Nothing
+          , uiSavedDraft     = ""
+          , uiModelName      = modelName cfg
+          , uiThinkingVisible  = True
+          , uiSelectedSubAgent = Nothing
+          , uiShowHud          = False
+          , uiCompletion       = Nothing
+          , uiSessionChooser   = Nothing
+          , uiIsGenerating     = False
+          , uiSpinnerStep      = 0
+          , uiConfig           = cfg
+          }
 
-  _ <- forkIO $ forever $ do
-    threadDelay 80000 -- 80ms tick (~12.5fps spinner)
-    writeBChan eventChan EvTick
-
-  -- 8. Setup Vty terminal with bracketed paste enabled and emoji width table
-  initVtyUnicodeWidthTable
-  initialVty <- VCross.mkVty V.defaultConfig
-  V.setMode (V.outputIface initialVty) V.BracketedPaste True
-  V.setMode (V.outputIface initialVty) V.Mouse True
-
-  -- 9. Initialize UI State from loaded session
-  let initialTurns = case loadedSession of
-        Just s | not (null (sessionTurns s)) -> sessionTurns s
-        _ -> [Turn 1 SystemRole [TextBlock "lambdA initialized. Enter a goal or press /help for commands."]]
-      initialSubs = case loadedSession of
-        Just s  -> sessionSubAgents s
-        Nothing -> Map.empty
-      initialMode = case loadedSession of
-        Just s  -> sessionMode s
-        Nothing -> PlanMode
-      initialStVec = case loadedSession of
-        Just s | Just sv <- Map.lookup "state_vector" (sessionStateVector s) -> sv
-        _ -> "GOAL: Awaiting task\nINVARIANTS: []\nACTIVE_HYPOTHESIS: None\nBLOCKED_ON: User"
-      initialPrompts = case loadedSession of
-        Just s  -> sessionPromptHistory s
-        Nothing -> []
-
-  let initialUIState = UIState
-        { uiTurns          = initialTurns
-        , uiSubAgents      = initialSubs
-        , uiCurrentPrompt  = Nothing
-        , uiPendingPrompts = Seq.Empty
-        , uiMode           = initialMode
-        , uiEditor         = E.editor EditorInput Nothing ""
-        , uiWorkingState   = initialStVec
-        , uiChannels       = channels
-        , uiLastEscTime    = Nothing
-        , uiContextLimit   = contextWindowLimit cfg
-        , uiPromptHistory  = initialPrompts
-        , uiHistoryIndex   = Nothing
-        , uiSavedDraft     = ""
-        , uiModelName      = modelName cfg
-        , uiThinkingVisible  = True
-        , uiSelectedSubAgent = Nothing
-        , uiShowHud          = False
-        , uiCompletion       = Nothing
-        , uiSessionChooser   = Nothing
-        , uiIsGenerating     = False
-        , uiSpinnerStep      = 0
-        , uiConfig           = cfg
-        }
-
-  -- 10. Run Brick TUI
-  let buildVty = do
-        v <- VCross.mkVty V.defaultConfig
-        V.setMode (V.outputIface v) V.BracketedPaste True
-        V.setMode (V.outputIface v) V.Mouse True
-        pure v
-  _ <- customMain initialVty buildVty (Just eventChan) theApp initialUIState
-  pure ()
+    -- 6. Run Brick TUI
+    let buildVty = do
+          v <- VCross.mkVty V.defaultConfig
+          V.setMode (V.outputIface v) V.BracketedPaste True
+          V.setMode (V.outputIface v) V.Mouse True
+          pure v
+    _ <- customMain initialVty buildVty (Just eventChan) theApp initialUIState
+    pure ()

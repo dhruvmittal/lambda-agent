@@ -1,15 +1,17 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module Lambda.Types where
 
 import Control.Concurrent.STM (TMVar)
 import qualified Data.Aeson as Aeson
-import Data.Aeson ((.=), (.:))
+import Data.Aeson ((.=), (.:), (.:?), (.!=))
 import qualified Data.ByteString.Lazy as BL
 import Data.Map.Strict (Map)
 import Data.Text (Text)
+import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import GHC.Generics (Generic)
 
@@ -162,6 +164,64 @@ data StreamChunk
 data Framing = HeaderFramed | LineFramed
   deriving stock (Eq, Show, Generic)
 
+-- | High-level working state / state vector ADT
+data WorkingState = WorkingState
+  { wsGoal             :: !Text
+  , wsInvariants       :: ![Text]
+  , wsActiveHypothesis :: !(Maybe Text)
+  , wsBlockedOn        :: !(Maybe Text)
+  } deriving stock (Eq, Show, Generic)
+
+instance Aeson.ToJSON WorkingState where
+  toJSON WorkingState{..} = Aeson.object
+    [ "goal" .= wsGoal
+    , "invariants" .= wsInvariants
+    , "active_hypothesis" .= wsActiveHypothesis
+    , "blocked_on" .= wsBlockedOn
+    ]
+
+instance Aeson.FromJSON WorkingState where
+  parseJSON (Aeson.String s) = pure (parseWorkingState s)
+  parseJSON (Aeson.Object o) =
+    WorkingState
+      <$> o .:? "goal" .!= "Awaiting task"
+      <*> o .:? "invariants" .!= []
+      <*> o .:? "active_hypothesis"
+      <*> o .:? "blocked_on"
+  parseJSON _ = pure (WorkingState "Awaiting task" [] Nothing Nothing)
+
+formatWorkingState :: WorkingState -> Text
+formatWorkingState WorkingState{..} =
+  T.unlines
+    [ "GOAL: " <> wsGoal
+    , "INVARIANTS: [" <> T.intercalate ", " wsInvariants <> "]"
+    , "ACTIVE_HYPOTHESIS: " <> maybe "None" id wsActiveHypothesis
+    , "BLOCKED_ON: " <> maybe "Ready" id wsBlockedOn
+    ]
+
+parseWorkingState :: Text -> WorkingState
+parseWorkingState txt =
+  let ls = T.lines txt
+      findPrefix pfx = case filter (pfx `T.isPrefixOf`) ls of
+        (l:_) -> Just (T.strip (T.drop (T.length pfx) l))
+        []    -> Nothing
+      goal = maybe "Awaiting task" id (findPrefix "GOAL:")
+      invarsRaw = maybe "" id (findPrefix "INVARIANTS:")
+      invars = parseInvariants invarsRaw
+      hypo = case findPrefix "ACTIVE_HYPOTHESIS:" of
+        Just h | h /= "None" && not (T.null h) -> Just h
+        _ -> Nothing
+      blocked = case findPrefix "BLOCKED_ON:" of
+        Just b | b /= "Ready" && b /= "None" && not (T.null b) -> Just b
+        _ -> Nothing
+  in WorkingState goal invars hypo blocked
+  where
+    parseInvariants s =
+      let trimmed = T.dropAround (\c -> c == '[' || c == ']' || c == ' ') s
+      in if T.null trimmed
+           then []
+           else filter (not . T.null) (map T.strip (T.splitOn "," trimmed))
+
 -- | Status of ephemeral subagent workers
 data SubAgentStatus
   = SubAgentRunning
@@ -175,14 +235,15 @@ instance Aeson.FromJSON SubAgentStatus
 
 -- | Ephemeral SubAgent task tracker descriptor
 data SubAgentTask = SubAgentTask
-  { subAgentId         :: !Int
-  , subAgentRole       :: !Text
-  , subAgentHypothesis :: !Text
-  , subAgentTurnCount  :: !Int
-  , subAgentBudget     :: !Int
-  , subAgentStatus     :: !SubAgentStatus
-  , subAgentArtifact   :: !(Maybe FilePath)
-  , subAgentTurns      :: ![Turn]
+  { subAgentId           :: !Int
+  , subAgentRole         :: !Text
+  , subAgentHypothesis   :: !Text
+  , subAgentTurnCount    :: !Int
+  , subAgentBudget       :: !Int
+  , subAgentStatus       :: !SubAgentStatus
+  , subAgentArtifact     :: !(Maybe FilePath)
+  , subAgentTurns        :: ![Turn]
+  , subAgentParentTurnId :: !(Maybe Int)
   } deriving stock (Eq, Show, Generic)
 
 instance Aeson.ToJSON SubAgentTask
