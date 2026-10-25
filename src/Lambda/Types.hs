@@ -273,6 +273,7 @@ data FrontendCommand
   | CmdSetMode !AgentMode
   | CmdSetModel !Text
   | CmdCancelSubAgent !Int
+  | CmdResumeSubAgent !Int !Int !(Maybe Text) !(Maybe Text)
   | CmdCompactHistory
   | CmdRewindTurns !Int
   | CmdForkSession !(Maybe Text)

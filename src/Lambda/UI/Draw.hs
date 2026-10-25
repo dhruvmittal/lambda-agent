@@ -672,12 +672,14 @@ renderSubAgentsSelected mSelected subs
       in clickable (SubAgentItem subAgentId) taskWidget
 
 formatStatus :: SubAgentStatus -> String
-formatStatus SubAgentRunning      = "RUNNING"
-formatStatus (SubAgentSuccess _)  = "SUCCESS"
-formatStatus (SubAgentBlocked _)  = "BLOCKED"
-formatStatus (SubAgentFailed _)   = "FAILED"
+formatStatus SubAgentRunning                 = "RUNNING"
+formatStatus (SubAgentSuccess "INCONCLUSIVE") = "EXHAUSTED"
+formatStatus (SubAgentSuccess _)             = "SUCCESS"
+formatStatus (SubAgentBlocked _)             = "BLOCKED"
+formatStatus (SubAgentFailed _)              = "FAILED"
 
 statusAttr :: SubAgentStatus -> AttrName
-statusAttr SubAgentRunning     = attrName "subRunning"
-statusAttr (SubAgentSuccess _) = attrName "subSuccess"
-statusAttr _                   = attrName "subFailed"
+statusAttr SubAgentRunning                 = attrName "subRunning"
+statusAttr (SubAgentSuccess "INCONCLUSIVE") = attrName "warning"
+statusAttr (SubAgentSuccess _)             = attrName "subSuccess"
+statusAttr _                               = attrName "subFailed"

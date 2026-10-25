@@ -30,7 +30,7 @@ import Lambda.Engine.Dispatcher (executeToolDispatch)
 import Lambda.Engine.Security (SecurityState(..), initSecurityWithRoot)
 import Lambda.Engine.Session (exportSessionTrace, loadSession, forkSession, deriveTitle, Session(..))
 import Lambda.Engine.State
-import Lambda.Engine.SubAgent (spawnSpecialistSubAgentTool, accumulateStreamChunks)
+import Lambda.Engine.SubAgent (spawnSpecialistSubAgentTool, resumeSpecialistSubAgentTool, resumeEphemeralSubAgent, accumulateStreamChunks)
 import Lambda.Provider.Builtin (builtinToolsWithManager)
 import Lambda.Provider.Mcp (McpClient, startAndLoadMcpServers, stopMcpClient)
 import Lambda.Driver.OpenAI (openAiDynamicDriver)
@@ -85,7 +85,8 @@ startEngineRuntime cfg maybeSess mOverrideDriver = do
     Just d  -> pure d
     Nothing -> openAiDynamicDriver cfg (readTVarIO (appActiveModel engineState))
 
-  let fullRegistry = registerTool (spawnSpecialistSubAgentTool engineState driver) baseRegistry
+  let fullRegistry = registerTool (resumeSpecialistSubAgentTool engineState driver)
+                   $ registerTool (spawnSpecialistSubAgentTool engineState driver) baseRegistry
   atomically $ writeTVar (appToolRegistry engineState) fullRegistry
 
   channels <- initEngineChannels (appEventQueue engineState)
@@ -159,6 +160,13 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       engineWorkerLoop engineState driver channels activeTaskVar
     CmdCancelSubAgent sId -> do
       updateSubAgentStatus engineState sId (SubAgentBlocked "Cancelled by user")
+      engineWorkerLoop engineState driver channels activeTaskVar
+    CmdResumeSubAgent sId extraBud mGuidance mRole -> do
+      _ <- async $ do
+        res <- resumeEphemeralSubAgent engineState driver sId extraBud mRole mGuidance []
+        case res of
+          Left err -> emitEngineEvent engineState (EvError err)
+          Right _  -> pure ()
       engineWorkerLoop engineState driver channels activeTaskVar
     CmdSetGoal newGoal -> do
       atomically $ do

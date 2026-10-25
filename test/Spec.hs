@@ -72,7 +72,7 @@ import Lambda.Engine.State
   , appContextLimit
   , appUndoStack
   )
-import Lambda.Engine.SubAgent (submitReportTool, filterSubAgentRegistry, subAgentLoop, runEphemeralSubAgent, SubAgentSpec(..), SubAgentReport(..))
+import Lambda.Engine.SubAgent (submitReportTool, filterSubAgentRegistry, subAgentLoop, runEphemeralSubAgent, resumeEphemeralSubAgent, resumeSpecialistSubAgentTool, SubAgentSpec(..), SubAgentReport(..))
 import qualified Data.Map.Strict as Map
 import Brick.BChan (newBChan, writeBChan)
 import Brick.AttrMap (attrName, attrMap)
@@ -186,6 +186,7 @@ main = do
   testJsonRpcAsyncExceptionSafety
   testWorkingStateBackwardsCompatibility
   testLongRunningUnboundedAndCancellation
+  testSubAgentResumptionAndSpecialization
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -3252,6 +3253,96 @@ testLongRunningUnboundedAndCancellation = do
   stopRpcClient client
 
   putStrLn "  -> OK: Unbounded execution, direct OS artifact redirection, and cooperative cancellation verified."
+
+-- 69. SubAgent Resumption, Re-Up, and Dynamic Specialization
+testSubAgentResumptionAndSpecialization :: IO ()
+testSubAgentResumptionAndSpecialization = do
+  putStrLn "\n[Test 69] SubAgent Resumption, Re-Up, and Dynamic Specialization"
+  sec <- initSecurity [] []
+  let cfg = defaultConfig { workspaceRoot = "." }
+      baseReg = registerTools [readFileTool ".", bashTool "." "/tmp"] emptyRegistry
+  es <- initEngineState cfg baseReg sec
+
+  -- 1. Setup mock driver that simulates an explore agent exhausting budget (2 turns)
+  driverTurnVar <- newTVarIO (0 :: Int)
+  let mockDriver = ModelDriver
+        { streamCompletion = \_ _ cb -> do
+            t <- atomically $ do
+              cur <- readTVar driverTurnVar
+              writeTVar driverTurnVar (cur + 1)
+              pure cur
+            case t of
+              0 -> do
+                cb (ChunkToolCallStart "call_read_1" "read_file")
+                cb (ChunkToolCallArgs "" "{\"path\":\"src/Lambda/Types.hs\"}")
+                cb ChunkDone
+              1 -> do
+                cb (ChunkToolCallStart "call_read_2" "read_file")
+                cb (ChunkToolCallArgs "" "{\"path\":\"src/Lambda/Config.hs\"}")
+                cb ChunkDone
+              2 -> do
+                -- Resumed turn 3: receives continuation guidance and submits report
+                cb (ChunkToolCallStart "call_rep_1" "submit_report")
+                cb (ChunkToolCallArgs "" "{\"status\":\"SUCCESS\",\"summary\":\"Identified and fixed race condition\",\"details\":\"Applied patch cleanly\"}")
+                cb ChunkDone
+              _ -> cb ChunkDone
+        }
+
+  -- 2. Spawn surveyor agent with budget 2
+  let spec = SubAgentSpec "surveyor" "Locate defect in configuration loading" 2 ["read_file*"]
+  initRes <- runEphemeralSubAgent es mockDriver spec
+  case initRes of
+    Left err -> failTest ("Unexpected initial failure: " <> T.unpack err)
+    Right rep -> do
+      assert "Initial execution hit turn budget and produced INCONCLUSIVE report" (reportStatus rep == "INCONCLUSIVE")
+      assert "Summary reports exhaustion" ("Turn budget exhausted after 2 turns" `T.isInfixOf` reportSummary rep)
+
+  subsBefore <- readTVarIO (appSubAgents es)
+  let [taskBefore] = Map.elems subsBefore
+      sId = subAgentId taskBefore
+  assert "Initial task status is SubAgentSuccess INCONCLUSIVE" (subAgentStatus taskBefore == SubAgentSuccess "INCONCLUSIVE")
+  assert "Initial task turn count is 2" (subAgentTurnCount taskBefore == 2)
+  assert "Initial task budget is 2" (subAgentBudget taskBefore == 2)
+  let initialTurns = subAgentTurns taskBefore
+  assert "Initial turns preserved in STM" (length initialTurns >= 4)
+
+  -- 3. Test Depth-1 Star Graph invariant: resume_subagent is filtered from subagents
+  repVar <- newTVarIO Nothing
+  let dummyDef = submitReportTool repVar
+      ToolRegistry regMap = baseReg
+      withResume = ToolRegistry $ Map.insert "resume_subagent" dummyDef regMap
+      filteredReg = filterSubAgentRegistry dummyDef withResume
+      ToolRegistry finalMap = filteredReg
+  assert "resume_subagent is filtered out from subagent tool registry" (not (Map.member "resume_subagent" finalMap))
+
+  -- 4. Test Resume & Specialize: extend budget by 2 turns, pivot to implementer role with guidance
+  resumeRes <- resumeEphemeralSubAgent es mockDriver sId 2 (Just "implementer") (Just "Focus on JsonRpc race") ["edit_file*"]
+  case resumeRes of
+    Left err -> failTest ("Unexpected resume failure: " <> T.unpack err)
+    Right rep -> do
+      assert "Resumed execution succeeded" (reportStatus rep == "SUCCESS")
+      assert "Summary matches deliverable" ("Identified and fixed race condition" `T.isInfixOf` reportSummary rep)
+
+  subsAfter <- readTVarIO (appSubAgents es)
+  let Just taskAfter = Map.lookup sId subsAfter
+  assert "SubAgent role specialized to implementer" (subAgentRole taskAfter == "implementer")
+  assert "SubAgent budget updated to 4" (subAgentBudget taskAfter == 4)
+  assert "SubAgent status is SUCCESS" (subAgentStatus taskAfter == SubAgentSuccess "SUCCESS")
+  let afterTurns = subAgentTurns taskAfter
+  assert "Previous turns were preserved and continuation turn was appended" (length afterTurns > length initialTurns)
+
+  -- Verify continuation turn was injected
+  let continuationTurns = [ t | t <- afterTurns, turnRole t == UserRole, any (\b -> case b of TextBlock txt -> "Task Resumed" `T.isInfixOf` txt; _ -> False) (turnBlocks t) ]
+  assert "Continuation turn was injected into conversation history" (length continuationTurns == 1)
+
+  -- 5. Test Already Running guard
+  atomically $ modifyTVar' (appSubAgents es) (Map.adjust (\t -> t { subAgentStatus = SubAgentRunning }) sId)
+  runningRes <- resumeEphemeralSubAgent es mockDriver sId 2 Nothing Nothing []
+  case runningRes of
+    Left err -> assert "Resuming running agent is safely rejected" ("already running" `T.isInfixOf` err)
+    Right _  -> failTest "Expected already-running subagent to be rejected"
+
+  putStrLn "  -> OK: SubAgent resumption, zero token context preservation, dynamic role specialization, and star-graph invariants verified."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

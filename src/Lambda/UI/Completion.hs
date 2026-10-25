@@ -43,6 +43,8 @@ allCommands =
   , "/prompt"
   , "/p"
   , "/sub"
+  , "/resume"
+  , "/reup"
   , "/trace"
   , "/compact"
   , "/clear"

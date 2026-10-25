@@ -11,6 +11,7 @@ module Lambda.Engine.State
   , registerSubAgentTaskWithParent
   , updateSubAgentStatus
   , updateSubAgentTurns
+  , updateSubAgentTask
   , emitEngineEvent
   , snapshotSession
   , persistCurrentSession
@@ -157,6 +158,17 @@ updateSubAgentTurns AppEngineState{..} sId turns = atomically $ do
       writeTVar appSubAgents (Map.insert sId updated subs)
       writeTQueue appEventQueue (EvSubAgentUpdate updated)
     Nothing -> pure ()
+
+updateSubAgentTask :: AppEngineState -> Int -> (SubAgentTask -> SubAgentTask) -> IO (Maybe SubAgentTask)
+updateSubAgentTask AppEngineState{..} sId f = atomically $ do
+  subs <- readTVar appSubAgents
+  case Map.lookup sId subs of
+    Just task -> do
+      let updated = f task
+      writeTVar appSubAgents (Map.insert sId updated subs)
+      writeTQueue appEventQueue (EvSubAgentUpdate updated)
+      pure (Just updated)
+    Nothing -> pure Nothing
 
 emitEngineEvent :: AppEngineState -> EngineEvent -> IO ()
 emitEngineEvent AppEngineState{..} ev = atomically $ writeTQueue appEventQueue ev

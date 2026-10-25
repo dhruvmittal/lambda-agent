@@ -704,6 +704,7 @@ handleCommand cmdText = do
             , "- `/rewind [N]` - Rewind conversation by N turn pairs (alias: `/undo`)"
             , "- `/prompt [name]` - Run or list prompt templates from `.lambda/prompts/*.md` (alias: `/p`)"
             , "- `/sub <id>` - Inspect SubAgent dialogue and thought trace (`/sub main` to return)"
+            , "- `/resume <id> [budget] [guidance]` - Resume or specialize an exhausted SubAgent (alias: `/reup <id> [budget]`)"
             , "- `/trace` - Export current session to formatted Markdown artifact"
             , "- `/compact` - Trigger manual context compaction of earlier conversation turns"
             , "- `/clear` - Clear conversation turns in current session"
@@ -930,6 +931,27 @@ handleCommand cmdText = do
             _ ->
               liftIO $ atomically $ writeTBQueue (cmdQueue channels)
                 (CmdSystemMessage "Usage: /sub <id> to view subagent CoT, or /sub main to return.")
+    cmd | "/resume " `T.isPrefixOf` cmd || "/reup " `T.isPrefixOf` cmd || cmd == "/resume" || cmd == "/reup" -> do
+      let rawArgs = T.strip $ if "/resume" `T.isPrefixOf` cmd then T.drop 7 cmd else T.drop 5 cmd
+          parts = T.words rawArgs
+      case parts of
+        [] -> liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+                (CmdSystemMessage "Usage: /resume <id> [budget] [guidance], or /reup <id> [budget]")
+        (sIdTxt : rest) -> case readMaybe (T.unpack sIdTxt) of
+          Nothing -> liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+                       (CmdSystemMessage $ "⚠️ Invalid subagent ID: " <> sIdTxt)
+          Just sId -> do
+            let (extraBud, mGuidance) = case rest of
+                  [] -> (6, Nothing)
+                  (bTxt : guidanceWords) -> case readMaybe (T.unpack bTxt) of
+                    Just b  -> (b, if null guidanceWords then Nothing else Just (T.unwords guidanceWords))
+                    Nothing -> (6, Just (T.unwords rest))
+            liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+              (CmdResumeSubAgent sId extraBud mGuidance Nothing)
+            put st { uiSelectedSubAgent = Just sId }
+            vScrollToEnd (viewportScroll SubAgentView)
+            liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+              (CmdSystemMessage $ "Resuming SubAgent #" <> T.pack (show sId) <> " with +" <> T.pack (show extraBud) <> " turns.")
     "/compact" -> do
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdCompactHistory
     "/clear" -> do
