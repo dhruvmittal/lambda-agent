@@ -27,6 +27,8 @@ import qualified Brick.Widgets.Edit as E
 import qualified Graphics.Vty as V
 import Lens.Micro ((^.), to)
 import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Key as K
+import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy as BL
 import Data.List (intersperse, partition)
 import qualified Data.Map.Strict as Map
@@ -312,7 +314,7 @@ headerBarWithElapsed workingStateText mSelected mElapsed =
             Nothing  -> emptyWidget
         , fill ' '
         , case mElapsed of
-            Just el -> hBox [ withAttr (attrName "selectedBadge") (txt $ " [⚙ " <> el <> " elapsed · Esc to cancel] "), str " " ]
+            Just el -> hBox [ withAttr (attrName "selectedBadge") (txt $ " [" <> el <> " elapsed · Esc to cancel] "), str " " ]
             Nothing -> emptyWidget
         , txt (case wsBlockedOn ws of
                  Just b  -> "● BLOCKED_ON: " <> b
@@ -333,7 +335,9 @@ renderTurnWithSubs _ _ (Turn _ UserRole blocks) =
       , vBox (map renderBlock blocks)
       ]
 renderTurnWithSubs mSelected turnSubs (Turn tId role blocks) =
-  padBottom (Pad 1) $
+  let hasToolCalls = any isToolCall blocks
+      padAmt = if role == AssistantRole && hasToolCalls then 0 else 1
+  in padBottom (Pad padAmt) $
     vBox
       [ if role == SystemRole
           then withAttr (attrName "systemRole") (str $ "● system (Turn #" <> show tId <> ")")
@@ -342,10 +346,14 @@ renderTurnWithSubs mSelected turnSubs (Turn tId role blocks) =
       , if null turnSubs
           then emptyWidget
           else renderFleetStrip mSelected turnSubs
-      , if role == AssistantRole
+      , if role == AssistantRole && not hasToolCalls
           then padLeft (Pad 2) $ withAttr (attrName "turnFooter") (str "■ Plan · assistant")
           else emptyWidget
       ]
+
+isToolCall :: ContentBlock -> Bool
+isToolCall (ToolCallBlock _) = True
+isToolCall _                 = False
 
 renderBlock :: ContentBlock -> Widget ResourceName
 renderBlock (TextBlock t) =
@@ -356,13 +364,17 @@ renderBlock (ThinkingBlock tId body vis) =
       case vis of
         Collapsed -> withAttr (attrName "thinkingDim") $ str "▶ Thought (press ^T or click to expand)"
         Visible   ->
-          withAttr (attrName "thinkingDim") $
-            txtWrap ("Thinking: " <> body)
+          hBox
+            [ withAttr (attrName "thinkingDim") (str "┊ ")
+            , withAttr (attrName "thinkingDim") $
+                txtWrap ("Thinking: " <> body)
+            ]
 renderBlock (ToolCallBlock tc) =
   padLeft (Pad 2) $
     withAttr (attrName "toolCall") $
-      let formattedArgs = TE.decodeUtf8 (BL.toStrict (Aeson.encode (toolCallArgs tc)))
-      in txtWrap $ "⚡ call: " <> toolCallName tc <> " " <> T.take 100 formattedArgs
+      let argsStr = formatToolCallArgs tc
+          header = "╭─ " <> toolCallName tc <> (if T.null argsStr then "" else " " <> argsStr)
+      in txtWrap header
 renderBlock (ToolResultBlock tr) =
   padLeft (Pad 2) $
     vBox
@@ -370,34 +382,81 @@ renderBlock (ToolResultBlock tr) =
           then renderToolResultStdout (resultStdout tr)
           else emptyWidget
       , if not (T.null (resultStderr tr))
-          then withAttr (attrName "toolError") $ txtWrap $ "✗ error: " <> T.take 120 (resultStderr tr)
+          then withAttr (attrName "toolError") $
+                 vBox
+                   [ txt ("│ ✗ error: " <> T.take 120 (resultStderr tr))
+                   , txt "╰─"
+                   ]
           else emptyWidget
       , if T.null (resultStdout tr) && T.null (resultStderr tr)
-          then withAttr (attrName "toolResult") $ txtWrap "✓ (empty output)"
+          then withAttr (attrName "toolResult") $ txt "╰─ ✓ (empty output)"
           else emptyWidget
       , case resultArtifactPath tr of
-          Just p  -> withAttr (attrName "artifact") (txtWrap ("  artifact -> " <> T.pack p))
+          Just p  -> withAttr (attrName "artifact") (txtWrap ("╰─ artifact -> " <> T.pack p))
           Nothing -> emptyWidget
       ]
+
+formatToolCallArgs :: ToolCall -> Text
+formatToolCallArgs tc =
+  let rawVal = toolCallArgs tc
+      parsedVal = case rawVal of
+        Aeson.String s -> case Aeson.decode (BL.fromStrict (TE.encodeUtf8 s)) of
+          Just (Aeson.Object obj) -> Aeson.Object obj
+          _                       -> rawVal
+        _ -> rawVal
+  in case parsedVal of
+    Aeson.Object obj ->
+      let formatPair (k, v) =
+            let kTxt = K.toText k
+                valTxt = case v of
+                  Aeson.String strVal ->
+                    let clean = T.take 60 (T.replace "\n" " " (T.replace "\r" "" strVal))
+                    in "\"" <> clean <> (if T.length strVal > 60 then "…" else "") <> "\""
+                  Aeson.Number n -> T.pack (show n)
+                  Aeson.Bool b   -> if b then "true" else "false"
+                  Aeson.Null     -> "null"
+                  _              -> T.take 40 (TE.decodeUtf8 (BL.toStrict (Aeson.encode v)))
+            in kTxt <> "=" <> valTxt
+      in T.intercalate " " (map formatPair (KM.toList obj))
+    Aeson.String s | not (T.null (T.strip s)) ->
+      T.take 80 (T.replace "\n" " " (T.replace "\r" "" s))
+    _ -> ""
 
 renderToolResultStdout :: Text -> Widget ResourceName
 renderToolResultStdout txtContent =
   let ls = T.lines txtContent
       isDiff = any (\l -> "--- " `T.isPrefixOf` l || "+++ " `T.isPrefixOf` l) ls
-  in if not isDiff
-       then withAttr (attrName "toolResult") $ txtWrap $ "✓ result: " <> T.take 120 txtContent
-       else vBox (map renderDiffLine ls)
+  in if isDiff
+       then vBox
+              [ withAttr (attrName "toolResult") (txt "│ diff:")
+              , vBox (map renderDiffLine ls)
+              , withAttr (attrName "toolResult") (txt "╰─ ✓ diff applied")
+              ]
+       else case ls of
+         [] -> withAttr (attrName "toolResult") (txt "╰─ ✓ (empty output)")
+         [single] ->
+           withAttr (attrName "toolResult") $
+             txtWrap $ "╰─ ✓ " <> T.take 120 single
+         _ ->
+           let preview = take 12 ls
+               extraCount = length ls - length preview
+               renderedPreview = map (\l -> withAttr (attrName "toolResult") (txt ("│  " <> T.take 120 l))) preview
+               summaryLine = if extraCount > 0
+                               then [withAttr (attrName "thinkingDim") (txt ("│  ... (" <> T.pack (show extraCount) <> " more lines)"))]
+                               else []
+               footer = "╰─ ✓ (" <> T.pack (show (length ls)) <> " lines)"
+           in vBox (renderedPreview ++ summaryLine ++ [withAttr (attrName "toolResult") (txt footer)])
 
 renderDiffLine :: Text -> Widget ResourceName
 renderDiffLine l
   | "--- " `T.isPrefixOf` l || "+++ " `T.isPrefixOf` l =
-      withAttr (attrName "diffHeader") (txt l)
+      withAttr (attrName "diffHeader") (txt ("│  " <> l))
   | "+" `T.isPrefixOf` l =
-      withAttr (attrName "diffAdd") (txt l)
+      withAttr (attrName "diffAdd") (txt ("│  " <> l))
   | "-" `T.isPrefixOf` l =
-      withAttr (attrName "diffRemove") (txt l)
+      withAttr (attrName "diffRemove") (txt ("│  " <> l))
   | otherwise =
-      withAttr (attrName "toolResult") (txt l)
+      withAttr (attrName "toolResult") (txt ("│  " <> l))
 
 renderInlineSubAgent :: SubAgentTask -> Widget ResourceName
 renderInlineSubAgent task = vLimit 1 (renderTaskChip Nothing task)
@@ -408,7 +467,7 @@ renderFleetStrip mSelected tasks =
     padLeft (Pad 2) $
       vLimit 1 $
         hBox
-          [ withAttr (attrName "thinkingDim") (str "⚡ SubAgents: ")
+          [ withAttr (attrName "thinkingDim") (str "◈ SubAgents: ")
           , hBox (intersperse (str "  ") (map (renderTaskChip mSelected) tasks))
           , vLimit 1 (fill ' ')
           ]
