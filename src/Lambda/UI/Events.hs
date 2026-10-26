@@ -30,7 +30,7 @@ import Text.Read (readMaybe)
 
 import Lens.Micro ((.~), (%~))
 
-import Lambda.Config (Config(..), isLocalEndpoint, isOpenAiEndpoint, isOpenRouterEndpoint, persistTheme)
+import Lambda.Config (Config(..), SpecialistConfig(..), isLocalEndpoint, isOpenAiEndpoint, isOpenRouterEndpoint, persistTheme)
 import Lambda.Core.EngineInterface (EngineChannels(..))
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro)
 import Lambda.Engine.Security (resolvePrompt)
@@ -689,7 +689,7 @@ handleCommand cmdText = do
   let channels = uiChannels st
   case cmdText of
     "/help" -> do
-      let helpText = T.unlines
+      let helpText = T.unlines $
             [ "## lambdA Commands & Navigation Reference"
             , ""
             , "### Core Slash Commands"
@@ -713,12 +713,12 @@ handleCommand cmdText = do
             , "- `/quit` - Exit lambdA safely"
             , ""
             , "### Specialist Subagents"
-            , "- `surveyor` - Large-scale directory maps, AST survey, symbol extraction"
-            , "- `debugger` - Failure analysis, sanitizer traces, compiler error triage"
-            , "- `profiler` - Performance diagnostics (Valgrind, perf, flamegraphs, benchmarks)"
-            , "- `implementer` - Code refactoring, test cascades, localized edits"
-            , "- `reviewer` - Adversarial critique, correctness audits, diff inspection"
-            , ""
+            ]
+            ++ [ "- `" <> name <> "` - " <> specialistDescription sc
+               | (name, sc) <- Map.toAscList (specialists (uiConfig st))
+               ]
+            ++
+            [ ""
             , "### Shortcuts & Terminal Conventions"
             , "- `Ctrl+C` - Cancel draft line / Interrupt active generation"
             , "- `Ctrl+D` - Exit lambdA (on empty line) / forward delete character"

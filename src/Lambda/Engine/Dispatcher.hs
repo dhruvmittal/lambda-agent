@@ -97,6 +97,7 @@ executeToolDispatch engineState@AppEngineState{..} caller grantedGlobs ToolCall{
                     Right (p :: Text) -> Just (T.unpack p)
                     _                 -> Nothing
                   isWebFetch = toolCallName == "fetch_url"
+                  isBashCall = toolCallName == "bash"
 
               -- Step 2: Workspace confinement check
               isOutsidePath <- case mPath of
@@ -115,7 +116,21 @@ executeToolDispatch engineState@AppEngineState{..} caller grantedGlobs ToolCall{
                       Just cmd -> not (isSafeBashCommand cmd)
                       Nothing  -> toolCapability == Destructive
 
-              let requiresExplicitPermission = isOutsidePath || isWebFetch || isDestructiveCommand
+                  -- Command-level grant match (e.g. "cmake *", "nix build*")
+                  matchesCmdGrant = case mCommand of
+                    Just cmd -> any (`matchesPattern` T.unpack cmd) grantedGlobs
+                    Nothing  -> False
+
+                  -- Tool-level generic grant match (e.g. "bash*", "read_file*")
+                  hasGenericToolGrant = any (`matchesPattern` T.unpack toolCallName) grantedGlobs
+                                     || (isBashCall && any (`matchesPattern` "bash") grantedGlobs)
+
+                  matchesGrant = hasGenericToolGrant || matchesCmdGrant
+
+                  -- Explicit command-specific grants (e.g. "cmake *") pre-authorize execution
+                  -- without prompting the interactive ledger unless breaching workspace boundaries
+                  requiresExplicitPermission =
+                    isOutsidePath || isWebFetch || (isDestructiveCommand && not matchesCmdGrant)
 
               -- Construct display command representation for authorization prompt
               let displayCmd = case mCommand of
@@ -128,11 +143,6 @@ executeToolDispatch engineState@AppEngineState{..} caller grantedGlobs ToolCall{
               -- Step 4: Capability & Security Authorization
               authorized <- case caller of
                 SubAgentId _ _ -> do
-                  let cmdStr = case mCommand of
-                        Just cmd -> T.unpack cmd
-                        Nothing  -> T.unpack toolCallName
-                      matchesGrant = any (`matchesPattern` cmdStr) grantedGlobs
-
                   if not matchesGrant
                     then
                       -- Ungranted tool -> dynamic permission escalation

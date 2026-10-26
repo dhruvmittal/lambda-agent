@@ -18,7 +18,7 @@ import Data.Time.Format (defaultTimeLocale, formatTime)
 import System.Directory (doesDirectoryExist, listDirectory)
 import System.FilePath ((</>), splitFileName)
 
-import Lambda.Config (Config(..), isLocalEndpoint, isOpenAiEndpoint, isOpenRouterEndpoint)
+import Lambda.Config (Config(..), SpecialistConfig(..), isLocalEndpoint, isOpenAiEndpoint, isOpenRouterEndpoint)
 import Lambda.Engine.PromptMacro (listPromptMacros)
 import Lambda.Engine.Session (listMeaningfulSessions, SessionMeta(..))
 import Lambda.Types
@@ -101,16 +101,20 @@ completeInput baseDir st rawInput = do
                                else []
             pure $ toCompletionState (extraClean ++ extraPrune ++ formatted)
 
-    -- 3. /sub argument completion (active subagent IDs + main)
-    _ | "/sub " `T.isPrefixOf` clean -> do
-        let subArg = T.drop 5 clean
+    -- 3. /sub, /resume, and /reup argument completion (active subagent IDs + main for /sub)
+    _ | "/sub " `T.isPrefixOf` clean || "/resume " `T.isPrefixOf` clean || "/reup " `T.isPrefixOf` clean -> do
+        let isSub = "/sub " `T.isPrefixOf` clean
+            subArg
+              | "/sub " `T.isPrefixOf` clean    = T.drop 5 clean
+              | "/resume " `T.isPrefixOf` clean = T.drop 8 clean
+              | otherwise                       = T.drop 6 clean
             subTasks = Map.elems (uiSubAgents st)
             activeSubs =
               [ Candidate (T.pack (show subAgentId)) ("#" <> T.pack (show subAgentId) <> " [" <> T.toUpper subAgentRole <> "] (" <> formatStatus subAgentStatus <> ")")
               | SubAgentTask{..} <- subTasks
               , subArg `T.isPrefixOf` T.pack (show subAgentId) || T.null subArg
               ]
-            mainOpt = if subArg `T.isPrefixOf` "main"
+            mainOpt = if isSub && subArg `T.isPrefixOf` "main"
                         then [Candidate "main" "main (dialogue)"]
                         else []
         pure $ toCompletionState (activeSubs ++ mainOpt)
@@ -205,7 +209,7 @@ completeInput baseDir st rawInput = do
                       ]
         pure $ toCompletionState matched
 
-    -- 7. Filesystem path completion (words starting with '@' or containing '/')
+    -- 8. Specialist '@agent' and filesystem path completion (words starting with '@' or containing '/')
     _ -> do
         let lastToken = case T.words clean of
               [] -> ""
@@ -214,18 +218,26 @@ completeInput baseDir st rawInput = do
           then do
             let hasAt = "@" `T.isPrefixOf` lastToken
                 rawPath = if hasAt then T.drop 1 lastToken else lastToken
+                specCands =
+                  if hasAt && not ("/" `T.isInfixOf` rawPath)
+                    then
+                      [ Candidate ("@" <> name) ("@" <> name <> " [" <> T.take 45 (specialistDescription sc) <> "]")
+                      | (name, sc) <- Map.toAscList (specialists (uiConfig st))
+                      , T.toLower rawPath `T.isPrefixOf` T.toLower name || T.null rawPath
+                      ]
+                    else []
                 pathStr = T.unpack rawPath
                 (dirPart, filePart) = splitFileName pathStr
                 searchDir = if null dirPart then baseDir else baseDir </> dirPart
             dirExists <- doesDirectoryExist searchDir
-            if not dirExists
-              then pure Nothing
+            pathCands <- if not dirExists
+              then pure []
               else do
                 entries <- catch (listDirectory searchDir) (\(_ :: SomeException) -> pure [])
                 let filtered = filter isAllowedPath entries
                     matches = filter (filePart `isPrefixOf`) filtered
-                cands <- mapM (formatPathCandidate baseDir dirPart hasAt) (take 25 matches)
-                pure $ toCompletionState cands
+                mapM (formatPathCandidate baseDir dirPart hasAt) (take 25 matches)
+            pure $ toCompletionState (specCands ++ pathCands)
           else pure Nothing
   where
     toCompletionState [] = Nothing

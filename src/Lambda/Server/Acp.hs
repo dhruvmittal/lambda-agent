@@ -267,6 +267,10 @@ forwardEngineEvents state channels sId = do
       sendSessionUpdate state sId (AcpAgentThoughtChunk thk)
       forwardEngineEvents state channels sId
 
+    EvStreamChunk (ChunkError err) -> do
+      sendSessionUpdate state sId (AcpAgentMessageChunk ("\n⚠️ " <> err <> "\n"))
+      forwardEngineEvents state channels sId
+
     EvPermissionRequired prompt -> do
       let callVal = Aeson.object
             [ "toolCallId" .= ("perm_" <> T.pack (show (promptId prompt)))

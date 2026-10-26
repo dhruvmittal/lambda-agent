@@ -341,7 +341,7 @@ runAgentTurnLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
           onChunk chunk =
             atomically $ writeTQueue evQueue (EvStreamChunk chunk)
 
-      (fullText, fullThinking, toolCalls, wasInterrupted) <-
+      (fullText, fullThinking, toolCalls, wasInterrupted, _mDriverErr) <-
         accumulateStreamChunks appInterrupted driver turns toolSchemas onProgress onChunk
 
       if wasInterrupted

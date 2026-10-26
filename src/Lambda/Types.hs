@@ -157,6 +157,7 @@ data StreamChunk
   | ChunkThinking !Text
   | ChunkToolCallStart !Text !Text -- CallID, ToolName
   | ChunkToolCallArgs !Text !Text  -- CallID, ArgChunk
+  | ChunkError !Text               -- Wire status failure or transport error
   | ChunkDone
   deriving stock (Eq, Show, Generic)
 

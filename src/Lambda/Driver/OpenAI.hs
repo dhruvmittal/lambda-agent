@@ -4,6 +4,7 @@
 module Lambda.Driver.OpenAI
   ( openAiDriver
   , openAiDynamicDriver
+  , openAiDynamicDriverWithManager
   , parseSseChunk
   , splitThinkingChunks
   , processSseStream
@@ -28,7 +29,7 @@ import Network.HTTP.Client.TLS (newTlsManager)
 import Network.HTTP.Types.Header (hContentType, hAuthorization)
 import Network.HTTP.Types.Status (statusCode, statusMessage)
 
-import Lambda.Config (Config(..), isLocalEndpoint)
+import Lambda.Config (Config(..), isLocalEndpoint, resolveModelWithConfig)
 import Lambda.Core.ModelDriver (ModelDriver(..))
 import Lambda.Engine.Compactor (turnsToOpenAIPayload)
 import Lambda.Types
@@ -38,65 +39,82 @@ openAiDriver cfg = openAiDynamicDriver cfg (pure (modelName cfg))
 
 -- | OpenAI driver supporting dynamic model resolution per request
 openAiDynamicDriver :: Config -> IO Text -> IO ModelDriver
-openAiDynamicDriver Config{..} getActiveModel = do
+openAiDynamicDriver cfg getActiveModel = do
   manager <- newTlsManager
-  pure ModelDriver
-    { streamCompletion = \turns tools callback -> do
-        curModel <- getActiveModel
-        case () of
-          _ | T.null apiBaseUrl -> do
-                callback (ChunkText "\n[Configuration Error: No provider base URL configured. Set 'api_base_url' in .lambda/config.json or export LAMBDA_BASE_URL (e.g. http://localhost:11434/v1 for Ollama, https://api.openai.com/v1 for OpenAI).]\n")
-                callback ChunkDone
-          _ | T.null curModel -> do
-                callback (ChunkText "\n[Configuration Error: No active model selected. Set 'model_name' in .lambda/config.json, export LAMBDA_MODEL, or use '/model <model_name>' to switch.]\n")
-                callback ChunkDone
-          _ | T.null apiKey && not (isLocalEndpoint apiBaseUrl) -> do
-                callback (ChunkText "\n[Configuration Error: API key is empty for remote provider. Set 'api_key' in .lambda/config.json or export LAMBDA_API_KEY / OPENAI_API_KEY.]\n")
-                callback ChunkDone
-          _ -> do
-            let cleanBase = T.dropWhileEnd (== '/') apiBaseUrl
-                endpoint = T.unpack cleanBase <> "/chat/completions"
-                messages = turnsToOpenAIPayload turns
-                baseBody =
-                  [ "model"    .= curModel
-                  , "messages" .= messages
-                  , "stream"   .= True
-                  ]
-                reqPayload = if null tools
-                  then Aeson.object baseBody
-                  else Aeson.object (baseBody ++ ["tools" .= tools])
+  pure (openAiDynamicDriverWithManager manager cfg getActiveModel)
 
-            res <- try $ do
-              initReq <- parseRequest endpoint
-              let customHdrs = [ (CI.mk (TE.encodeUtf8 k), TE.encodeUtf8 v) | (k, v) <- Map.toList customHeaders ]
-                  authHdrs = if T.null apiKey then [] else [(hAuthorization, "Bearer " <> TE.encodeUtf8 apiKey)]
-                  allHdrs = [(hContentType, "application/json")] ++ authHdrs ++ customHdrs
-                  req = initReq
-                    { method = "POST"
-                    , requestHeaders = allHdrs
-                    , requestBody = RequestBodyLBS (Aeson.encode reqPayload)
-                    , checkResponse = \_ _ -> pure ()
-                    }
+-- | OpenAI driver sharing an existing HTTP connection pool Manager
+openAiDynamicDriverWithManager :: Manager -> Config -> IO Text -> ModelDriver
+openAiDynamicDriverWithManager manager cfg@Config{..} getActiveModel = ModelDriver
+  { streamCompletion = \turns tools callback -> do
+      curModel <- getActiveModel
+      case () of
+        _ | T.null apiBaseUrl -> do
+              let errMsg = "No provider base URL configured. Set 'api_base_url' in .lambda/config.json or export LAMBDA_BASE_URL (e.g. http://localhost:11434/v1 for Ollama, https://api.openai.com/v1 for OpenAI)."
+              callback (ChunkError errMsg)
+              callback (ChunkText ("\n[Configuration Error: " <> errMsg <> "]\n"))
+              callback ChunkDone
+        _ | T.null curModel -> do
+              let errMsg = "No active model selected. Set 'model_name' in .lambda/config.json, export LAMBDA_MODEL, or use '/model <model_name>' to switch."
+              callback (ChunkError errMsg)
+              callback (ChunkText ("\n[Configuration Error: " <> errMsg <> "]\n"))
+              callback ChunkDone
+        _ | T.null apiKey && not (isLocalEndpoint apiBaseUrl) -> do
+              let errMsg = "API key is empty for remote provider. Set 'api_key' in .lambda/config.json or export LAMBDA_API_KEY / OPENAI_API_KEY."
+              callback (ChunkError errMsg)
+              callback (ChunkText ("\n[Configuration Error: " <> errMsg <> "]\n"))
+              callback ChunkDone
+        _ -> do
+          let cleanBase = T.dropWhileEnd (== '/') apiBaseUrl
+              endpoint = T.unpack cleanBase <> "/chat/completions"
+              messages = turnsToOpenAIPayload turns
+              baseBody =
+                [ "model"    .= curModel
+                , "messages" .= messages
+                , "stream"   .= True
+                ]
+              reqPayload = if null tools
+                then Aeson.object baseBody
+                else Aeson.object (baseBody ++ ["tools" .= tools])
 
-              withResponse req manager $ \response -> do
-                let status = responseStatus response
-                    code = statusCode status
-                if code < 200 || code >= 300
-                  then do
-                    errChunks <- brConsume (responseBody response)
-                    let errBody = TE.decodeUtf8Lenient (BS.concat errChunks)
-                    callback (ChunkText $ "\n[API Error " <> T.pack (show code) <> " " <> TE.decodeUtf8Lenient (statusMessage status) <> ": " <> errBody <> "]\n")
-                    callback ChunkDone
-                  else do
-                    let reader = responseBody response
-                    processSseStream reader callback
+          res <- try $ do
+            initReq <- parseRequest endpoint
+            let customHdrs = [ (CI.mk (TE.encodeUtf8 k), TE.encodeUtf8 v) | (k, v) <- Map.toList customHeaders ]
+                authHdrs = if T.null apiKey then [] else [(hAuthorization, "Bearer " <> TE.encodeUtf8 apiKey)]
+                allHdrs = [(hContentType, "application/json")] ++ authHdrs ++ customHdrs
+                req = initReq
+                  { method = "POST"
+                  , requestHeaders = allHdrs
+                  , requestBody = RequestBodyLBS (Aeson.encode reqPayload)
+                  , checkResponse = \_ _ -> pure ()
+                  }
 
-            case res of
-              Left (ex :: SomeException) -> do
-                callback (ChunkText $ "\n[HTTP/Network Exception: " <> T.pack (show ex) <> "]\n")
-                callback ChunkDone
-              Right () -> pure ()
-    }
+            withResponse req manager $ \response -> do
+              let status = responseStatus response
+                  code = statusCode status
+              if code < 200 || code >= 300
+                then do
+                  errChunks <- brConsume (responseBody response)
+                  let errBody = TE.decodeUtf8Lenient (BS.concat errChunks)
+                      msg = "API Error " <> T.pack (show code) <> " " <> TE.decodeUtf8Lenient (statusMessage status) <> ": " <> errBody
+                  callback (ChunkError msg)
+                  callback (ChunkText ("\n[" <> msg <> "]\n"))
+                  callback ChunkDone
+                else do
+                  let reader = responseBody response
+                  processSseStream reader callback
+
+          case res of
+            Left (ex :: SomeException) -> do
+              let msg = "HTTP/Network Exception: " <> T.pack (show ex)
+              callback (ChunkError msg)
+              callback (ChunkText ("\n[" <> msg <> "]\n"))
+              callback ChunkDone
+            Right () -> pure ()
+  , driverWithModel = \newModel ->
+      let resolved = resolveModelWithConfig cfg (T.strip newModel)
+      in openAiDynamicDriverWithManager manager cfg (pure resolved)
+  }
 
 processSseStream :: BodyReader -> (StreamChunk -> IO ()) -> IO ()
 processSseStream reader callback = do

@@ -23,12 +23,19 @@ module Lambda.Config
   , curatedModels
   , resolveEnvTemplates
   , loadConfig
+  , parseMarkdownAgent
+  , loadMarkdownAgentsFromDir
+  , loadAllMarkdownAgents
   , persistAllowGlob
   , persistTheme
   ) where
 
 import Control.Applicative ((<|>))
 import Control.Exception (catch, IOException)
+import Control.Monad (forM)
+import Data.Char (isSpace)
+import Data.List (nub, isPrefixOf)
+import Data.Maybe (fromMaybe)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:?), (.!=))
 import qualified Data.Aeson.Key as Key
@@ -40,12 +47,14 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import qualified Data.Vector as V
 import GHC.Generics (Generic)
-import System.Directory (createDirectoryIfMissing, doesFileExist, getHomeDirectory)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getHomeDirectory, listDirectory)
 import System.Environment (lookupEnv)
-import System.FilePath ((</>))
+import System.FilePath (dropExtension, takeExtension, (</>))
+import Text.Read (readMaybe)
 
 data McpServerConfig = McpServerConfig
   { mcpCommand :: !FilePath
@@ -72,22 +81,29 @@ data SpecialistConfig = SpecialistConfig
   , specialistPrompt       :: !Text
   , specialistBudget       :: !Int
   , specialistCapabilities :: ![Text]
+  , specialistDenyGlobs    :: ![Text]
+  , specialistModel        :: !(Maybe Text)
   } deriving stock (Eq, Show, Generic)
 
 instance Aeson.ToJSON SpecialistConfig where
-  toJSON SpecialistConfig{..} = Aeson.object
+  toJSON SpecialistConfig{..} = Aeson.object $
     [ "description"  .= specialistDescription
     , "prompt"       .= specialistPrompt
     , "budget"       .= specialistBudget
     , "capabilities" .= specialistCapabilities
-    ]
+    , "deny_globs"   .= specialistDenyGlobs
+    ] ++ maybe [] (\m -> ["model" .= m]) specialistModel
 
 instance Aeson.FromJSON SpecialistConfig where
   parseJSON = Aeson.withObject "SpecialistConfig" $ \obj -> do
     specialistDescription  <- obj .:? "description" .!= ""
     specialistPrompt       <- obj .:? "prompt" .!= ""
-    specialistBudget       <- obj .:? "budget" .!= 6
+    mBud                   <- obj .:? "budget"
+    mSteps                 <- obj .:? "steps"
+    let specialistBudget = fromMaybe 6 (mBud <|> mSteps)
     specialistCapabilities <- obj .:? "capabilities" .!= []
+    specialistDenyGlobs    <- obj .:? "deny_globs" .!= []
+    specialistModel        <- obj .:? "model"
     pure SpecialistConfig{..}
 
 defaultSpecialists :: Map Text SpecialistConfig
@@ -107,6 +123,8 @@ defaultSpecialists = Map.fromList
             ]
         , specialistBudget       = 16
         , specialistCapabilities = ["read_file*", "list_directory*", "grep_search*", "find_by_name*", "fetch_url*", "sd_*", "git status*", "git diff*", "git log*"]
+        , specialistDenyGlobs    = []
+        , specialistModel        = Nothing
         }
     )
   , ( "debugger"
@@ -123,6 +141,8 @@ defaultSpecialists = Map.fromList
             ]
         , specialistBudget       = 14
         , specialistCapabilities = ["read_file*", "grep_search*", "find_by_name*", "cabal test*", "ctest*", "pytest*", "bash*", "sd_*"]
+        , specialistDenyGlobs    = []
+        , specialistModel        = Nothing
         }
     )
   , ( "profiler"
@@ -139,6 +159,8 @@ defaultSpecialists = Map.fromList
             ]
         , specialistBudget       = 10
         , specialistCapabilities = ["valgrind*", "callgrind_annotate*", "perf*", "read_file*", "bash*", "cabal bench*"]
+        , specialistDenyGlobs    = []
+        , specialistModel        = Nothing
         }
     )
   , ( "implementer"
@@ -155,6 +177,8 @@ defaultSpecialists = Map.fromList
             ]
         , specialistBudget       = 12
         , specialistCapabilities = ["write_file*", "replace_lines*", "read_file*", "sd_read*"]
+        , specialistDenyGlobs    = []
+        , specialistModel        = Nothing
         }
     )
   , ( "reviewer"
@@ -171,6 +195,8 @@ defaultSpecialists = Map.fromList
             ]
         , specialistBudget       = 12
         , specialistCapabilities = ["git diff*", "git log*", "read_file*", "cabal test*", "ctest*", "sd_recall*"]
+        , specialistDenyGlobs    = []
+        , specialistModel        = Nothing
         }
     )
   ]
@@ -251,6 +277,7 @@ defaultAllowGlobs =
   , "read_file*"
   , "list_directory*"
   , "spawn_specialist_subagent*"
+  , "resume_subagent*"
   , "sd_*"
   ]
 
@@ -282,22 +309,304 @@ defaultConfig = Config
   , customThemes        = Map.empty
   }
 
+-- | Default capabilities granted to OpenCode markdown agents unless restricted by frontmatter
+defaultOpenCodeCapabilities :: [Text]
+defaultOpenCodeCapabilities =
+  [ "read_file*"
+  , "list_directory*"
+  , "grep_search*"
+  , "find_by_name*"
+  , "fetch_url*"
+  , "replace_lines*"
+  , "edit_file*"
+  , "write_file*"
+  , "bash*"
+  , "sd_*"
+  , "git status*"
+  , "git diff*"
+  , "git log*"
+  ]
+
+-- | Map an OpenCode tool class or permission key to lambdA capability globs
+mapOpenCodeToolKey :: Text -> [Text]
+mapOpenCodeToolKey k =
+  case T.toLower (T.strip k) of
+    "edit"      -> ["replace_lines*", "edit_file*"]
+    "patch"     -> ["replace_lines*", "edit_file*"]
+    "multiedit" -> ["replace_lines*", "edit_file*"]
+    "write"     -> ["write_file*"]
+    "bash"      -> ["bash*"]
+    "shell"     -> ["bash*"]
+    "read"      -> ["read_file*", "sd_read*"]
+    "list"      -> ["list_directory*"]
+    "grep"      -> ["grep_search*"]
+    "glob"      -> ["find_by_name*"]
+    "webfetch"  -> ["fetch_url*"]
+    "websearch" -> ["fetch_url*"]
+    other
+      | T.null other -> []
+      | "*" `T.isInfixOf` other || " " `T.isInfixOf` other -> [T.strip k]
+      | otherwise -> [T.strip k <> "*"]
+
+-- | Strip surrounding quotes and trailing inline YAML comments
+cleanYamlScalar :: Text -> Text
+cleanYamlScalar raw =
+  let s = T.strip raw
+  in case T.uncons s of
+       Just ('"', rest) ->
+         T.takeWhile (/= '"') rest
+       Just ('\'', rest) ->
+         T.takeWhile (/= '\'') rest
+       _ ->
+         T.strip (fst (T.breakOn " #" s))
+
+-- | Scanner state for parsing frontmatter without sprawling tuples
+data FmScannerState = FmScannerState
+  { fmSection      :: !Text
+  , fmSubSection   :: !Text
+  , fmDesc         :: !Text
+  , fmBudget       :: !Int
+  , fmModel        :: !(Maybe Text)
+  , fmHidden       :: !Bool
+  , fmCaps         :: ![Text]
+  , fmAllowGlobs   :: ![Text]
+  , fmDenyGlobs    :: ![Text]
+  , fmCmdDenyGlobs :: ![Text]
+  , fmBashSpecific :: !Bool
+  , fmWildDeny     :: !Bool
+  }
+
+defaultScannerState :: FmScannerState
+defaultScannerState = FmScannerState
+  { fmSection      = ""
+  , fmSubSection   = ""
+  , fmDesc         = ""
+  , fmBudget       = 12
+  , fmModel        = Nothing
+  , fmHidden       = False
+  , fmCaps         = []
+  , fmAllowGlobs   = []
+  , fmDenyGlobs    = []
+  , fmCmdDenyGlobs = []
+  , fmBashSpecific = False
+  , fmWildDeny     = False
+  }
+
+-- | Parse an inline YAML array like ["read_file*", "bash*"]
+parseInlineYamlList :: Text -> [Text]
+parseInlineYamlList raw =
+  let s = T.strip raw
+  in case Aeson.decodeStrict (TE.encodeUtf8 s) of
+       Just (xs :: [Text]) -> filter (not . T.null) (map cleanYamlScalar xs)
+       Nothing ->
+         if "[" `T.isPrefixOf` s && "]" `T.isSuffixOf` s
+           then
+             let inner = T.drop 1 (T.dropEnd 1 s)
+                 parts = map cleanYamlScalar (T.splitOn "," inner)
+             in filter (not . T.null) parts
+           else []
+
+-- | Parse an OpenCode or native lambdA Markdown agent file with YAML frontmatter
+parseMarkdownAgent :: Text -> Maybe SpecialistConfig
+parseMarkdownAgent rawContent =
+  let contentNoBom = fromMaybe rawContent (T.stripPrefix "\xFEFF" rawContent)
+      allLines = map (T.dropWhileEnd (== '\r')) (T.lines contentNoBom)
+      nonBlankStart = dropWhile (T.null . T.strip) allLines
+      (fmLines, bodyLines) = case nonBlankStart of
+        (firstLine : rest) | T.strip firstLine == "---" ->
+          let (fm, afterFm) = break (\l -> let st = T.strip l in st == "---" || st == "...") rest
+          in case afterFm of
+               (_closing : body) -> (fm, body)
+               []                -> ([], allLines)
+        _ -> ([], allLines)
+      rawBody = T.strip (T.unlines bodyLines)
+  in if T.null rawBody && null fmLines
+       then Nothing
+       else
+         let step st line =
+               let trimmed = T.strip line
+                   indent = T.length (T.takeWhile isSpace line)
+               in if T.null trimmed || "#" `T.isPrefixOf` trimmed
+                    then st
+                    else if indent == 0
+                      then
+                        let (kRaw, vWithColon) = T.breakOn ":" trimmed
+                            k = T.toLower (T.strip kRaw)
+                            v = cleanYamlScalar (T.drop 1 vWithColon)
+                        in case k of
+                             "description" -> st { fmSection = "", fmSubSection = "", fmDesc = v }
+                             "steps"       -> st { fmSection = "", fmSubSection = "", fmBudget = fromMaybe (fmBudget st) (readMaybe (T.unpack v)) }
+                             "maxsteps"    -> st { fmSection = "", fmSubSection = "", fmBudget = fromMaybe (fmBudget st) (readMaybe (T.unpack v)) }
+                             "budget"      -> st { fmSection = "", fmSubSection = "", fmBudget = fromMaybe (fmBudget st) (readMaybe (T.unpack v)) }
+                             "model"       -> st { fmSection = "", fmSubSection = "", fmModel = if T.null v then fmModel st else Just v }
+                             "hidden"      -> st { fmSection = "", fmSubSection = "", fmHidden = fmHidden st || T.toLower v == "true" }
+                             "disable"     -> st { fmSection = "", fmSubSection = "", fmHidden = fmHidden st || T.toLower v == "true" }
+                             "capabilities" ->
+                               let inline = parseInlineYamlList (T.strip (T.drop 1 vWithColon))
+                               in st { fmSection = "capabilities", fmSubSection = "", fmCaps = fmCaps st ++ inline }
+                             "tools"       -> st { fmSection = "tools", fmSubSection = "" }
+                             "permission"  -> st { fmSection = "permission", fmSubSection = "" }
+                             "permissions" -> st { fmSection = "permission", fmSubSection = "" }
+                             _             -> st { fmSection = "", fmSubSection = "" }
+                      else
+                        -- Indented line inside a section
+                        case fmSection st of
+                          "capabilities"
+                            | "- " `T.isPrefixOf` trimmed ->
+                                let item = cleanYamlScalar (T.drop 2 trimmed)
+                                in st { fmCaps = fmCaps st ++ [item | not (T.null item)] }
+                          s | s `elem` ["tools", "permission"] ->
+                            let (kRaw, vWithColon) = T.breakOn ":" trimmed
+                                kClean = cleanYamlScalar kRaw
+                                vClean = T.toLower (cleanYamlScalar (T.drop 1 vWithColon))
+                            in if T.null vClean && ":" `T.isSuffixOf` trimmed
+                                 then st { fmSubSection = T.toLower kClean }
+                                 else
+                                   let activeSub = if indent <= 2 then "" else fmSubSection st
+                                   in if activeSub `elem` ["bash", "shell"]
+                                        then
+                                          case vClean of
+                                            "allow" ->
+                                              let pat = if "*" `T.isInfixOf` kClean then kClean else kClean <> "*"
+                                              in st { fmAllowGlobs = fmAllowGlobs st ++ [pat], fmBashSpecific = True }
+                                            "true" ->
+                                              let pat = if "*" `T.isInfixOf` kClean then kClean else kClean <> "*"
+                                              in st { fmAllowGlobs = fmAllowGlobs st ++ [pat], fmBashSpecific = True }
+                                            "deny" | kClean == "*" ->
+                                              st { fmDenyGlobs = fmDenyGlobs st ++ ["bash*"], fmBashSpecific = True }
+                                            "deny" ->
+                                              let pat = if "*" `T.isInfixOf` kClean then kClean else kClean <> "*"
+                                              in st { fmCmdDenyGlobs = fmCmdDenyGlobs st ++ [pat] }
+                                            "ask" | kClean == "*" ->
+                                              st { fmDenyGlobs = fmDenyGlobs st ++ ["bash*"], fmBashSpecific = True }
+                                            "ask" ->
+                                              let pat = if "*" `T.isInfixOf` kClean then kClean else kClean <> "*"
+                                              in st { fmCmdDenyGlobs = fmCmdDenyGlobs st ++ [pat] }
+                                            _ -> st
+                                        else
+                                          let mapped = mapOpenCodeToolKey kClean
+                                          in case vClean of
+                                               v | v `elem` ["true", "allow"] ->
+                                                 st { fmAllowGlobs = fmAllowGlobs st ++ mapped }
+                                               v | v `elem` ["false", "deny"] ->
+                                                 if kClean == "*"
+                                                   then st { fmWildDeny = True }
+                                                   else st { fmDenyGlobs = fmDenyGlobs st ++ mapped }
+                                               _ -> st
+                          _ -> st
+
+             finalSt = foldl step defaultScannerState fmLines
+         in if fmHidden finalSt
+              then Nothing
+              else
+                let explicitCaps = fmCaps finalSt
+                    allowed = fmAllowGlobs finalSt
+                    denied = fmDenyGlobs finalSt
+                    effectiveCaps
+                      | not (null explicitCaps) = nub explicitCaps
+                      | otherwise =
+                          let base = if fmWildDeny finalSt then [] else defaultOpenCodeCapabilities
+                              deniedWithBash = if fmBashSpecific finalSt && "bash*" `notElem` allowed
+                                                 then "bash*" : denied
+                                                 else denied
+                              filteredBase = filter (`notElem` deniedWithBash) base
+                          in nub (filteredBase ++ allowed)
+                    fallbackDesc = case filter (not . T.null . T.strip) (T.lines rawBody) of
+                      (l:_) -> T.take 80 (T.dropWhile (\c -> c == '#' || isSpace c) l)
+                      []    -> "Custom specialist subagent"
+                    effectiveDesc = if T.null (fmDesc finalSt) then fallbackDesc else fmDesc finalSt
+                    effectivePrompt =
+                      if "submit_report" `T.isInfixOf` rawBody
+                        then rawBody
+                        else rawBody <> "\n\nWhen your task is complete, call `submit_report` with status, summary, details, and any artifact path."
+                in Just SpecialistConfig
+                     { specialistDescription  = effectiveDesc
+                     , specialistPrompt       = effectivePrompt
+                     , specialistBudget       = fmBudget finalSt
+                     , specialistCapabilities = effectiveCaps
+                     , specialistDenyGlobs    = nub (fmCmdDenyGlobs finalSt)
+                     , specialistModel        = fmModel finalSt
+                     }
+
+-- | Recursively load Markdown agent definitions (.md) from a directory
+loadMarkdownAgentsFromDir :: FilePath -> IO (Map Text SpecialistConfig)
+loadMarkdownAgentsFromDir rootDir = do
+  exists <- doesDirectoryExist rootDir
+  if not exists
+    then pure Map.empty
+    else go "" rootDir
+  where
+    go relPrefix currentDir = do
+      entries <- listDirectory currentDir `catch` (\(_ :: IOException) -> pure [])
+      maps <- forM entries $ \entry -> do
+        let fullPath = currentDir </> entry
+        isDir <- doesDirectoryExist fullPath
+        if isDir
+          then
+            if "." `isPrefixOf` entry
+              then pure Map.empty
+              else do
+                let nextPrefix = if null relPrefix then entry else relPrefix ++ "/" ++ entry
+                go nextPrefix fullPath
+          else
+            if takeExtension entry == ".md"
+              then do
+                raw <- TIO.readFile fullPath `catch` (\(_ :: IOException) -> pure "")
+                case parseMarkdownAgent raw of
+                  Nothing -> pure Map.empty
+                  Just spec -> do
+                    let baseKey = T.toLower (T.pack (dropExtension entry))
+                        relKey  = if null relPrefix
+                                    then baseKey
+                                    else T.toLower (T.pack relPrefix) <> "/" <> baseKey
+                    pure $ if relKey == baseKey
+                             then Map.singleton baseKey spec
+                             else Map.fromList [(relKey, spec), (baseKey, spec)]
+              else pure Map.empty
+      pure (Map.unions maps)
+
+-- | Load Markdown agent definitions from multiple directories in priority order (first wins)
+loadAllMarkdownAgents :: [FilePath] -> IO (Map Text SpecialistConfig)
+loadAllMarkdownAgents dirs = do
+  maps <- mapM loadMarkdownAgentsFromDir dirs
+  pure (Map.unions maps)
+
 loadConfig :: FilePath -> IO Config
 loadConfig wsRoot = do
   home <- getHomeDirectory
   let globalPath = home </> ".config" </> "lambdA" </> "config.json"
       localPath  = wsRoot </> ".lambda" </> "config.json"
 
+  -- 1. Load global Markdown agents (OpenCode + lambdA)
+  globalMdSpecs <- loadAllMarkdownAgents
+    [ home </> ".config" </> "lambdA" </> "agents"
+    , home </> ".config" </> "opencode" </> "agents"
+    , home </> ".config" </> "opencode" </> "agent"
+    ]
+  let allGlobalSpecs = Map.union globalMdSpecs defaultSpecialists
+
+  -- 2. Load global config.json
   baseCfg <- do
     gExists <- doesFileExist globalPath
     if gExists
       then do
         content <- BS.readFile globalPath
         pure $ case Aeson.decodeStrict content of
-          Just c  -> c
-          Nothing -> defaultConfig
-      else pure defaultConfig
+          Just c  -> c { specialists = Map.union (specialists c) allGlobalSpecs }
+          Nothing -> defaultConfig { specialists = allGlobalSpecs }
+      else pure (defaultConfig { specialists = allGlobalSpecs })
 
+  -- 3. Load workspace Markdown agents (.opencode/agent[s] and .lambda/agents)
+  localMdSpecs <- loadAllMarkdownAgents
+    [ wsRoot </> ".lambda" </> "agents"
+    , wsRoot </> ".opencode" </> "agents"
+    , wsRoot </> ".opencode" </> "agent"
+    ]
+  let baseCfgWithLocalMd = baseCfg
+        { specialists = Map.union localMdSpecs (specialists baseCfg)
+        }
+
+  -- 4. Load workspace .lambda/config.json
   mergedCfg <- do
     lExists <- doesFileExist localPath
     if lExists
@@ -312,32 +621,32 @@ loadConfig wsRoot = do
                   Just (Just m) -> Map.union m fallback
                   _             -> fallback
                 mAliases = case parseMaybe (.:? "model_aliases") o of
-                  Just (Just a) -> Map.union a (modelAliases baseCfg)
+                  Just (Just a) -> Map.union a (modelAliases baseCfgWithLocalMd)
                   _             -> case parseMaybe (.:? "aliases") o of
-                    Just (Just a) -> Map.union a (modelAliases baseCfg)
-                    _             -> modelAliases baseCfg
+                    Just (Just a) -> Map.union a (modelAliases baseCfgWithLocalMd)
+                    _             -> modelAliases baseCfgWithLocalMd
                 specsWithSubs = case parseMaybe (.:? "subagents") o of
-                  Just (Just sub) -> Map.union sub (specialists baseCfg)
-                  _               -> specialists baseCfg
-            in baseCfg
-              { apiBaseUrl         = pick "api_base_url" (apiBaseUrl baseCfg)
-              , apiKey             = pick "api_key" (apiKey baseCfg)
-              , modelName          = pick "model_name" (modelName baseCfg)
-              , customHeaders      = pickMap "custom_headers" (customHeaders baseCfg)
-              , alwaysAllowGlobs   = pick "always_allow_globs" (alwaysAllowGlobs baseCfg)
-              , alwaysDenyGlobs    = pick "always_deny_globs" (alwaysDenyGlobs baseCfg)
-              , maxTurnBudget      = pick "max_turn_budget" (maxTurnBudget baseCfg)
-              , contextWindowLimit = pick "context_limit" (contextWindowLimit baseCfg)
-              , mcpServers         = pickMap "mcp_servers" (mcpServers baseCfg)
+                  Just (Just sub) -> Map.union sub (specialists baseCfgWithLocalMd)
+                  _               -> specialists baseCfgWithLocalMd
+            in baseCfgWithLocalMd
+              { apiBaseUrl         = pick "api_base_url" (apiBaseUrl baseCfgWithLocalMd)
+              , apiKey             = pick "api_key" (apiKey baseCfgWithLocalMd)
+              , modelName          = pick "model_name" (modelName baseCfgWithLocalMd)
+              , customHeaders      = pickMap "custom_headers" (customHeaders baseCfgWithLocalMd)
+              , alwaysAllowGlobs   = pick "always_allow_globs" (alwaysAllowGlobs baseCfgWithLocalMd)
+              , alwaysDenyGlobs    = pick "always_deny_globs" (alwaysDenyGlobs baseCfgWithLocalMd)
+              , maxTurnBudget      = pick "max_turn_budget" (maxTurnBudget baseCfgWithLocalMd)
+              , contextWindowLimit = pick "context_limit" (contextWindowLimit baseCfgWithLocalMd)
+              , mcpServers         = pickMap "mcp_servers" (mcpServers baseCfgWithLocalMd)
               , specialists        = pickMap "specialists" specsWithSubs
-              , maxSavedSessions   = pick "max_saved_sessions" (maxSavedSessions baseCfg)
+              , maxSavedSessions   = pick "max_saved_sessions" (maxSavedSessions baseCfgWithLocalMd)
               , modelAliases       = mAliases
-              , configuredModels   = pick "models" (configuredModels baseCfg)
-              , themeName          = pick "theme" (themeName baseCfg)
-              , customThemes       = pickMap "themes" (customThemes baseCfg)
+              , configuredModels   = pick "models" (configuredModels baseCfgWithLocalMd)
+              , themeName          = pick "theme" (themeName baseCfgWithLocalMd)
+              , customThemes       = pickMap "themes" (customThemes baseCfgWithLocalMd)
               }
-          _ -> baseCfg
-      else pure baseCfg
+          _ -> baseCfgWithLocalMd
+      else pure baseCfgWithLocalMd
 
   -- Load local .env / .env.local variables if present
   dotEnvMap <- do
