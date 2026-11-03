@@ -219,6 +219,7 @@ data Config = Config
   , configuredModels    :: ![Text]
   , themeName           :: !Text
   , customThemes        :: !(Map Text (Map Text Text))
+  , mouseSupport        :: !Bool
   } deriving stock (Eq, Show, Generic)
 
 instance Aeson.ToJSON Config where
@@ -238,6 +239,7 @@ instance Aeson.ToJSON Config where
     , "models"              .= configuredModels
     , "theme"               .= themeName
     , "themes"              .= customThemes
+    , "mouse_support"       .= mouseSupport
     ]
 
 instance Aeson.FromJSON Config where
@@ -261,6 +263,9 @@ instance Aeson.FromJSON Config where
     configuredModels   <- obj .:? "models" .!= []
     themeName          <- obj .:? "theme" .!= "default"
     customThemes       <- obj .:? "themes" .!= Map.empty
+    mMouse             <- obj .:? "mouse_support"
+    mMouseAlias        <- obj .:? "mouse"
+    let mouseSupport   = fromMaybe True (mMouse <|> mMouseAlias)
     let specialists = Map.union userSpecialists (Map.union userSubagents defaultSpecialists)
         workspaceRoot  = "."
         artifactDir    = ".lambda/artifacts"
@@ -307,6 +312,7 @@ defaultConfig = Config
   , configuredModels    = []
   , themeName           = "default"
   , customThemes        = Map.empty
+  , mouseSupport        = True
   }
 
 -- | Default capabilities granted to OpenCode markdown agents unless restricted by frontmatter
@@ -644,6 +650,7 @@ loadConfig wsRoot = do
               , configuredModels   = pick "models" (configuredModels baseCfgWithLocalMd)
               , themeName          = pick "theme" (themeName baseCfgWithLocalMd)
               , customThemes       = pickMap "themes" (customThemes baseCfgWithLocalMd)
+              , mouseSupport       = pick "mouse_support" (mouseSupport baseCfgWithLocalMd)
               }
           _ -> baseCfgWithLocalMd
       else pure baseCfgWithLocalMd

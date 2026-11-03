@@ -12,7 +12,7 @@ import Data.Text (Text)
 import Data.Time.Clock (UTCTime)
 import Lens.Micro.TH (makeLensesFor)
 
-import Lambda.Config (Config)
+import Lambda.Config (Config, mouseSupport)
 import Lambda.Core.EngineInterface (EngineChannels)
 import Lambda.Engine.Session (SessionMeta)
 import Lambda.Types
@@ -83,6 +83,7 @@ data UIState = UIState
   , uiExecutionStart   :: !(Maybe UTCTime)
   , uiElapsedSeconds   :: !Int
   , uiConfig           :: !Config
+  , uiMouseEnabled     :: !Bool
   }
 
 makeLensesFor
@@ -100,6 +101,7 @@ makeLensesFor
   , ("uiShowHud", "showHudL")
   , ("uiSelectedSubAgent", "selectedSubAgentL")
   , ("uiPromptHistory", "promptHistoryL")
+  , ("uiMouseEnabled", "mouseEnabledL")
   ] ''UIState
 
 -- | Provides a standard default UIState to prevent missing-field breakage
@@ -129,4 +131,5 @@ defaultUIState chans cfg = UIState
   , uiExecutionStart   = Nothing
   , uiElapsedSeconds   = 0
   , uiConfig           = cfg
+  , uiMouseEnabled     = mouseSupport cfg
   }

@@ -184,7 +184,7 @@ main = do
     initVtyUnicodeWidthTable
     initialVty <- VCross.mkVty V.defaultConfig
     V.setMode (V.outputIface initialVty) V.BracketedPaste True
-    V.setMode (V.outputIface initialVty) V.Mouse True
+    V.setMode (V.outputIface initialVty) V.Mouse (mouseSupport cfg)
 
     -- 5. Initialize UI State from loaded session
     let initialTurns = case loadedSession of
@@ -228,13 +228,14 @@ main = do
           , uiExecutionStart   = Nothing
           , uiElapsedSeconds   = 0
           , uiConfig           = cfg
+          , uiMouseEnabled     = mouseSupport cfg
           }
 
     -- 6. Run Brick TUI
     let buildVty = do
           v <- VCross.mkVty V.defaultConfig
           V.setMode (V.outputIface v) V.BracketedPaste True
-          V.setMode (V.outputIface v) V.Mouse True
+          V.setMode (V.outputIface v) V.Mouse (mouseSupport cfg)
           pure v
     _ <- customMain initialVty buildVty (Just eventChan) theApp initialUIState
     pure ()

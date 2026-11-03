@@ -131,7 +131,11 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
         Just t  -> cancel t
         Nothing -> pure ()
     CmdInterrupt -> do
-      atomically $ writeTVar appInterrupted True
+      atomically $ do
+        writeTVar appInterrupted True
+        subs <- readTVar appSubAgents
+        let updatedSubs = Map.map (\t -> if subAgentStatus t == SubAgentRunning then t { subAgentStatus = SubAgentBlocked "Cancelled by user" } else t) subs
+        writeTVar appSubAgents updatedSubs
       mTask <- readTVarIO activeTaskVar
       case mTask of
         Just t  -> cancel t
@@ -292,8 +296,9 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
           else pure ()
 
       -- 2. Run agent conversation loop in async task so cmdQueue remains responsive
+      let maxBudget = max 1 (maxTurnBudget appConfig)
       turnTask <- async $ do
-        turnRes <- try $ runAgentTurnLoop engineState driver channels 1 15
+        turnRes <- try $ runAgentTurnLoop engineState driver channels 1 maxBudget
         case turnRes of
           Left (ex :: SomeException) -> do
             intr <- readTVarIO appInterrupted
@@ -322,10 +327,14 @@ runAgentTurnLoop
   -> Int
   -> Int
   -> IO ()
-runAgentTurnLoop engineState@AppEngineState{..} driver channels@EngineChannels{..} turnIdx maxTurns
-  | turnIdx > maxTurns = do
-      emitEngineEvent engineState (EvError "Maximum turn limit reached for current prompt.")
-  | otherwise = do
+runAgentTurnLoop engineState@AppEngineState{..} driver channels@EngineChannels{..} rawTurnIdx rawMaxTurns = do
+  let turnIdx = max 1 rawTurnIdx
+      maxTurns = max 1 rawMaxTurns
+  if turnIdx > maxTurns
+    then do
+      emitEngineEvent engineState
+        (EvError $ "Turn budget limit of " <> T.pack (show maxTurns) <> " reached for current prompt. To allow longer tool loops, increase 'max_turn_budget' in .lambda/config.json.")
+    else do
       turns <- readTVarIO appTurns
       mode <- readTVarIO appMode
       reg <- readTVarIO appToolRegistry

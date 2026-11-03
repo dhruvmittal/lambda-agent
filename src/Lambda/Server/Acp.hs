@@ -13,6 +13,9 @@ module Lambda.Server.Acp
   , initAcpServerStateWithSink
   , startAcpSession
   , startAcpSessionWithSession
+  , formatToolCallTitle
+  , determineToolKind
+  , broadcastUsageUpdate
   ) where
 
 import Control.Concurrent (forkIO)
@@ -21,7 +24,7 @@ import Control.Concurrent.STM
 import Control.Exception (SomeException, catch, try)
 import Control.Monad (unless)
 import qualified Data.Aeson as Aeson
-import Data.Aeson ((.=), (.:))
+import Data.Aeson ((.=), (.:), (.:?))
 import Data.Aeson.Types (parseEither)
 import qualified Data.ByteString.Lazy as BL
 import Data.Map.Strict (Map)
@@ -47,7 +50,7 @@ import System.IO
   )
 import System.Timeout (timeout)
 
-import Lambda.Config (Config(..), loadConfig)
+import Lambda.Config (Config(..), loadConfig, curatedModels, lookupModelContextLimit)
 import Lambda.Core.EngineInterface
   ( EngineChannels(..)
   , EngineRuntime(..)
@@ -55,6 +58,7 @@ import Lambda.Core.EngineInterface
   , stopEngineRuntime
   )
 import Lambda.Core.ModelDriver (ModelDriver(..))
+import Lambda.Engine.Compactor (estimateTotalTokens)
 import Lambda.Engine.Security (resolvePrompt)
 import Lambda.Engine.Session (loadSession, listMeaningfulSessions, Session(..), SessionMeta(..))
 import Lambda.Engine.State (AppEngineState(..))
@@ -197,15 +201,264 @@ parsePlanEntriesFromVector txt =
         in AcpPlanEntry line status prio
   in map toEntry ls
 
--- | Calculates rough prompt and completion token counts from session turns
+-- | Calculates prompt and completion token counts across dialogue turns
 calculateSessionTokens :: [Turn] -> (Int, Int)
 calculateSessionTokens turns =
-  let countChars blks = sum [ T.length t | TextBlock t <- blks ]
-      promptChars = sum [ countChars (turnBlocks t) | t <- turns, turnRole t /= AssistantRole ]
-      compChars   = sum [ countChars (turnBlocks t) | t <- turns, turnRole t == AssistantRole ]
-      pToks = max 1 (promptChars `div` 4)
-      cToks = max 1 (compChars `div` 4)
-  in (pToks + cToks, pToks)
+  let promptToks = estimateTotalTokens (filter (\t -> turnRole t /= AssistantRole) turns)
+      compToks   = estimateTotalTokens (filter (\t -> turnRole t == AssistantRole) turns)
+  in (promptToks + compToks, promptToks)
+
+-- | Broadcasts real-time context token usage and model capacity to the ACP client (e.g. Zed)
+broadcastUsageUpdate :: AcpServerState -> AppEngineState -> Text -> IO ()
+broadcastUsageUpdate state eng sId = do
+  turns <- readTVarIO (appTurns eng)
+  ctxLimit <- readTVarIO (appContextLimit eng)
+  let (totalToks, promptToks) = calculateSessionTokens turns
+      compToks = max 0 (totalToks - promptToks)
+      cost = fromIntegral totalToks * 0.000005
+  sendSessionUpdate state sId (AcpUsageUpdate totalToks ctxLimit (Just cost) (Just promptToks) (Just compToks))
+
+-- | Formats a descriptive, human-readable title for a tool call based on its arguments
+formatToolCallTitle :: ToolCall -> Text
+formatToolCallTitle tc =
+  let name = toolCallName tc
+      argsObj = case toolCallArgs tc of
+        Aeson.Object o -> Just o
+        _              -> Nothing
+      detail = case (name, argsObj) of
+        ("read_file", Just o) ->
+          case parseEither (.: "path") o of
+            Right (p :: Text) -> " " <> p
+            _ -> ""
+        ("list_directory", Just o) ->
+          case parseEither (.:? "path") o of
+            Right (Just (p :: Text)) -> " " <> p
+            _ -> ""
+        ("execute_bash", Just o) ->
+          case parseEither (.: "command") o of
+            Right (c :: Text) -> " " <> (if T.length c > 50 then T.take 47 c <> "..." else c)
+            _ -> ""
+        ("call_mcp_tool", Just o) ->
+          let sName = case parseEither (.: "server_name") o of
+                Right (s :: Text) -> Right s
+                Left _            -> parseEither (.: "ServerName") o
+              tName = case parseEither (.: "tool_name") o of
+                Right (t :: Text) -> Right t
+                Left _            -> parseEither (.: "ToolName") o
+              mArgs = case parseEither (.:? "arguments") o of
+                Right (Just (Aeson.Object io)) -> Right (Just (Aeson.Object io))
+                _                              -> parseEither (.:? "Arguments") o
+          in case (sName, tName) of
+               (Right (s :: Text), Right (t :: Text)) ->
+                 let inner = case mArgs of
+                       Right (Just (Aeson.Object io)) ->
+                         let mPath = parseEither (.:? "path") io
+                             mAct  = parseEither (.:? "action") io
+                             mQry  = parseEither (.:? "query") io
+                             mTgt  = parseEither (.:? "target_file") io
+                         in case (mPath, mAct, mQry, mTgt) of
+                              (Right (Just (p :: Text)), _, _, _) -> " (" <> p <> ")"
+                              (_, Right (Just (a :: Text)), _, _) -> " (" <> a <> ")"
+                              (_, _, Right (Just (q :: Text)), _) -> " (" <> q <> ")"
+                              (_, _, _, Right (Just (tf :: Text))) -> " (" <> tf <> ")"
+                              _ -> ""
+                       _ -> ""
+                 in " " <> s <> "/" <> t <> inner
+               _ -> ""
+        ("spawn_specialist_subagent", Just o) ->
+          case (parseEither (.: "role") o, parseEither (.: "task") o) of
+            (Right (r :: Text), Right (t :: Text)) ->
+              " " <> r <> " (" <> (if T.length t > 40 then T.take 37 t <> "..." else t) <> ")"
+            (Right (r :: Text), _) -> " " <> r
+            _ -> ""
+        ("grep_search", Just o) ->
+          case parseEither (.: "pattern") o of
+            Right (pat :: Text) -> " \"" <> pat <> "\""
+            _ -> ""
+        ("file_search", Just o) ->
+          case parseEither (.: "query") o of
+            Right (q :: Text) -> " \"" <> q <> "\""
+            _ -> ""
+        ("edit_file", Just o) ->
+          case parseEither (.: "path") o of
+            Right (p :: Text) -> " " <> p
+            _ -> ""
+        ("write_file", Just o) ->
+          case parseEither (.: "path") o of
+            Right (p :: Text) -> " " <> p
+            _ -> ""
+        _ -> ""
+  in name <> detail
+
+-- | Determines ACP tool kind (read, edit, execute)
+determineToolKind :: Text -> Text
+determineToolKind = \case
+  "read_file"      -> "read"
+  "list_directory" -> "read"
+  "grep_search"    -> "read"
+  "file_search"    -> "read"
+  "fetch_web"      -> "read"
+  "edit_file"      -> "edit"
+  "write_file"     -> "edit"
+  _                -> "execute"
+
+-- | Standard commands advertised to ACP clients
+acpStandardCommands :: [AcpCommand]
+acpStandardCommands =
+  [ AcpCommand "plan" "Switch to Plan mode (read-only inspection, safe execution)"
+  , AcpCommand "exec" "Switch to Exec mode (full tool execution access)"
+  , AcpCommand "model" "Inspect or switch active model"
+  , AcpCommand "compact" "Compact conversation history"
+  , AcpCommand "clear" "Clear session history"
+  , AcpCommand "commands" "List all available slash commands"
+  , AcpCommand "help" "Show command reference"
+  ]
+
+-- | Builds ACP config options for model selection, mode switching, and reasoning level
+buildSessionConfigOptions :: Config -> AgentMode -> Text -> Text -> [AcpConfigOption]
+buildSessionConfigOptions cfg curMode curModel curThought =
+  let modelChoices =
+        let curChoice = AcpConfigOptionChoice curModel curModel (Just "Active model")
+            curated = [ AcpConfigOptionChoice m m (Just "Curated model option") | m <- curatedModels, m /= curModel ]
+            cfgCustom = [ AcpConfigOptionChoice m m (Just "User configured model") | m <- configuredModels cfg, m /= curModel && notElem m curatedModels ]
+        in curChoice : (curated ++ cfgCustom)
+      modeChoices =
+        [ AcpConfigOptionChoice "plan" "Plan Mode" (Just "Read-only inspection and safe planning")
+        , AcpConfigOptionChoice "exec" "Exec Mode" (Just "Full mutating tool execution access")
+        ]
+      thoughtChoices =
+        [ AcpConfigOptionChoice "low" "Low" (Just "Concise responses")
+        , AcpConfigOptionChoice "medium" "Medium" (Just "Balanced reasoning")
+        , AcpConfigOptionChoice "high" "High" (Just "In-depth deductive reasoning")
+        ]
+      modeStr = if curMode == PlanMode then "plan" else "exec"
+  in [ AcpConfigOption "model" "Model" (Just "Active language model") (Just "model") "select" curModel modelChoices
+     , AcpConfigOption "mode" "Mode" (Just "Operating mode") (Just "mode") "select" modeStr modeChoices
+     , AcpConfigOption "thought_level" "Reasoning Level" (Just "Model reasoning effort") (Just "thought_level") "select" curThought thoughtChoices
+     ]
+
+-- | Builds legacy modes structure for ACP v1 client backward compatibility
+buildSessionModes :: AgentMode -> AcpModesState
+buildSessionModes curMode =
+  let modeStr = if curMode == PlanMode then "plan" else "exec"
+  in AcpModesState
+       { currentModeId  = modeStr
+       , availableModes =
+           [ AcpModeInfo "plan" "Plan" (Just "Read-only inspection and safe planning")
+           , AcpModeInfo "exec" "Exec" (Just "Full mutating tool execution access")
+           ]
+       }
+
+-- | Handles ACP slash commands intercepted before reaching LLM
+handleSlashPrompt :: AcpServerState -> Maybe Aeson.Value -> Text -> Text -> Maybe EngineChannels -> Maybe AppEngineState -> Config -> IO ()
+handleSlashPrompt state mReqId sId prompt mChannels mEngine baseCfg = do
+  let (cmdWord, rawArgs) = T.breakOn " " prompt
+      cmd = T.toLower cmdWord
+      args = T.strip rawArgs
+      finish = case mReqId of
+        Just rId -> sendAcpResponse state rId (Just (Aeson.toJSON (AcpSessionPromptResult "end_turn"))) Nothing
+        Nothing  -> pure ()
+  case cmd of
+    "/plan" -> do
+      case mEngine of
+        Just eng -> atomically $ writeTVar (appMode eng) PlanMode
+        Nothing  -> pure ()
+      case mChannels of
+        Just ch -> atomically $ writeTBQueue (cmdQueue ch) (CmdSetMode PlanMode)
+        Nothing -> pure ()
+      curModel <- case mEngine of
+        Just eng -> readTVarIO (appActiveModel eng)
+        Nothing  -> pure (modelName baseCfg)
+      sendSessionUpdate state sId (AcpCurrentModeUpdate "plan")
+      sendSessionUpdate state sId $ AcpConfigOptionsUpdate
+        (buildSessionConfigOptions baseCfg PlanMode curModel "high")
+      sendSessionUpdate state sId (AcpAgentMessageChunk "Switched to **Plan Mode** (read-only inspection, safe execution).\n")
+      finish
+
+    "/exec" -> do
+      case mEngine of
+        Just eng -> atomically $ writeTVar (appMode eng) ExecMode
+        Nothing  -> pure ()
+      case mChannels of
+        Just ch -> atomically $ writeTBQueue (cmdQueue ch) (CmdSetMode ExecMode)
+        Nothing -> pure ()
+      curModel <- case mEngine of
+        Just eng -> readTVarIO (appActiveModel eng)
+        Nothing  -> pure (modelName baseCfg)
+      sendSessionUpdate state sId (AcpCurrentModeUpdate "exec")
+      sendSessionUpdate state sId $ AcpConfigOptionsUpdate
+        (buildSessionConfigOptions baseCfg ExecMode curModel "high")
+      sendSessionUpdate state sId (AcpAgentMessageChunk "Switched to **Exec Mode** (full tool execution access).\n")
+      finish
+
+    "/model" -> do
+      if T.null args
+        then do
+          curModel <- case mEngine of
+            Just eng -> readTVarIO (appActiveModel eng)
+            Nothing  -> pure (modelName baseCfg)
+          let modelsMsg = "Active model: `" <> curModel <> "`\n\nCurated models:\n"
+                <> T.unlines [ "- `" <> m <> "`" | m <- curatedModels ]
+                <> "\nTo switch models, run `/model <model-name>`\n"
+          sendSessionUpdate state sId (AcpAgentMessageChunk modelsMsg)
+          finish
+        else do
+          let targetModel = args
+              targetLimit = lookupModelContextLimit targetModel
+          case mEngine of
+            Just eng -> atomically $ do
+              writeTVar (appActiveModel eng) targetModel
+              writeTVar (appContextLimit eng) targetLimit
+            Nothing  -> pure ()
+          case mChannels of
+            Just ch -> atomically $ writeTBQueue (cmdQueue ch) (CmdSetModel targetModel)
+            Nothing -> pure ()
+          atomically $ modifyTVar' (acpConfig state) (\c -> c { modelName = targetModel, contextWindowLimit = targetLimit })
+          curMode <- case mEngine of
+            Just eng -> readTVarIO (appMode eng)
+            Nothing  -> pure PlanMode
+          sendSessionUpdate state sId $ AcpConfigOptionsUpdate
+            (buildSessionConfigOptions baseCfg curMode targetModel "high")
+          case mEngine of
+            Just eng -> broadcastUsageUpdate state eng sId
+            Nothing  -> pure ()
+          sendSessionUpdate state sId (AcpAgentMessageChunk ("Active model switched to: `" <> targetModel <> "`\n"))
+          finish
+
+    "/compact" -> do
+      case mChannels of
+        Just ch -> atomically $ writeTBQueue (cmdQueue ch) CmdCompactHistory
+        Nothing -> pure ()
+      case mEngine of
+        Just eng -> broadcastUsageUpdate state eng sId
+        Nothing  -> pure ()
+      sendSessionUpdate state sId (AcpAgentMessageChunk "Conversation history compaction initiated.\n")
+      finish
+
+    "/clear" -> do
+      case mChannels of
+        Just ch -> atomically $ writeTBQueue (cmdQueue ch) CmdClearHistory
+        Nothing -> pure ()
+      case mEngine of
+        Just eng -> broadcastUsageUpdate state eng sId
+        Nothing  -> pure ()
+      sendSessionUpdate state sId (AcpAgentMessageChunk "Session history cleared.\n")
+      finish
+
+    c | c `elem` ["/help", "/commands"] -> do
+      let msg = "Available ACP Slash Commands:\n"
+            <> "- `/plan` : Switch to Plan mode (read-only inspection, safe execution)\n"
+            <> "- `/exec` : Switch to Exec mode (mutating tool execution access)\n"
+            <> "- `/model [name]` : Show active model or switch to a new model\n"
+            <> "- `/compact` : Compact conversation history\n"
+            <> "- `/clear` : Clear current session history\n"
+            <> "- `/commands` or `/help` : Show this command reference\n"
+      sendSessionUpdate state sId (AcpAgentMessageChunk msg)
+      finish
+
+    _ -> do
+      sendSessionUpdate state sId (AcpAgentMessageChunk ("Unrecognized slash command `" <> cmdWord <> "`. Type `/help` for available commands.\n"))
+      finish
 
 -- | Starts a new session or sets up workspace
 startAcpSession :: AcpServerState -> Maybe FilePath -> IO Text
@@ -242,15 +495,14 @@ startAcpSessionWithSession state mCwd maybeSess = do
   -- Forward engine events to ACP session/update
   _ <- forkIO $ forwardEngineEvents state channels sId
 
-  -- 7. Broadcast available commands update and initial title
-  sendSessionUpdate state sId $ AcpAvailableCommandsUpdate
-    [ AcpCommand "plan" "Switch to Plan mode (read-only inspection, safe execution)"
-    , AcpCommand "exec" "Switch to Exec mode (full tool execution access)"
-    , AcpCommand "model" "Inspect or switch active model"
-    , AcpCommand "compact" "Compact conversation history"
-    , AcpCommand "help" "Show command reference"
-    ]
+  -- 7. Broadcast available commands update, mode, config options, and initial title
+  sendSessionUpdate state sId $ AcpAvailableCommandsUpdate acpStandardCommands
+  let modeStr = if sessionMode sess == PlanMode then "plan" else "exec"
+  sendSessionUpdate state sId (AcpCurrentModeUpdate modeStr)
+  sendSessionUpdate state sId $ AcpConfigOptionsUpdate
+    (buildSessionConfigOptions cfg (sessionMode sess) (modelName cfg) "high")
   sendSessionUpdate state sId (AcpSessionInfoUpdate (sessionTitle sess))
+  broadcastUsageUpdate state engineState sId
 
   pure sId
 
@@ -313,7 +565,12 @@ forwardEngineEvents state channels sId = do
     EvTurnUpdated (Turn _ AssistantRole blks) -> do
       mapM_ (\case
         ToolCallBlock tc ->
-          sendSessionUpdate state sId (AcpToolCall (toolCallId tc) (toolCallName tc) "execute" "in_progress")
+          sendSessionUpdate state sId
+            (AcpToolCall (toolCallId tc)
+                         (formatToolCallTitle tc)
+                         (determineToolKind (toolCallName tc))
+                         "in_progress"
+                         (Just (toolCallArgs tc)))
         _ -> pure ()
         ) blks
       forwardEngineEvents state channels sId
@@ -324,16 +581,17 @@ forwardEngineEvents state channels sId = do
           sendSessionUpdate state sId (AcpToolCallUpdate (resultCallIdRef tr) "completed" (Just (resultStdout tr)))
         _ -> pure ()
         ) blks
+      mEng <- readTVarIO (acpActiveEngine state)
+      case mEng of
+        Just eng -> broadcastUsageUpdate state eng sId
+        Nothing  -> pure ()
       forwardEngineEvents state channels sId
 
     EvDone -> do
       mEng <- readTVarIO (acpActiveEngine state)
       case mEng of
         Just eng -> do
-          turns <- readTVarIO (appTurns eng)
-          let (totalToks, promptToks) = calculateSessionTokens turns
-              cost = fromIntegral totalToks * 0.000005
-          sendSessionUpdate state sId (AcpUsageUpdate totalToks promptToks (Just cost))
+          broadcastUsageUpdate state eng sId
 
           stVec <- readTVarIO (appStateVector eng)
           let entries = parsePlanEntriesFromVector stVec
@@ -351,8 +609,33 @@ forwardEngineEvents state channels sId = do
             Just eng -> readTVarIO (appInterrupted eng)
             Nothing  -> pure False
           let stopReason = if isInterrupted then "cancelled" else "end_turn"
-          atomically $ putTMVar doneVar (AcpSessionPromptResult stopReason)
+          atomically $ do
+            _ <- tryPutTMVar doneVar (AcpSessionPromptResult stopReason)
+            pure ()
         Nothing      -> pure ()
+      forwardEngineEvents state channels sId
+
+    EvSubAgentUpdate _ -> do
+      -- Subagents report their findings through the tool result of spawn_specialist_subagent;
+      -- we do not leak subagent updates into the main agent's thinking stream.
+      forwardEngineEvents state channels sId
+
+    EvWorkingStateUpdate stVec -> do
+      let entries = parsePlanEntriesFromVector stVec
+      unless (null entries) $
+        sendSessionUpdate state sId (AcpPlanUpdate entries)
+      forwardEngineEvents state channels sId
+
+    EvModelSwitched newModel _ -> do
+      baseCfg <- readTVarIO (acpConfig state)
+      mEng <- readTVarIO (acpActiveEngine state)
+      curMode <- case mEng of
+        Just eng -> do
+          broadcastUsageUpdate state eng sId
+          readTVarIO (appMode eng)
+        Nothing  -> pure PlanMode
+      sendSessionUpdate state sId $ AcpConfigOptionsUpdate
+        (buildSessionConfigOptions baseCfg curMode newModel "high")
       forwardEngineEvents state channels sId
 
     EvError err -> do
@@ -409,8 +692,24 @@ handleAcpRequest state AcpJsonRpcRequest{..} = do
             Nothing -> Nothing
           mCwd = mParams >>= newSessionCwd
       sId <- startAcpSession state mCwd
+      baseCfg <- readTVarIO (acpConfig state)
+      mEng <- readTVarIO (acpActiveEngine state)
+      (curMode, curModel) <- case mEng of
+        Just eng -> do
+          mode <- readTVarIO (appMode eng)
+          model <- readTVarIO (appActiveModel eng)
+          pure (mode, model)
+        Nothing -> pure (PlanMode, modelName baseCfg)
+      let cfgOpts = buildSessionConfigOptions baseCfg curMode curModel "high"
+          modesSt = buildSessionModes curMode
+          res = AcpSessionNewResult
+            { newSessionId         = sId
+            , newConfigOptions     = Just cfgOpts
+            , newModes             = Just modesSt
+            , newAvailableCommands = Just acpStandardCommands
+            }
       case reqId of
-        Just rId -> sendAcpResponse state rId (Just (Aeson.toJSON (AcpSessionNewResult sId))) Nothing
+        Just rId -> sendAcpResponse state rId (Just (Aeson.toJSON res)) Nothing
         Nothing  -> pure ()
 
     "session/list" -> do
@@ -477,20 +776,68 @@ handleAcpRequest state AcpJsonRpcRequest{..} = do
       case (reqId, reqParams) of
         (Just rId, Just v) -> do
           case Aeson.fromJSON v of
-            Aeson.Success (AcpSetConfigOptionParams _sId cfgId val) -> do
+            Aeson.Success (AcpSetConfigOptionParams sId cfgId val) -> do
+              baseCfg <- readTVarIO (acpConfig state)
+              mEng <- readTVarIO (acpActiveEngine state)
               case cfgId of
                 "model" -> case val of
                   Aeson.String mName -> do
-                    mEng <- readTVarIO (acpActiveEngine state)
+                    let targetLimit = lookupModelContextLimit mName
                     case mEng of
-                      Just eng -> atomically $ writeTVar (appActiveModel eng) mName
+                      Just eng -> atomically $ do
+                        writeTVar (appActiveModel eng) mName
+                        writeTVar (appContextLimit eng) targetLimit
                       Nothing  -> pure ()
-                    atomically $ modifyTVar' (acpConfig state) (\c -> c { modelName = mName })
-                    sendAcpResponse state rId (Just (Aeson.object ["status" .= ("ok" :: Text)])) Nothing
+                    atomically $ modifyTVar' (acpConfig state) (\c -> c { modelName = mName, contextWindowLimit = targetLimit })
+                    updatedCfg <- readTVarIO (acpConfig state)
+                    curMode <- case mEng of
+                      Just eng -> readTVarIO (appMode eng)
+                      Nothing  -> pure PlanMode
+                    let opts = buildSessionConfigOptions updatedCfg curMode mName "high"
+                    sendSessionUpdate state sId (AcpConfigOptionsUpdate opts)
+                    case mEng of
+                      Just eng -> broadcastUsageUpdate state eng sId
+                      Nothing  -> pure ()
+                    sendAcpResponse state rId (Just (Aeson.object ["status" .= ("ok" :: Text), "configOptions" .= opts])) Nothing
                   _ ->
                     sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= ("Expected string model name" :: Text) ]))
-                _ ->
-                  sendAcpResponse state rId (Just (Aeson.object ["status" .= ("ok" :: Text)])) Nothing
+                "mode" -> case val of
+                  Aeson.String modeStr -> do
+                    let targetMode = if T.toLower modeStr == "exec" then ExecMode else PlanMode
+                    case mEng of
+                      Just eng -> atomically $ writeTVar (appMode eng) targetMode
+                      Nothing  -> pure ()
+                    curModel <- case mEng of
+                      Just eng -> readTVarIO (appActiveModel eng)
+                      Nothing  -> pure (modelName baseCfg)
+                    let opts = buildSessionConfigOptions baseCfg targetMode curModel "high"
+                    sendSessionUpdate state sId (AcpCurrentModeUpdate (if targetMode == PlanMode then "plan" else "exec"))
+                    sendSessionUpdate state sId (AcpConfigOptionsUpdate opts)
+                    sendAcpResponse state rId (Just (Aeson.object ["status" .= ("ok" :: Text), "configOptions" .= opts])) Nothing
+                  _ ->
+                    sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= ("Expected string mode name" :: Text) ]))
+                "thought_level" -> case val of
+                  Aeson.String thkStr -> do
+                    (curMode, curModel) <- case mEng of
+                      Just eng -> do
+                        m <- readTVarIO (appMode eng)
+                        md <- readTVarIO (appActiveModel eng)
+                        pure (m, md)
+                      Nothing -> pure (PlanMode, modelName baseCfg)
+                    let opts = buildSessionConfigOptions baseCfg curMode curModel thkStr
+                    sendSessionUpdate state sId (AcpConfigOptionsUpdate opts)
+                    sendAcpResponse state rId (Just (Aeson.object ["status" .= ("ok" :: Text), "configOptions" .= opts])) Nothing
+                  _ ->
+                    sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= ("Expected string thought level" :: Text) ]))
+                _ -> do
+                  (curMode, curModel) <- case mEng of
+                    Just eng -> do
+                      m <- readTVarIO (appMode eng)
+                      md <- readTVarIO (appActiveModel eng)
+                      pure (m, md)
+                    Nothing -> pure (PlanMode, modelName baseCfg)
+                  let opts = buildSessionConfigOptions baseCfg curMode curModel "high"
+                  sendAcpResponse state rId (Just (Aeson.object ["status" .= ("ok" :: Text), "configOptions" .= opts])) Nothing
             Aeson.Error err ->
               sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= err ]))
         _ -> pure ()
@@ -499,20 +846,27 @@ handleAcpRequest state AcpJsonRpcRequest{..} = do
       case (reqId, reqParams) of
         (Just rId, Just v) -> do
           case Aeson.fromJSON v of
-            Aeson.Success (AcpSessionPromptParams _sId prompt) -> do
+            Aeson.Success (AcpSessionPromptParams sId prompt) -> do
               mChannels <- readTVarIO (acpActiveChannels state)
-              case mChannels of
-                Just channels -> do
-                  doneVar <- newEmptyTMVarIO
-                  atomically $ writeTVar (acpPendingTurnVar state) (Just doneVar)
-                  atomically $ writeTBQueue (cmdQueue channels) (CmdUserPrompt prompt)
-                  -- Await prompt turn completion
-                  res <- atomically $ takeTMVar doneVar
-                  sendAcpResponse state rId (Just (Aeson.toJSON res)) Nothing
-                Nothing -> do
-                  -- Auto-initialize if no active session
-                  _ <- startAcpSession state Nothing
-                  handleAcpRequest state (AcpJsonRpcRequest (Just rId) "session/prompt" (Just v))
+              mEngine   <- readTVarIO (acpActiveEngine state)
+              baseCfg   <- readTVarIO (acpConfig state)
+              let trimmed = T.strip prompt
+                  firstLine = T.takeWhile (/= '\n') trimmed
+                  (cmdWord, _) = T.breakOn " " firstLine
+              if cmdWord `elem` ["/plan", "/exec", "/model", "/compact", "/clear", "/help", "/commands"]
+                then handleSlashPrompt state (Just rId) sId trimmed mChannels mEngine baseCfg
+                else case mChannels of
+                  Just channels -> do
+                    doneVar <- newEmptyTMVarIO
+                    atomically $ writeTVar (acpPendingTurnVar state) (Just doneVar)
+                    atomically $ writeTBQueue (cmdQueue channels) (CmdUserPrompt prompt)
+                    -- Await prompt turn completion
+                    res <- atomically $ takeTMVar doneVar
+                    sendAcpResponse state rId (Just (Aeson.toJSON res)) Nothing
+                  Nothing -> do
+                    -- Auto-initialize if no active session
+                    _ <- startAcpSession state Nothing
+                    handleAcpRequest state (AcpJsonRpcRequest (Just rId) "session/prompt" (Just v))
             Aeson.Error err ->
               sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= ("Invalid params: " ++ err) ]))
         (Just rId, Nothing) ->
@@ -525,23 +879,44 @@ handleAcpRequest state AcpJsonRpcRequest{..} = do
           case Aeson.fromJSON v of
             Aeson.Success (AcpSetModeParams sId modeStr) -> do
               mEngine <- readTVarIO (acpActiveEngine state)
-              case mEngine of
+              baseCfg <- readTVarIO (acpConfig state)
+              let targetMode = if T.toLower modeStr == "exec" then ExecMode else PlanMode
+              curModel <- case mEngine of
                 Just engine -> do
-                  let targetMode = if T.toLower modeStr == "plan" then PlanMode else ExecMode
                   atomically $ writeTVar (appMode engine) targetMode
-                  sendSessionUpdate state sId (AcpCurrentModeUpdate (if targetMode == PlanMode then "plan" else "exec"))
-                  sendAcpResponse state rId (Just (Aeson.object ["status" .= ("ok" :: Text)])) Nothing
-                Nothing ->
-                  sendAcpResponse state rId (Just (Aeson.object ["status" .= ("ok" :: Text)])) Nothing
+                  readTVarIO (appActiveModel engine)
+                Nothing -> pure (modelName baseCfg)
+              let opts = buildSessionConfigOptions baseCfg targetMode curModel "high"
+              sendSessionUpdate state sId (AcpCurrentModeUpdate (if targetMode == PlanMode then "plan" else "exec"))
+              sendSessionUpdate state sId (AcpConfigOptionsUpdate opts)
+              sendAcpResponse state rId (Just (Aeson.object ["status" .= ("ok" :: Text), "configOptions" .= opts])) Nothing
             Aeson.Error err ->
               sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= err ]))
         _ -> pure ()
 
-    "session/cancel" -> do
+    m | m `elem` ["session/cancel", "session/stop", "$/cancel_request", "$/cancelRequest"] -> do
+      mEngine <- readTVarIO (acpActiveEngine state)
+      case mEngine of
+        Just eng -> atomically $ do
+          writeTVar (appInterrupted eng) True
+          subs <- readTVar (appSubAgents eng)
+          let updatedSubs = Map.map (\t -> if subAgentStatus t == SubAgentRunning then t { subAgentStatus = SubAgentBlocked "Cancelled by user" } else t) subs
+          writeTVar (appSubAgents eng) updatedSubs
+        Nothing  -> pure ()
       mChannels <- readTVarIO (acpActiveChannels state)
       case mChannels of
         Just channels -> atomically $ writeTBQueue (cmdQueue channels) CmdInterrupt
         Nothing       -> pure ()
+      -- Immediately fulfill any in-flight prompt with "cancelled" so the client stops waiting
+      mVar <- atomically $ do
+        v <- readTVar (acpPendingTurnVar state)
+        writeTVar (acpPendingTurnVar state) Nothing
+        pure v
+      case mVar of
+        Just doneVar -> atomically $ do
+          _ <- tryPutTMVar doneVar (AcpSessionPromptResult "cancelled")
+          pure ()
+        Nothing -> pure ()
       case reqId of
         Just rId -> sendAcpResponse state rId (Just (Aeson.object ["status" .= ("cancelled" :: Text)])) Nothing
         Nothing  -> pure ()
@@ -559,7 +934,22 @@ handleAcpRequest state AcpJsonRpcRequest{..} = do
                 Right sess -> do
                   -- Restored successfully
                   _ <- startAcpSessionWithSession state mCwd (Just sess)
-                  sendAcpResponse state rId (Just (Aeson.object ["sessionId" .= sId, "status" .= ("loaded" :: Text)])) Nothing
+                  mEng <- readTVarIO (acpActiveEngine state)
+                  (curMode, curModel) <- case mEng of
+                    Just eng -> do
+                      mode <- readTVarIO (appMode eng)
+                      model <- readTVarIO (appActiveModel eng)
+                      pure (mode, model)
+                    Nothing -> pure (sessionMode sess, modelName baseCfg)
+                  let cfgOpts = buildSessionConfigOptions baseCfg curMode curModel "high"
+                      modesSt = buildSessionModes curMode
+                      res = AcpSessionNewResult
+                        { newSessionId         = sId
+                        , newConfigOptions     = Just cfgOpts
+                        , newModes             = Just modesSt
+                        , newAvailableCommands = Just acpStandardCommands
+                        }
+                  sendAcpResponse state rId (Just (Aeson.toJSON res)) Nothing
                 Left err ->
                   sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32000 :: Int), "message" .= err ]))
             Aeson.Error err ->
@@ -593,7 +983,9 @@ acpLoop state = do
       Right line -> do
         unless (T.null (T.strip line)) $ do
           case Aeson.decode (BL.fromStrict (TE.encodeUtf8 line)) of
-            Just (IncomingRequest req)   -> handleAcpRequest state req
+            Just (IncomingRequest req)   -> do
+              _ <- forkIO $ handleAcpRequest state req
+              pure ()
             Just (IncomingResponse resp) -> handleAcpResponse state resp
             Nothing                      -> TIO.hPutStrLn stderr ("[lambdA-ACP] Invalid JSON line: " <> line)
         acpLoop state

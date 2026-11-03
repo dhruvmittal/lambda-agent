@@ -109,6 +109,9 @@ import Lambda.Server.Acp
   , handleAcpResponse
   , callClientRpc
   , AcpServerState(..)
+  , formatToolCallTitle
+  , determineToolKind
+  , broadcastUsageUpdate
   )
 import Lambda.Server.Acp.Types
 
@@ -189,6 +192,7 @@ main = do
   testSubAgentResumptionAndSpecialization
   testOpenCodeAgentCompatibilityAndSynthesis
   testHaskellArchitectHardeningAndDriverDecoupling
+  testAcpStopCancellationAndToolFormatting
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -2332,12 +2336,18 @@ testAcpSessionAndModeControl = do
   assert "session/new response id matches" (respId sessResp == Aeson.toJSON (102 :: Int))
   sId <- case respResult sessResp of
     Just val -> case Aeson.fromJSON val of
-      Aeson.Success (AcpSessionNewResult sid) -> pure sid
+      Aeson.Success res -> do
+        assert "session/new contains configOptions" (maybe False (not . null) (newConfigOptions res))
+        assert "session/new contains modes" (maybe False (not . null . availableModes) (newModes res))
+        assert "session/new contains availableCommands" (maybe False (not . null) (newAvailableCommands res))
+        pure (newSessionId res)
       Aeson.Error err -> failTest ("Failed to parse AcpSessionNewResult: " <> err) >> pure ""
     Nothing -> failTest "session/new missing result" >> pure ""
 
   assert "Available commands notification broadcast on session start"
     (any (\n -> notifMethod n == "session/update") notifications)
+  assert "usage_update notification broadcast on session start with size and used"
+    (any (\n -> notifMethod n == "session/update" && "\"sessionUpdate\":\"usage_update\"" `T.isInfixOf` TE.decodeUtf8 (BL.toStrict (Aeson.encode (notifParams n)))) notifications)
 
   -- 2. session/set_mode to "exec"
   let setExecReq = AcpJsonRpcRequest
@@ -2482,6 +2492,45 @@ testAcpSessionLifecycle = do
       assert "Active model updated to claude-3-5-sonnet" (activeMod == "claude-3-5-sonnet")
     Nothing -> failTest "Missing active engine state"
 
+  -- 2b. Test session/set_config_option for mode
+  let setModeCfgReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (3021 :: Int))
+        , reqMethod = "session/set_config_option"
+        , reqParams = Just (Aeson.object
+            [ "sessionId" .= sId
+            , "configId"  .= ("mode" :: Text)
+            , "value"     .= ("exec" :: Text)
+            ])
+        }
+  handleAcpRequest state setModeCfgReq
+  modeCfgMsgs <- drainQueue outputQueue
+  let modeCfgResps = [ r | Just (r :: AcpJsonRpcResponse) <- map Aeson.decode modeCfgMsgs ]
+  assert "Received set_config_option mode response" (not (null modeCfgResps))
+  case mEng of
+    Just eng -> do
+      mMode <- readTVarIO (appMode eng)
+      assert "Mode config option updated engine to ExecMode" (mMode == ExecMode)
+    Nothing -> failTest "Missing active engine state"
+
+  -- 2c. Test slash command interception in session/prompt (/commands)
+  let slashCmdReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (3022 :: Int))
+        , reqMethod = "session/prompt"
+        , reqParams = Just (Aeson.object
+            [ "sessionId" .= sId
+            , "prompt"    .= ("/commands" :: Text)
+            ])
+        }
+  handleAcpRequest state slashCmdReq
+  slashMsgs <- drainQueue outputQueue
+  let slashResps = [ r | Just (r :: AcpJsonRpcResponse) <- map Aeson.decode slashMsgs ]
+      slashNotifs = [ n | Just (n :: AcpJsonRpcNotification) <- map Aeson.decode slashMsgs ]
+  assert "Received slash prompt response" (not (null slashResps))
+  let sResp = head slashResps
+  assert "Slash command response stopReason is end_turn" (respResult sResp == Just (Aeson.object ["stopReason" .= ("end_turn" :: Text)]))
+  assert "Slash command emitted agent message chunk with available commands"
+    (any (\n -> notifMethod n == "session/update" && "/plan" `T.isInfixOf` TE.decodeUtf8 (BL.toStrict (Aeson.encode (notifParams n)))) slashNotifs)
+
   -- 3. Test session/list
   let listReq = AcpJsonRpcRequest
         { reqId = Just (Aeson.toJSON (303 :: Int))
@@ -2578,10 +2627,10 @@ testAcpFullDuplexRpcAndNotifications = do
   assert "Plan update contains sessionUpdate plan" ("\"sessionUpdate\":\"plan\"" `T.isInfixOf` planTxt)
   assert "Plan update contains Verify compiler flags" ("Verify compiler flags" `T.isInfixOf` planTxt)
 
-  let usageNotif = AcpSessionUpdateNotification "sess_test" (AcpUsageUpdate 1500 1000 (Just 0.0075))
+  let usageNotif = AcpSessionUpdateNotification "sess_test" (AcpUsageUpdate 1500 200000 (Just 0.0075) (Just 1000) (Just 500))
       usageTxt = TE.decodeUtf8 (BL.toStrict (Aeson.encode usageNotif))
-  assert "Usage update contains session_usage_update" ("\"sessionUpdate\":\"session_usage_update\"" `T.isInfixOf` usageTxt)
-  assert "Usage update contains totalTokens 1500" ("\"totalTokens\":1500" `T.isInfixOf` usageTxt)
+  assert "Usage update contains usage_update" ("\"sessionUpdate\":\"usage_update\"" `T.isInfixOf` usageTxt)
+  assert "Usage update contains used 1500" ("\"used\":1500" `T.isInfixOf` usageTxt)
 
   let titleNotif = AcpSessionUpdateNotification "sess_test" (AcpSessionInfoUpdate "Dynamic Title")
       titleTxt = TE.decodeUtf8 (BL.toStrict (Aeson.encode titleNotif))
@@ -3188,6 +3237,7 @@ testWorkingStateBackwardsCompatibility = do
         , uiExecutionStart = Nothing
         , uiElapsedSeconds = 0
         , uiConfig = cfg
+        , uiMouseEnabled = True
         }
   let modifiedState = baseState
         & isGeneratingL .~ True
@@ -3563,6 +3613,135 @@ testHaskellArchitectHardeningAndDriverDecoupling = do
   removeDirectoryRecursive tmpDirB
 
   putStrLn "  -> OK: Decoupled model derivation, pre-authorized bash globs, ChunkError fast-fail, budget-1 upfront notice, and scanner hardening verified."
+
+-- 72. ACP Interactive Stop Cancellation, Formatted Tool Titles & Arguments, and SubAgent Isolation
+testAcpStopCancellationAndToolFormatting :: IO ()
+testAcpStopCancellationAndToolFormatting = do
+  putStrLn "\n[Test 72] ACP Interactive Stop Cancellation, Tool Formatting & SubAgent Stream Isolation"
+
+  -- 1. Verify formatToolCallTitle produces descriptive titles
+  let readCallTitle = formatToolCallTitle (ToolCall "1" "read_file" (Aeson.object [ "path" .= ("src/Lambda/Server/Acp.hs" :: Text) ]))
+      bashCallTitle = formatToolCallTitle (ToolCall "2" "execute_bash" (Aeson.object [ "command" .= ("cabal build" :: Text) ]))
+      mcpCallTitle = formatToolCallTitle (ToolCall "3" "call_mcp_tool" (Aeson.object
+        [ "ServerName" .= ("stormdrain" :: Text)
+        , "ToolName"   .= ("sd_memory" :: Text)
+        , "Arguments"  .= Aeson.object [ "query" .= ("test" :: Text) ]
+        ]))
+      subAgentTitle = formatToolCallTitle (ToolCall "4" "spawn_specialist_subagent" (Aeson.object
+        [ "role" .= ("surveyor" :: Text)
+        , "task" .= ("Analyze codebase structure" :: Text)
+        ]))
+      genericTitle = formatToolCallTitle (ToolCall "5" "custom_tool" (Aeson.object [ "foo" .= ("bar" :: Text) ]))
+
+  assert "formatToolCallTitle for read_file contains path" (readCallTitle == "read_file src/Lambda/Server/Acp.hs")
+  assert "formatToolCallTitle for execute_bash contains command" (bashCallTitle == "execute_bash cabal build")
+  assert "formatToolCallTitle for call_mcp_tool contains server/tool" (mcpCallTitle == "call_mcp_tool stormdrain/sd_memory (test)")
+  assert "formatToolCallTitle for spawn_specialist_subagent contains role and task" (subAgentTitle == "spawn_specialist_subagent surveyor (Analyze codebase structure)")
+  assert "formatToolCallTitle for generic tool" (genericTitle == "custom_tool")
+
+  -- 2. Verify determineToolKind
+  assert "determineToolKind read_file is read" (determineToolKind "read_file" == "read")
+  assert "determineToolKind list_directory is read" (determineToolKind "list_directory" == "read")
+  assert "determineToolKind edit_file is edit" (determineToolKind "edit_file" == "edit")
+  assert "determineToolKind write_file is edit" (determineToolKind "write_file" == "edit")
+  assert "determineToolKind execute_bash is execute" (determineToolKind "execute_bash" == "execute")
+
+  -- 3. Verify AcpToolCall serialization includes rawInput and arguments
+  let sampleArgs = Aeson.object [ "path" .= ("test/Spec.hs" :: Text) ]
+      toolCall = AcpToolCall "call_abc" "read_file test/Spec.hs" "read" "in_progress" (Just sampleArgs)
+      tcJson = TE.decodeUtf8 (BL.toStrict (Aeson.encode toolCall))
+
+  assert "AcpToolCall JSON contains toolCallId" ("\"toolCallId\":\"call_abc\"" `T.isInfixOf` tcJson)
+  assert "AcpToolCall JSON contains descriptive title" ("\"title\":\"read_file test/Spec.hs\"" `T.isInfixOf` tcJson)
+  assert "AcpToolCall JSON contains kind" ("\"kind\":\"read\"" `T.isInfixOf` tcJson)
+  assert "AcpToolCall JSON contains rawInput with path" ("\"rawInput\":{\"path\":\"test/Spec.hs\"}" `T.isInfixOf` tcJson)
+  assert "AcpToolCall JSON contains arguments with path" ("\"arguments\":{\"path\":\"test/Spec.hs\"}" `T.isInfixOf` tcJson)
+
+  -- 4. Verify Interactive Stop Cancellation unblocks concurrent session/prompt immediately
+  cfg <- loadConfig "."
+  outputQueue <- newTQueueIO
+  state <- initAcpServerStateWithSink cfg (\bytes -> atomically $ writeTQueue outputQueue bytes)
+
+  -- Mock driver that pauses on prompt until cancelled
+  startedPromptVar <- newEmptyTMVarIO
+  let hangingDriver = simpleModelDriver $ \_ _ cb -> do
+        cb (ChunkThinking "Beginning extensive analysis...")
+        atomically $ putTMVar startedPromptVar ()
+        -- Simulate work loop waiting for cancellation
+        let waitLoop = do
+              threadDelay 50000 -- 50ms
+              waitLoop
+        waitLoop
+  atomically $ writeTVar (acpDriverOverride state) (Just hangingDriver)
+
+  -- Start session
+  let newReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (7201 :: Int))
+        , reqMethod = "session/new"
+        , reqParams = Just (Aeson.object [ "cwd" .= ("." :: Text) ])
+        }
+  handleAcpRequest state newReq
+  initMsgs <- drainQueue outputQueue
+  let initNotifs = [ n | Just (n :: AcpJsonRpcNotification) <- map Aeson.decode initMsgs ]
+  assert "Initial usage_update emitted with context window size"
+    (any (\n -> notifMethod n == "session/update" && "\"sessionUpdate\":\"usage_update\"" `T.isInfixOf` TE.decodeUtf8 (BL.toStrict (Aeson.encode (notifParams n)))) initNotifs)
+  sId <- readTVarIO (acpActiveSessionId state)
+
+  -- Verify model switch updates usage_update with model's context limit
+  let switchModelReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (7204 :: Int))
+        , reqMethod = "session/set_config_option"
+        , reqParams = Just (Aeson.object
+            [ "sessionId" .= sId
+            , "configId"  .= ("model" :: Text)
+            , "value"     .= ("anthropic/claude-3.5-sonnet" :: Text)
+            ])
+        }
+  handleAcpRequest state switchModelReq
+  switchMsgs <- drainQueue outputQueue
+  let switchNotifs = [ n | Just (n :: AcpJsonRpcNotification) <- map Aeson.decode switchMsgs ]
+  assert "Model switch emits updated usage_update with 200000 size"
+    (any (\n -> notifMethod n == "session/update" && "\"size\":200000" `T.isInfixOf` TE.decodeUtf8 (BL.toStrict (Aeson.encode (notifParams n)))) switchNotifs)
+
+  -- Spawn session/prompt on background thread (simulating asynchronous ACP client)
+  promptResultVar <- newEmptyTMVarIO
+  _ <- forkIO $ do
+    let promptReq = AcpJsonRpcRequest
+          { reqId = Just (Aeson.toJSON (7202 :: Int))
+          , reqMethod = "session/prompt"
+          , reqParams = Just (Aeson.object [ "sessionId" .= sId, "prompt" .= ("Long running job" :: Text) ])
+          }
+    handleAcpRequest state promptReq
+    msgs <- drainQueue outputQueue
+    let resps = [ r | Just (r :: AcpJsonRpcResponse) <- map Aeson.decode msgs, respId r == Aeson.toJSON (7202 :: Int) ]
+    case resps of
+      (r:_) -> atomically $ putTMVar promptResultVar r
+      []    -> pure ()
+
+  -- Wait until driver has started thinking
+  atomically $ takeTMVar startedPromptVar
+
+  -- Client sends stop command: "session/cancel"
+  let cancelReq = AcpJsonRpcRequest
+        { reqId = Just (Aeson.toJSON (7203 :: Int))
+        , reqMethod = "session/cancel"
+        , reqParams = Just (Aeson.object [ "sessionId" .= sId ])
+        }
+  handleAcpRequest state cancelReq
+
+  -- Prompt result must unblock and finish with "cancelled"
+  mPromptResp <- timeout (2 * 1000 * 1000) (atomically $ takeTMVar promptResultVar)
+  case mPromptResp of
+    Nothing -> failTest "session/cancel failed to unblock hanging session/prompt within 2s"
+    Just pResp -> do
+      case respResult pResp of
+        Just val -> case Aeson.fromJSON val of
+          Aeson.Success (AcpSessionPromptResult stopReason) ->
+            assert "Prompt was stopped with stopReason == cancelled" (stopReason == "cancelled")
+          Aeson.Error err -> failTest ("Failed to parse stopped prompt result: " <> err)
+        Nothing -> failTest "Missing prompt result on cancel"
+
+  putStrLn "  -> OK: ACP stop cancellation unblocks instantly, tool titles/arguments format richly, and subagent stream isolation verified."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

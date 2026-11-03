@@ -10,6 +10,10 @@ module Lambda.Server.Acp.Types
   , AcpAgentCapabilities(..)
   , AcpInitializeParams(..)
   , AcpInitializeResult(..)
+  , AcpConfigOptionChoice(..)
+  , AcpConfigOption(..)
+  , AcpModeInfo(..)
+  , AcpModesState(..)
   , AcpSessionNewParams(..)
   , AcpSessionNewResult(..)
   , AcpSessionLoadParams(..)
@@ -36,10 +40,11 @@ module Lambda.Server.Acp.Types
   , parseAcpPrompt
   ) where
 
+import Control.Applicative ((<|>))
 import qualified Data.Aeson as Aeson
-import Data.Aeson ((.=), (.:), (.:?))
+import Data.Aeson ((.=), (.:), (.:?), (.!=))
 import Data.Aeson.Types (parseEither)
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import GHC.Generics (Generic)
@@ -163,18 +168,113 @@ instance Aeson.FromJSON AcpSessionNewParams where
       <$> o .:? "cwd"
       <*> o .:? "mcpServers"
 
-newtype AcpSessionNewResult = AcpSessionNewResult
-  { newSessionId :: Text
+data AcpConfigOptionChoice = AcpConfigOptionChoice
+  { choiceValue       :: !Text
+  , choiceName        :: !Text
+  , choiceDescription :: !(Maybe Text)
+  } deriving stock (Eq, Show, Generic)
+
+instance Aeson.ToJSON AcpConfigOptionChoice where
+  toJSON AcpConfigOptionChoice{..} = Aeson.object $
+    [ "value" .= choiceValue
+    , "name"  .= choiceName
+    ] ++ maybe [] (\d -> ["description" .= d]) choiceDescription
+
+instance Aeson.FromJSON AcpConfigOptionChoice where
+  parseJSON = Aeson.withObject "AcpConfigOptionChoice" $ \o ->
+    AcpConfigOptionChoice
+      <$> o .: "value"
+      <*> o .: "name"
+      <*> o .:? "description"
+
+data AcpConfigOption = AcpConfigOption
+  { cfgOptId           :: !Text
+  , cfgOptName         :: !Text
+  , cfgOptDescription  :: !(Maybe Text)
+  , cfgOptCategory     :: !(Maybe Text)
+  , cfgOptType         :: !Text
+  , cfgOptCurrentValue :: !Text
+  , cfgOptOptions      :: ![AcpConfigOptionChoice]
+  } deriving stock (Eq, Show, Generic)
+
+instance Aeson.ToJSON AcpConfigOption where
+  toJSON AcpConfigOption{..} = Aeson.object $
+    [ "id"           .= cfgOptId
+    , "name"         .= cfgOptName
+    , "type"         .= cfgOptType
+    , "currentValue" .= cfgOptCurrentValue
+    , "options"      .= cfgOptOptions
+    ] ++ maybe [] (\d -> ["description" .= d]) cfgOptDescription
+      ++ maybe [] (\c -> ["category" .= c]) cfgOptCategory
+
+instance Aeson.FromJSON AcpConfigOption where
+  parseJSON = Aeson.withObject "AcpConfigOption" $ \o ->
+    AcpConfigOption
+      <$> o .: "id"
+      <*> o .: "name"
+      <*> o .:? "description"
+      <*> o .:? "category"
+      <*> o .:? "type" .!= "select"
+      <*> o .: "currentValue"
+      <*> o .:? "options" .!= []
+
+data AcpModeInfo = AcpModeInfo
+  { modeInfoId          :: !Text
+  , modeInfoName        :: !Text
+  , modeInfoDescription :: !(Maybe Text)
+  } deriving stock (Eq, Show, Generic)
+
+instance Aeson.ToJSON AcpModeInfo where
+  toJSON AcpModeInfo{..} = Aeson.object $
+    [ "id"   .= modeInfoId
+    , "name" .= modeInfoName
+    ] ++ maybe [] (\d -> ["description" .= d]) modeInfoDescription
+
+instance Aeson.FromJSON AcpModeInfo where
+  parseJSON = Aeson.withObject "AcpModeInfo" $ \o ->
+    AcpModeInfo
+      <$> o .: "id"
+      <*> o .: "name"
+      <*> o .:? "description"
+
+data AcpModesState = AcpModesState
+  { currentModeId  :: !Text
+  , availableModes :: ![AcpModeInfo]
+  } deriving stock (Eq, Show, Generic)
+
+instance Aeson.ToJSON AcpModesState where
+  toJSON AcpModesState{..} = Aeson.object
+    [ "currentModeId"  .= currentModeId
+    , "availableModes" .= availableModes
+    ]
+
+instance Aeson.FromJSON AcpModesState where
+  parseJSON = Aeson.withObject "AcpModesState" $ \o ->
+    AcpModesState
+      <$> o .: "currentModeId"
+      <*> o .: "availableModes"
+
+data AcpSessionNewResult = AcpSessionNewResult
+  { newSessionId         :: !Text
+  , newConfigOptions     :: !(Maybe [AcpConfigOption])
+  , newModes             :: !(Maybe AcpModesState)
+  , newAvailableCommands :: !(Maybe [AcpCommand])
   } deriving stock (Eq, Show, Generic)
 
 instance Aeson.ToJSON AcpSessionNewResult where
-  toJSON AcpSessionNewResult{..} = Aeson.object
+  toJSON AcpSessionNewResult{..} = Aeson.object $
     [ "sessionId" .= newSessionId
-    ]
+    ] ++ maybe [] (\co -> ["configOptions" .= co]) newConfigOptions
+      ++ maybe [] (\m  -> ["modes" .= m]) newModes
+      ++ maybe [] (\ac -> ["availableCommands" .= ac]) newAvailableCommands
 
 instance Aeson.FromJSON AcpSessionNewResult where
   parseJSON = Aeson.withObject "AcpSessionNewResult" $ \o ->
-    AcpSessionNewResult <$> o .: "sessionId"
+    AcpSessionNewResult
+      <$> o .: "sessionId"
+      <*> o .:? "configOptions"
+      <*> o .:? "modes"
+      <*> o .:? "availableCommands"
 
 data AcpSessionLoadParams = AcpSessionLoadParams
   { loadSessionId  :: !Text
@@ -312,7 +412,7 @@ instance Aeson.FromJSON AcpSetModeParams where
   parseJSON = Aeson.withObject "AcpSetModeParams" $ \o ->
     AcpSetModeParams
       <$> o .: "sessionId"
-      <*> o .: "mode"
+      <*> (o .: "modeId" <|> o .: "mode" <|> o .: "target")
 
 newtype AcpSessionCancelParams = AcpSessionCancelParams
   { cancelSessionId :: Text
@@ -332,6 +432,12 @@ instance Aeson.ToJSON AcpCommand where
     [ "name"        .= cmdName
     , "description" .= cmdDescription
     ]
+
+instance Aeson.FromJSON AcpCommand where
+  parseJSON = Aeson.withObject "AcpCommand" $ \o ->
+    AcpCommand
+      <$> o .: "name"
+      <*> (o .: "description" <|> pure "")
 
 data AcpPlanEntry = AcpPlanEntry
   { planContent  :: !Text
@@ -396,12 +502,13 @@ instance Aeson.FromJSON AcpRequestPermissionParams where
 data AcpUpdate
   = AcpAgentMessageChunk !Text
   | AcpAgentThoughtChunk !Text
-  | AcpToolCall !Text !Text !Text !Text -- callId, title, kind, status
+  | AcpToolCall !Text !Text !Text !Text !(Maybe Aeson.Value) -- callId, title, kind, status, rawInput
   | AcpToolCallUpdate !Text !Text !(Maybe Text) -- callId, status, content
   | AcpCurrentModeUpdate !Text
   | AcpAvailableCommandsUpdate ![AcpCommand]
+  | AcpConfigOptionsUpdate ![AcpConfigOption]
   | AcpPlanUpdate ![AcpPlanEntry]
-  | AcpUsageUpdate !Int !Int !(Maybe Double) -- totalTokens, promptTokens, cost
+  | AcpUsageUpdate !Int !Int !(Maybe Double) !(Maybe Int) !(Maybe Int) -- used, size, cost, inputTokens, outputTokens
   | AcpSessionInfoUpdate !Text -- title
   deriving stock (Eq, Show, Generic)
 
@@ -414,13 +521,13 @@ instance Aeson.ToJSON AcpUpdate where
     [ "sessionUpdate" .= ("agent_thought_chunk" :: Text)
     , "content"       .= Aeson.object [ "type" .= ("text" :: Text), "text" .= thk ]
     ]
-  toJSON (AcpToolCall callId title kind status) = Aeson.object
+  toJSON (AcpToolCall callId title kind status mRawInput) = Aeson.object $
     [ "sessionUpdate" .= ("tool_call" :: Text)
     , "toolCallId"    .= callId
     , "title"         .= title
     , "kind"          .= kind
     , "status"        .= status
-    ]
+    ] ++ maybe [] (\r -> ["rawInput" .= r, "arguments" .= r]) mRawInput
   toJSON (AcpToolCallUpdate callId status mContent) = Aeson.object
     [ "sessionUpdate" .= ("tool_call_update" :: Text)
     , "toolCallId"    .= callId
@@ -434,18 +541,27 @@ instance Aeson.ToJSON AcpUpdate where
     , "mode"          .= m
     ]
   toJSON (AcpAvailableCommandsUpdate cmds) = Aeson.object
-    [ "sessionUpdate" .= ("available_commands_update" :: Text)
-    , "commands"      .= cmds
+    [ "sessionUpdate"     .= ("available_commands_update" :: Text)
+    , "availableCommands" .= cmds
+    , "commands"          .= cmds
+    ]
+  toJSON (AcpConfigOptionsUpdate opts) = Aeson.object
+    [ "sessionUpdate"     .= ("config_options_update" :: Text)
+    , "configOptions"     .= opts
     ]
   toJSON (AcpPlanUpdate entries) = Aeson.object
     [ "sessionUpdate" .= ("plan" :: Text)
     , "entries"       .= entries
     ]
-  toJSON (AcpUsageUpdate totalToks promptToks mCost) = Aeson.object $
-    [ "sessionUpdate" .= ("session_usage_update" :: Text)
-    , "totalTokens"   .= totalToks
-    , "promptTokens"  .= promptToks
-    ] ++ maybe [] (\c -> ["cost" .= c]) mCost
+  toJSON (AcpUsageUpdate usedToks sizeLimit mCost mInToks mOutToks) = Aeson.object $
+    [ "sessionUpdate" .= ("usage_update" :: Text)
+    , "used"          .= usedToks
+    , "size"          .= sizeLimit
+    , "totalTokens"   .= usedToks
+    , "promptTokens"  .= fromMaybe (usedToks `div` 2) mInToks
+    ] ++ maybe [] (\c -> ["cost" .= Aeson.object ["amount" .= c, "currency" .= ("USD" :: Text)]]) mCost
+      ++ maybe [] (\i -> ["inputTokens" .= i]) mInToks
+      ++ maybe [] (\o -> ["outputTokens" .= o]) mOutToks
   toJSON (AcpSessionInfoUpdate title) = Aeson.object
     [ "sessionUpdate" .= ("session_info_update" :: Text)
     , "title"         .= title

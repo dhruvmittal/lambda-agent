@@ -45,6 +45,8 @@ allCommands =
   , "/sub"
   , "/resume"
   , "/reup"
+  , "/yank"
+  , "/mouse"
   , "/trace"
   , "/compact"
   , "/clear"

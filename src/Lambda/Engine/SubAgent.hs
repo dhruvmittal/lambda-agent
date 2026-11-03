@@ -18,15 +18,17 @@ module Lambda.Engine.SubAgent
   , finalizeToolArgs
   ) where
 
+import Control.Applicative ((<|>))
 import Control.Concurrent.Async (mapConcurrently, race)
 import Control.Concurrent.STM
 import Control.Monad (unless)
 import qualified Data.Aeson as Aeson
-import Data.Aeson ((.=), (.:), (.:?))
+import Data.Aeson ((.=), (.:), (.:?), (.!=))
 import Data.Aeson.Types (parseEither)
 import qualified Data.ByteString.Lazy as BL
 import Data.List (nub)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -94,9 +96,14 @@ submitReportTool reportVar = ToolDefinition
   }
   where
     parseReport = Aeson.withObject "submit_report" $ \o -> do
-      s <- o .: "status"
-      sum' <- o .: "summary"
-      det <- o .: "details"
+      s <- o .:? "status" .!= "SUCCESS"
+      mSum <- o .:? "summary"
+      mRes <- o .:? "result"
+      mRep <- o .:? "report"
+      let sum' = fromMaybe "Task completed" (mSum <|> mRes <|> mRep)
+      mDet <- o .:? "details"
+      mContent <- o .:? "content"
+      let det = fromMaybe "" (mDet <|> mContent)
       art <- o .:? "artifact_path"
       pure $ SubAgentReport s sum' det art
 
@@ -135,7 +142,7 @@ runEphemeralSubAgent engineState@AppEngineState{..} driver SubAgentSpec{..} = do
         Nothing -> "# Identity: Specialist SubAgent [" <> subAgentRoleName <> "]\nYou are an ephemeral specialist subagent for an isolated task."
       defaultCaps = maybe [] specialistCapabilities mSpecialist
       defaultBud = maybe 6 specialistBudget mSpecialist
-      effectiveBudget = if subTurnBudget > 0 then subTurnBudget else defaultBud
+      effectiveBudget = max 1 (if subTurnBudget > 0 then subTurnBudget else defaultBud)
       combinedGlobs = if null subGrantedGlobs then defaultCaps else nub (defaultCaps ++ subGrantedGlobs)
 
   task <- registerSubAgentTaskWithParent engineState subAgentRoleName subTaskDescription effectiveBudget parentTurnId
@@ -207,7 +214,7 @@ subAgentLoop
   -> Int
   -> Int
   -> IO (Either Text SubAgentReport)
-subAgentLoop engineState@AppEngineState{..} driver sId grants turnsVar attemptedToolsVar reportVar currentTurn budget
+subAgentLoop engineState@AppEngineState{..} driver sId grants turnsVar attemptedToolsVar reportVar rawCurrentTurn rawBudget
   | currentTurn > budget = do
       mReport <- readTVarIO reportVar
       case mReport of
@@ -235,8 +242,11 @@ subAgentLoop engineState@AppEngineState{..} driver sId grants turnsVar attempted
       mode <- readTVarIO appMode
       let toolSchemas = toolsToOpenAISchema mode reg
 
+      let onSubProgress _ _ = pure ()
+          onSubChunk _ = pure ()
+
       (fullText, fullThinking, toolCalls, wasInterrupted, mDriverErr) <-
-        accumulateStreamChunks appInterrupted driver turns toolSchemas (\_ _ -> pure ()) (\_ -> pure ())
+        accumulateStreamChunks appInterrupted driver turns toolSchemas onSubProgress onSubChunk
 
       case mDriverErr of
         Just err -> pure $ Left ("Model Driver Error: " <> err)
@@ -315,6 +325,8 @@ subAgentLoop engineState@AppEngineState{..} driver sId grants turnsVar attempted
                         Just rep -> pure $ Right rep
                         Nothing  -> subAgentLoop engineState driver sId grants turnsVar attemptedToolsVar reportVar (currentTurn + 1) budget
   where
+    currentTurn = max 1 rawCurrentTurn
+    budget = max 1 rawBudget
     subTaskDescription = "SubAgent #" <> T.pack (show sId)
 
     runSingleSubTool caller tc = do
@@ -495,8 +507,8 @@ resumeEphemeralSubAgent engineState@AppEngineState{..} driver sId addBudget mNew
                 Just s  -> specialistPrompt s
                 Nothing -> "# Identity: Specialist SubAgent [" <> effectiveRole <> "]\nYou are an ephemeral specialist subagent for an isolated task."
               defaultCaps = maybe [] specialistCapabilities mSpecialist
-              effectiveAddBudget = if addBudget > 0 then addBudget else maybe 6 specialistBudget mSpecialist
-              newTotalBudget = subAgentBudget task + effectiveAddBudget
+              effectiveAddBudget = max 1 (if addBudget > 0 then addBudget else maybe 6 specialistBudget mSpecialist)
+              newTotalBudget = max 1 (subAgentBudget task + effectiveAddBudget)
               combinedGlobs = nub (defaultCaps ++ additionalGrants)
               isDestructiveGlob g = any (`T.isPrefixOf` g) ["bash*", "write_file*", "edit_file*", "replace_lines*"]
               effectiveGrants = if curMode == PlanMode

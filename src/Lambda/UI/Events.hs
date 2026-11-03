@@ -17,14 +17,19 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Char (isSpace)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
+import Data.Bits (shiftL, shiftR, (.|.), (.&.))
+import qualified Data.ByteString as BS
 import Data.Sequence (Seq(..), (|>))
 import qualified Data.Sequence as Seq
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Data.Text.IO as TIO
 import qualified Data.Text.Zipper as Z
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
+import qualified Data.Vector as Vec
 import qualified Graphics.Vty as V
+import System.IO (stdout, hFlush)
 import System.Posix.Signals (raiseSignal, sigTSTP)
 import Text.Read (readMaybe)
 
@@ -261,6 +266,13 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 'm') mods))
   | any (`elem` [V.MMeta, V.MAlt]) mods = toggleMode
 
 handleAppEvent (VtyEvent (V.EvKey (V.KFun 2) [])) = toggleMode
+
+-- Alt+Y / Meta+Y: Copy last assistant output to OS clipboard (OSC 52)
+handleAppEvent (VtyEvent (V.EvKey (V.KChar 'y') mods))
+  | any (`elem` [V.MMeta, V.MAlt]) mods = copyLastAssistantResponse
+
+-- F10: Toggle Mouse Tracking Mode (unlocks terminal text highlighting / copy)
+handleAppEvent (VtyEvent (V.EvKey (V.KFun 10) [])) = toggleMouseTracking
 
 -- Alt+B: Move backward one word
 handleAppEvent (VtyEvent (V.EvKey (V.KChar 'b') mods))
@@ -739,6 +751,8 @@ handleCommand cmdText = do
             , "- `Ctrl+A`, `Ctrl+E` - Move cursor to start / end of line"
             , "- `Ctrl+T` - Toggle thinking/reasoning blocks"
             , "- `Ctrl+S` - Open interactive session chooser modal"
+            , "- `Alt+Y` / `/copy` / `/yank` - Copy last assistant response to clipboard (OSC 52)"
+            , "- `F10` / `/mouse` - Toggle mouse tracking (turn off to highlight text directly with terminal drag)"
             , "- `Keys 1,2,3,4` - Resolve authorization prompt (Always, Session, Once, Deny)"
             , "- `Mouse Wheel` - Scroll conversation viewport"
             , "- `Mouse Click` - Click on SubAgent #id in sidebar, thinking folds, or session chooser"
@@ -954,6 +968,8 @@ handleCommand cmdText = do
               (CmdSystemMessage $ "Resuming SubAgent #" <> T.pack (show sId) <> " with +" <> T.pack (show extraBud) <> " turns.")
     "/compact" -> do
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdCompactHistory
+    "/mouse" -> toggleMouseTracking
+    cmd | cmd `elem` ["/copy", "/yank"] -> copyLastAssistantResponse
     "/clear" -> do
       put st { uiTurns = [] }
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdClearHistory
@@ -964,6 +980,68 @@ handleCommand cmdText = do
       now <- liftIO getCurrentTime
       put st { uiIsGenerating = True, uiExecutionStart = Just now, uiElapsedSeconds = 0 }
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdUserPrompt cmdText)
+
+toggleMouseTracking :: EventM ResourceName UIState ()
+toggleMouseTracking = do
+  vty <- getVtyHandle
+  cur <- gets uiMouseEnabled
+  let newM = not cur
+  liftIO $ V.setMode (V.outputIface vty) V.Mouse newM
+  modify (mouseEnabledL .~ newM)
+  channels <- gets uiChannels
+  liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+    (CmdSystemMessage $ if newM
+       then "✓ Mouse tracking enabled (scroll wheel & clicking active). Type /mouse or use Shift+drag to highlight text."
+       else "✓ Mouse tracking disabled (terminal text highlight/copy enabled). Type /mouse or press F10 to re-enable.")
+
+copyLastAssistantResponse :: EventM ResourceName UIState ()
+copyLastAssistantResponse = do
+  turns <- gets uiTurns
+  channels <- gets uiChannels
+  case [ t | Turn _ AssistantRole blks <- reverse turns, TextBlock t <- blks, not (T.null (T.strip t)) ] of
+    (lastText : _) -> do
+      liftIO $ copyToClipboardOSC52 lastText
+      liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+        (CmdSystemMessage "✓ Copied last assistant response to system clipboard (OSC 52).")
+    [] -> liftIO $ atomically $ writeTBQueue (cmdQueue channels)
+        (CmdSystemMessage "⚠️ No assistant response available to copy.")
+
+-- | Pure Base64 encoding for OSC 52 clipboard export
+encodeBase64Text :: Text -> Text
+encodeBase64Text rawTxt =
+  let bytes = BS.unpack (TE.encodeUtf8 rawTxt)
+      tbl = Vec.fromList ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" :: String)
+      enc3 (a:b:c:rest) =
+        let n = (fromIntegral a `shiftL` 16) .|. (fromIntegral b `shiftL` 8) .|. fromIntegral c :: Int
+        in [ tbl Vec.! ((n `shiftR` 18) .&. 63)
+           , tbl Vec.! ((n `shiftR` 12) .&. 63)
+           , tbl Vec.! ((n `shiftR` 6) .&. 63)
+           , tbl Vec.! (n .&. 63)
+           ] ++ enc3 rest
+      enc3 [a, b] =
+        let n = (fromIntegral a `shiftL` 16) .|. (fromIntegral b `shiftL` 8) :: Int
+        in [ tbl Vec.! ((n `shiftR` 18) .&. 63)
+           , tbl Vec.! ((n `shiftR` 12) .&. 63)
+           , tbl Vec.! ((n `shiftR` 6) .&. 63)
+           , '='
+           ]
+      enc3 [a] =
+        let n = fromIntegral a `shiftL` 16 :: Int
+        in [ tbl Vec.! ((n `shiftR` 18) .&. 63)
+           , tbl Vec.! ((n `shiftR` 12) .&. 63)
+           , '='
+           , '='
+           ]
+      enc3 [] = []
+  in T.pack (enc3 bytes)
+
+-- | Sends OSC 52 sequence to the terminal emulator to set the system clipboard
+copyToClipboardOSC52 :: Text -> IO ()
+copyToClipboardOSC52 rawTxt = do
+  let b64 = encodeBase64Text rawTxt
+      osc52 = "\ESC]52;c;" <> b64 <> "\BEL"
+  TIO.hPutStr stdout osc52
+  hFlush stdout
 
 resolveActiveModal :: PermissionLevel -> EventM ResourceName UIState ()
 resolveActiveModal level = do

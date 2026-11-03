@@ -273,14 +273,29 @@ renderMainPane mSelected turns subs uiComp mode model ctxLimit cfg editor isWait
             then if null subList
                    then emptyWidget
                    else renderFleetStrip mSelected subList
-            else vBox (map renderTurnPair turnPairs)
+            else vBox (map renderTurnItem (groupTurnsForDisplay turnPairs))
     , renderCompletionLine uiComp
     , renderPowerlinePromptWithElapsed mode model (apiBaseUrl cfg) turns ctxLimit editor isWaiting spinnerStep mElapsed
     ]
   where
     subList = Map.elems subs
     turnPairs = distributeSubAgentsToTurns turns subList
-    renderTurnPair (t, turnSubs) = renderTurnWithSubs mSelected turnSubs t
+    renderTurnItem (RenderNormalTurn t turnSubs) = renderTurnWithSubs mSelected turnSubs t
+    renderTurnItem (RenderPairedTurn t1 mt2 turnSubs) = renderPairedTurnWithSubs mSelected turnSubs t1 mt2
+
+data RenderTurnItem
+  = RenderNormalTurn !Turn ![SubAgentTask]
+  | RenderPairedTurn !Turn !(Maybe Turn) ![SubAgentTask]
+
+-- | Groups adjacent Assistant turns with tool calls and their matching Tool results turns
+-- so each tool call is rendered directly alongside its corresponding result in parallel execution
+groupTurnsForDisplay :: [(Turn, [SubAgentTask])] -> [RenderTurnItem]
+groupTurnsForDisplay [] = []
+groupTurnsForDisplay ((t1@(Turn _ AssistantRole blks1), s1) : (t2@(Turn _ ToolRole _), s2) : rest)
+  | any isToolCall blks1 =
+      RenderPairedTurn t1 (Just t2) (s1 ++ s2) : groupTurnsForDisplay rest
+groupTurnsForDisplay ((t, s) : rest) =
+  RenderNormalTurn t s : groupTurnsForDisplay rest
 
 -- | Partitions subagent tasks across turns according to parent turn attribution
 distributeSubAgentsToTurns :: [Turn] -> [SubAgentTask] -> [(Turn, [SubAgentTask])]
@@ -350,6 +365,36 @@ renderTurnWithSubs mSelected turnSubs (Turn tId role blocks) =
           then padLeft (Pad 2) $ withAttr (attrName "turnFooter") (str "■ Plan · assistant")
           else emptyWidget
       ]
+
+-- | Renders an Assistant turn with parallel tool calls interleaved with their corresponding Tool results
+renderPairedTurnWithSubs :: Maybe Int -> [SubAgentTask] -> Turn -> Maybe Turn -> Widget ResourceName
+renderPairedTurnWithSubs mSelected turnSubs asstTurn@(Turn tId role asstBlocks) mToolTurn =
+  case mToolTurn of
+    Nothing -> renderTurnWithSubs mSelected turnSubs asstTurn
+    Just (Turn _ ToolRole toolBlocks) ->
+      let (toolCalls, nonToolBlocks) = partition isToolCall asstBlocks
+          resultMap = Map.fromList [ (resultCallIdRef tr, tr) | ToolResultBlock tr <- toolBlocks ]
+          renderCallAndResult tcBlock@(ToolCallBlock tc) =
+            case Map.lookup (toolCallId tc) resultMap of
+              Just tr -> [renderBlock tcBlock, renderBlock (ToolResultBlock tr)]
+              Nothing -> [renderBlock tcBlock]
+          renderCallAndResult other = [renderBlock other]
+          matchedCallIds = Set.fromList [ toolCallId tc | ToolCallBlock tc <- toolCalls ]
+          orphanResults = [ ToolResultBlock tr | ToolResultBlock tr <- toolBlocks, not (Set.member (resultCallIdRef tr) matchedCallIds) ]
+          combinedWidgets = map renderBlock nonToolBlocks ++ concatMap renderCallAndResult toolCalls ++ map renderBlock orphanResults
+      in padBottom (Pad 1) $
+        vBox
+          [ if role == SystemRole
+              then withAttr (attrName "systemRole") (str $ "● system (Turn #" <> show tId <> ")")
+              else emptyWidget
+          , vBox combinedWidgets
+          , if null turnSubs
+              then emptyWidget
+              else renderFleetStrip mSelected turnSubs
+          , padLeft (Pad 2) $ withAttr (attrName "turnFooter") (str "■ Plan · assistant")
+          ]
+    Just otherTurn ->
+      vBox [renderTurnWithSubs mSelected [] asstTurn, renderTurnWithSubs mSelected turnSubs otherTurn]
 
 isToolCall :: ContentBlock -> Bool
 isToolCall (ToolCallBlock _) = True
@@ -692,8 +737,8 @@ renderPowerlinePromptWithElapsed mode model baseUrl turns ctxLimit editor isWait
               )
 
           segments
-            | totalW < 45 = [capLeft, seg1, div1to3, seg3, div3to5, seg5, capRight]
-            | totalW < 65 = [capLeft, seg1, div1to2, seg2, div2to3, seg3, div3to5, seg5, capRight]
+            | totalW < 42 = [capLeft, seg1, div1to3, seg3, div3to5, seg5, capRight]
+            | totalW < 58 = [capLeft, seg1, div1to3, seg3, div3to4, seg4, div4to5, seg5, capRight]
             | otherwise   = [capLeft, seg1, div1to2, seg2, div2to3, seg3, div3to4, seg4, div4to5, seg5, capRight]
       in hBox segments
 
