@@ -21,8 +21,8 @@ module Lambda.Server.Acp
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
-import Control.Exception (SomeException, catch, try)
-import Control.Monad (unless)
+import Control.Exception (SomeException, catch, try, finally)
+import Control.Monad (unless, when)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?))
 import Data.Aeson.Types (parseEither)
@@ -48,7 +48,6 @@ import System.IO
   , BufferMode(..)
   , isEOF
   )
-import System.Timeout (timeout)
 
 import Lambda.Config (Config(..), loadConfig, curatedModels, lookupModelContextLimit)
 import Lambda.Core.EngineInterface
@@ -66,19 +65,20 @@ import Lambda.Server.Acp.Types
 import Lambda.Types
 
 data AcpServerState = AcpServerState
-  { acpConfig           :: !(TVar Config)
-  , acpActiveRuntime    :: !(TVar (Maybe EngineRuntime))
-  , acpActiveEngine     :: !(TVar (Maybe AppEngineState))
-  , acpActiveChannels   :: !(TVar (Maybe EngineChannels))
-  , acpActiveSessionId  :: !(TVar Text)
-  , acpStdoutLock       :: !(MVar ())
-  , acpPendingTurnVar   :: !(TVar (Maybe (TMVar AcpSessionPromptResult)))
-  , acpPendingReqLock   :: !(MVar ())
-  , acpOutputWriter     :: !(BL.ByteString -> IO ())
-  , acpDriverOverride   :: !(TVar (Maybe ModelDriver))
-  , acpClientCaps       :: !(TVar (Maybe Aeson.Object))
-  , acpNextRpcId        :: !(TVar Int)
-  , acpPendingClientRpc :: !(TVar (Map Int (TMVar (Either Aeson.Value Aeson.Value))))
+  { acpConfig             :: !(TVar Config)
+  , acpActiveRuntime      :: !(TVar (Maybe EngineRuntime))
+  , acpActiveEngine       :: !(TVar (Maybe AppEngineState))
+  , acpActiveChannels     :: !(TVar (Maybe EngineChannels))
+  , acpActiveSessionId    :: !(TVar Text)
+  , acpStdoutLock         :: !(MVar ())
+  , acpPendingTurnVar     :: !(TVar (Maybe (TMVar AcpSessionPromptResult)))
+  , acpPendingReqLock     :: !(MVar ())
+  , acpOutputWriter       :: !(BL.ByteString -> IO ())
+  , acpDriverOverride     :: !(TVar (Maybe ModelDriver))
+  , acpClientCaps         :: !(TVar (Maybe Aeson.Object))
+  , acpNextRpcId          :: !(TVar Int)
+  , acpPendingClientRpc   :: !(TVar (Map Int (TMVar (Either Aeson.Value Aeson.Value))))
+  , acpActiveSubAgentCallId :: !(TVar (Maybe Text))
   }
 
 initAcpServerState :: Config -> IO AcpServerState
@@ -103,20 +103,22 @@ initAcpServerStateWithSink cfg sink = do
   capsVar   <- newTVarIO Nothing
   rpcIdVar  <- newTVarIO 1000
   rpcMapVar <- newTVarIO Map.empty
+  subCallIdVar <- newTVarIO Nothing
   pure $ AcpServerState
-    { acpConfig           = cfgVar
-    , acpActiveRuntime    = rtVar
-    , acpActiveEngine     = engVar
-    , acpActiveChannels   = chanVar
-    , acpActiveSessionId  = sessVar
-    , acpStdoutLock       = lock
-    , acpPendingTurnVar   = turnVar
-    , acpPendingReqLock   = reqLock
-    , acpOutputWriter     = sink
-    , acpDriverOverride   = drvVar
-    , acpClientCaps       = capsVar
-    , acpNextRpcId        = rpcIdVar
-    , acpPendingClientRpc = rpcMapVar
+    { acpConfig             = cfgVar
+    , acpActiveRuntime      = rtVar
+    , acpActiveEngine       = engVar
+    , acpActiveChannels     = chanVar
+    , acpActiveSessionId    = sessVar
+    , acpStdoutLock         = lock
+    , acpPendingTurnVar     = turnVar
+    , acpPendingReqLock     = reqLock
+    , acpOutputWriter       = sink
+    , acpDriverOverride     = drvVar
+    , acpClientCaps         = capsVar
+    , acpNextRpcId          = rpcIdVar
+    , acpPendingClientRpc   = rpcMapVar
+    , acpActiveSubAgentCallId = subCallIdVar
     }
 
 -- | Sends a JSON-RPC 2.0 response to the configured output sink
@@ -139,7 +141,7 @@ sendSessionUpdate state sId upd = do
   let notif = AcpSessionUpdateNotification sId upd
   sendAcpNotification state "session/update" (Aeson.toJSON notif)
 
--- | Initiates a server-to-client JSON-RPC request and awaits response
+-- | Initiates a server-to-client JSON-RPC request and awaits response indefinitely
 callClientRpc :: AcpServerState -> Text -> Aeson.Value -> IO (Either Aeson.Value Aeson.Value)
 callClientRpc state method params = do
   (rpcId, replyVar) <- atomically $ do
@@ -156,13 +158,8 @@ callClientRpc state method params = do
         ]
   withMVar (acpStdoutLock state) $ \() ->
     acpOutputWriter state (Aeson.encode reqObj)
-  -- Await client response with timeout of 10s
-  mRes <- timeout (10 * 1000 * 1000) (atomically $ takeTMVar replyVar)
-  case mRes of
-    Just res -> pure res
-    Nothing  -> do
-      atomically $ modifyTVar' (acpPendingClientRpc state) (Map.delete rpcId)
-      pure (Left (Aeson.String "Client RPC timeout"))
+  -- Await client response indefinitely until answered or cancelled
+  atomically $ takeTMVar replyVar
 
 -- | Handles an incoming JSON-RPC response fulfilling a server-to-client request
 handleAcpResponse :: AcpServerState -> AcpJsonRpcResponse -> IO ()
@@ -215,8 +212,7 @@ broadcastUsageUpdate state eng sId = do
   ctxLimit <- readTVarIO (appContextLimit eng)
   let (totalToks, promptToks) = calculateSessionTokens turns
       compToks = max 0 (totalToks - promptToks)
-      cost = fromIntegral totalToks * 0.000005
-  sendSessionUpdate state sId (AcpUsageUpdate totalToks ctxLimit (Just cost) (Just promptToks) (Just compToks))
+  sendSessionUpdate state sId (AcpUsageUpdate totalToks ctxLimit Nothing (Just promptToks) (Just compToks))
 
 -- | Formats a descriptive, human-readable title for a tool call based on its arguments
 formatToolCallTitle :: ToolCall -> Text
@@ -524,47 +520,57 @@ forwardEngineEvents state channels sId = do
       forwardEngineEvents state channels sId
 
     EvPermissionRequired prompt -> do
-      let callVal = Aeson.object
-            [ "toolCallId" .= ("perm_" <> T.pack (show (promptId prompt)))
+      let realCallId = fromMaybe ("perm_" <> T.pack (show (promptId prompt))) (promptToolCallId prompt)
+          callVal = Aeson.object
+            [ "toolCallId" .= realCallId
             , "title"      .= promptTool prompt
             , "kind"       .= ("execute" :: Text)
+            , "status"     .= ("pending" :: Text)
             , "arguments"  .= promptArgs prompt
+            , "rawInput"   .= promptArgs prompt
             ]
           params = Aeson.object
             [ "sessionId" .= sId
             , "toolCall"  .= callVal
             , "options"   .=
-                [ Aeson.object ["optionId" .= ("allow_once" :: Text), "label" .= ("Allow Once" :: Text), "kind" .= ("allow_once" :: Text)]
-                , Aeson.object ["optionId" .= ("allow_always" :: Text), "label" .= ("Always Allow" :: Text), "kind" .= ("allow_always" :: Text)]
-                , Aeson.object ["optionId" .= ("deny" :: Text), "label" .= ("Deny" :: Text), "kind" .= ("deny" :: Text)]
+                [ Aeson.object ["optionId" .= ("allow_once" :: Text), "name" .= ("Allow Once" :: Text), "label" .= ("Allow Once" :: Text), "kind" .= ("allow_once" :: Text)]
+                , Aeson.object ["optionId" .= ("allow_always" :: Text), "name" .= ("Always Allow" :: Text), "label" .= ("Always Allow" :: Text), "kind" .= ("allow_always" :: Text)]
+                , Aeson.object ["optionId" .= ("reject_once" :: Text), "name" .= ("Deny" :: Text), "label" .= ("Deny" :: Text), "kind" .= ("reject_once" :: Text)]
                 ]
             ]
       _ <- forkIO $ do
         clientRes <- callClientRpc state "session/request_permission" params
         case clientRes of
           Right resVal -> do
-            let isAllowed = case resVal of
+            let outcome = case resVal of
                   Aeson.Object o ->
                     case parseEither (.: "outcome") o of
-                      Right (Aeson.String "allow") -> True
-                      Right (Aeson.Object oc) -> case parseEither (.: "outcome") oc of
-                        Right (Aeson.String "allow") -> True
-                        _ -> False
+                      Right (Aeson.Object oc) ->
+                        case parseEither (.: "optionId") oc of
+                          Right (opt :: Text) -> Just opt
+                          Left _ -> case parseEither (.: "outcome") oc of
+                            Right (out :: Text) -> Just out
+                            Left _ -> Nothing
+                      Right (Aeson.String out) -> Just out
                       _ -> case parseEither (.: "optionId") o of
-                        Right (Aeson.String "allow_once")   -> True
-                        Right (Aeson.String "allow_always") -> True
-                        _ -> False
-                  _ -> False
-            if isAllowed
-              then resolvePrompt prompt PermSession
-              else resolvePrompt prompt PermDeny
+                        Right (opt :: Text) -> Just opt
+                        Left _ -> Nothing
+                  _ -> Nothing
+            case outcome of
+              Just "allow_always" -> resolvePrompt prompt PermAlways
+              Just "allow_once"   -> resolvePrompt prompt PermOnce
+              Just "allow"        -> resolvePrompt prompt PermOnce
+              _                   -> resolvePrompt prompt PermDeny
           Left _ ->
-            resolvePrompt prompt PermSession
+            -- Fail-closed on error or cancellation
+            resolvePrompt prompt PermDeny
       forwardEngineEvents state channels sId
 
     EvTurnUpdated (Turn _ AssistantRole blks) -> do
       mapM_ (\case
-        ToolCallBlock tc ->
+        ToolCallBlock tc -> do
+          when (toolCallName tc `elem` ["spawn_specialist_subagent", "resume_subagent"]) $
+            atomically $ writeTVar (acpActiveSubAgentCallId state) (Just (toolCallId tc))
           sendSessionUpdate state sId
             (AcpToolCall (toolCallId tc)
                          (formatToolCallTitle tc)
@@ -577,7 +583,8 @@ forwardEngineEvents state channels sId = do
 
     EvTurnUpdated (Turn _ ToolRole blks) -> do
       mapM_ (\case
-        ToolResultBlock tr ->
+        ToolResultBlock tr -> do
+          atomically $ writeTVar (acpActiveSubAgentCallId state) Nothing
           sendSessionUpdate state sId (AcpToolCallUpdate (resultCallIdRef tr) "completed" (Just (resultStdout tr)))
         _ -> pure ()
         ) blks
@@ -615,9 +622,19 @@ forwardEngineEvents state channels sId = do
         Nothing      -> pure ()
       forwardEngineEvents state channels sId
 
-    EvSubAgentUpdate _ -> do
-      -- Subagents report their findings through the tool result of spawn_specialist_subagent;
-      -- we do not leak subagent updates into the main agent's thinking stream.
+    EvSubAgentUpdate task -> do
+      mCallId <- readTVarIO (acpActiveSubAgentCallId state)
+      case mCallId of
+        Just callId -> do
+          let statusText = "[" <> subAgentRole task <> "] "
+                <> (case subAgentStatus task of
+                      SubAgentRunning -> "Turn " <> T.pack (show (subAgentTurnCount task)) <> "/" <> T.pack (show (subAgentBudget task))
+                      SubAgentSuccess _ -> "Completed"
+                      SubAgentBlocked b -> "Blocked: " <> b
+                      SubAgentFailed f -> "Failed: " <> f)
+                <> (if T.null (subAgentHypothesis task) then "" else " - " <> T.take 40 (subAgentHypothesis task))
+          sendSessionUpdate state sId (AcpToolCallUpdate callId "in_progress" (Just statusText))
+        Nothing -> pure ()
       forwardEngineEvents state channels sId
 
     EvWorkingStateUpdate stVec -> do
@@ -639,12 +656,15 @@ forwardEngineEvents state channels sId = do
       forwardEngineEvents state channels sId
 
     EvError err -> do
+      sendSessionUpdate state sId (AcpAgentMessageChunk ("\n[Error: " <> err <> "]\n"))
       mVar <- atomically $ do
         v <- readTVar (acpPendingTurnVar state)
         writeTVar (acpPendingTurnVar state) Nothing
         pure v
       case mVar of
-        Just doneVar -> atomically $ putTMVar doneVar (AcpSessionPromptResult ("error: " <> err))
+        Just doneVar -> atomically $ do
+          _ <- tryPutTMVar doneVar (AcpSessionPromptResult "end_turn")
+          pure ()
         Nothing      -> pure ()
       forwardEngineEvents state channels sId
 
@@ -855,18 +875,19 @@ handleAcpRequest state AcpJsonRpcRequest{..} = do
                   (cmdWord, _) = T.breakOn " " firstLine
               if cmdWord `elem` ["/plan", "/exec", "/model", "/compact", "/clear", "/help", "/commands"]
                 then handleSlashPrompt state (Just rId) sId trimmed mChannels mEngine baseCfg
-                else case mChannels of
-                  Just channels -> do
-                    doneVar <- newEmptyTMVarIO
-                    atomically $ writeTVar (acpPendingTurnVar state) (Just doneVar)
-                    atomically $ writeTBQueue (cmdQueue channels) (CmdUserPrompt prompt)
-                    -- Await prompt turn completion
-                    res <- atomically $ takeTMVar doneVar
-                    sendAcpResponse state rId (Just (Aeson.toJSON res)) Nothing
-                  Nothing -> do
-                    -- Auto-initialize if no active session
-                    _ <- startAcpSession state Nothing
-                    handleAcpRequest state (AcpJsonRpcRequest (Just rId) "session/prompt" (Just v))
+                else withMVar (acpPendingReqLock state) $ \() -> do
+                  case mChannels of
+                    Just channels -> do
+                      doneVar <- newEmptyTMVarIO
+                      atomically $ writeTVar (acpPendingTurnVar state) (Just doneVar)
+                      atomically $ writeTBQueue (cmdQueue channels) (CmdUserPrompt prompt)
+                      -- Await prompt turn completion
+                      res <- atomically $ takeTMVar doneVar
+                      sendAcpResponse state rId (Just (Aeson.toJSON res)) Nothing
+                    Nothing -> do
+                      -- Auto-initialize if no active session
+                      _ <- startAcpSession state Nothing
+                      handleAcpRequest state (AcpJsonRpcRequest (Just rId) "session/prompt" (Just v))
             Aeson.Error err ->
               sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= ("Invalid params: " ++ err) ]))
         (Just rId, Nothing) ->
@@ -917,6 +938,11 @@ handleAcpRequest state AcpJsonRpcRequest{..} = do
           _ <- tryPutTMVar doneVar (AcpSessionPromptResult "cancelled")
           pure ()
         Nothing -> pure ()
+      -- Immediately unblock all waiting client RPCs (e.g. permission requests) with cancellation
+      atomically $ do
+        pendingRpcs <- readTVar (acpPendingClientRpc state)
+        writeTVar (acpPendingClientRpc state) Map.empty
+        mapM_ (\replyV -> tryPutTMVar replyV (Left (Aeson.String "Cancelled by user"))) (Map.elems pendingRpcs)
       case reqId of
         Just rId -> sendAcpResponse state rId (Just (Aeson.object ["status" .= ("cancelled" :: Text)])) Nothing
         Nothing  -> pure ()
@@ -971,7 +997,13 @@ runAcpServer baseCfg = do
   hSetEncoding stdin utf8
   state <- initAcpServerState baseCfg
   TIO.hPutStrLn stderr "[lambdA-ACP] Server initialized. Listening on stdin/stdout..."
-  acpLoop state
+  acpLoop state `finally` cleanupServer state
+  where
+    cleanupServer st = do
+      mRt <- readTVarIO (acpActiveRuntime st)
+      case mRt of
+        Just rt -> stopEngineRuntime rt
+        Nothing -> pure ()
 
 acpLoop :: AcpServerState -> IO ()
 acpLoop state = do

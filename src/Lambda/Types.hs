@@ -59,6 +59,7 @@ data PermissionPrompt = PermissionPrompt
   , promptArgs         :: !Aeson.Value
   , promptProposedGlob :: !Text
   , promptReply        :: !(TMVar PermissionLevel)
+  , promptToolCallId   :: !(Maybe Text)
   }
 
 -- | Folding state for thinking / reasoning blocks

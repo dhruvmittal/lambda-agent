@@ -13,6 +13,7 @@ module Lambda.Engine.Compactor
   ) where
 
 import qualified Data.Aeson as Aeson
+import qualified Data.ByteString.Lazy as BL
 import Data.Aeson ((.=))
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
@@ -169,7 +170,8 @@ estimateTotalTokens turns = sum (map estimateTurnTokens turns)
     estimateBlockTokens (TextBlock t) = max 1 (T.length t `div` 4)
     estimateBlockTokens (ThinkingBlock _ t _) = max 1 (T.length t `div` 4)
     estimateBlockTokens (ToolCallBlock tc) =
-      max 1 ((T.length (toolCallName tc) + 20) `div` 4)
+      let argsChars = fromIntegral (BL.length (Aeson.encode (toolCallArgs tc)))
+      in max 1 ((T.length (toolCallName tc) + argsChars + 20) `div` 4)
     estimateBlockTokens (ToolResultBlock tr) =
       max 1 ((T.length (resultStdout tr) + T.length (resultStderr tr)) `div` 4)
 
@@ -205,6 +207,7 @@ synthesizeTurnSummary turns =
       userPrompts = [ p | Turn _ UserRole blks <- turns, TextBlock p <- blks ]
       toolCalls   = [ toolCallName tc | Turn _ AssistantRole blks <- turns, ToolCallBlock tc <- blks ]
       artifacts   = [ T.pack path | Turn _ ToolRole blks <- turns, ToolResultBlock tr <- blks, Just path <- [resultArtifactPath tr] ]
+      priorSummaries = [ s | Turn _ SystemRole blks <- turns, TextBlock s <- blks, "[Context Summary:" `T.isInfixOf` s ]
       promptSummary = if null userPrompts
                         then "None recorded"
                         else T.intercalate "; " (take 3 userPrompts)
@@ -214,10 +217,13 @@ synthesizeTurnSummary turns =
       artifactSummary = if null artifacts
                           then "None"
                           else T.intercalate ", " (take 5 artifacts)
-  in T.unlines
+      priorSection = case priorSummaries of
+        [] -> []
+        (p:_) -> ["- Prior Context: " <> T.strip (T.take 300 (T.replace "\n" " " p))]
+  in T.unlines $
        [ "[Context Summary: " <> T.pack (show totalCompacted) <> " historical turns compacted into working state]"
        , "- Key Objectives: " <> promptSummary
        , "- Tools Executed: " <> toolSummary
        , "- Active Artifacts: " <> artifactSummary
-       ]
+       ] ++ priorSection
 

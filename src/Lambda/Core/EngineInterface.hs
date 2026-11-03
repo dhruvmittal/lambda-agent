@@ -14,7 +14,7 @@ module Lambda.Core.EngineInterface
 import Control.Concurrent (forkIO)
 import Control.Concurrent.Async (Async, async, cancel, mapConcurrently, race)
 import Control.Concurrent.STM
-import Control.Exception (try, SomeException)
+import Control.Exception (try, SomeException, finally)
 import Control.Monad (forever, when, unless)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -297,7 +297,7 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
 
       -- 2. Run agent conversation loop in async task so cmdQueue remains responsive
       let maxBudget = max 1 (maxTurnBudget appConfig)
-      turnTask <- async $ do
+      turnTask <- async $ (`finally` cleanupTurn) $ do
         turnRes <- try $ runAgentTurnLoop engineState driver channels 1 maxBudget
         case turnRes of
           Left (ex :: SomeException) -> do
@@ -311,7 +311,6 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
           let updatedVec = T.unlines $ map (\l -> if "BLOCKED_ON:" `T.isPrefixOf` l then "BLOCKED_ON: User input" else l) (T.lines curVec)
           writeTVar appStateVector updatedVec
           writeTQueue appEventQueue (EvWorkingStateUpdate updatedVec)
-          writeTVar activeTaskVar Nothing
 
         -- Auto-save session state after turn completion
         persistCurrentSession engineState
@@ -319,6 +318,8 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
 
       atomically $ writeTVar activeTaskVar (Just turnTask)
       engineWorkerLoop engineState driver channels activeTaskVar
+  where
+    cleanupTurn = atomically $ writeTVar activeTaskVar Nothing
 
 runAgentTurnLoop
   :: AppEngineState

@@ -87,8 +87,8 @@ initSecurity :: [String] -> [String] -> IO SecurityState
 initSecurity = initSecurityWithRoot "."
 
 -- | Pragmatic UX safeguard check with non-blocking STM queueing
-checkAuthorization :: SecurityState -> CallerContext -> Text -> Aeson.Value -> IO Bool
-checkAuthorization SecurityState{..} caller cmd payload = do
+checkAuthorization :: SecurityState -> CallerContext -> Text -> Aeson.Value -> Maybe Text -> IO Bool
+checkAuthorization SecurityState{..} caller cmd payload mToolCallId = do
   let cmdStr = T.unpack cmd
 
   -- Step 1: Static Deny List (Deny-first rule)
@@ -116,7 +116,7 @@ checkAuthorization SecurityState{..} caller cmd payload = do
                   rId <- readTVar promptCounter
                   writeTVar promptCounter (rId + 1)
                   reply <- newEmptyTMVar
-                  let req = PermissionPrompt rId caller cmd payload proposedGlob reply
+                  let req = PermissionPrompt rId caller cmd payload proposedGlob reply mToolCallId
                   writeTBQueue uiPromptQueue req
                   pure (rId, reply)
 
@@ -155,7 +155,7 @@ requestGrantApproval SecurityState{..} sId hypothesis requestedGlobs = do
     rId <- readTVar promptCounter
     writeTVar promptCounter (rId + 1)
     reply <- newEmptyTMVar
-    let req = PermissionPrompt rId (SubAgentId sId hypothesis) grantDesc payload proposedGlob reply
+    let req = PermissionPrompt rId (SubAgentId sId hypothesis) grantDesc payload proposedGlob reply Nothing
     writeTBQueue uiPromptQueue req
     pure (rId, reply)
 

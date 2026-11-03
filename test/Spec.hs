@@ -289,14 +289,14 @@ testSecurityGlobMatching = do
   sec <- initSecurity allows denies
 
   -- Test static allowlist
-  canGitStatus <- checkAuthorization sec MainAgent "git status --short" (Aeson.object [])
+  canGitStatus <- checkAuthorization sec MainAgent "git status --short" (Aeson.object []) Nothing
   assert "git status matches allowlist" canGitStatus
 
-  canGitDiff <- checkAuthorization sec MainAgent "git diff HEAD~1" (Aeson.object [])
+  canGitDiff <- checkAuthorization sec MainAgent "git diff HEAD~1" (Aeson.object []) Nothing
   assert "git diff matches allowlist" canGitDiff
 
   -- Test static denylist
-  canRmRf <- checkAuthorization sec MainAgent "rm -rf /*" (Aeson.object [])
+  canRmRf <- checkAuthorization sec MainAgent "rm -rf /*" (Aeson.object []) Nothing
   assert "rm -rf /* is blocked by denylist" (not canRmRf)
 
   putStrLn "  -> OK: Static whitelist and blacklist glob matching verified."
@@ -2072,7 +2072,7 @@ testTieredSecurityModalAndWhitelisting = do
   -- 2. Test PermDeny: rejects the call and does not whitelist for subsequent calls
   sec <- initSecurityWithRoot tempWs ["git status*"] []
 
-  a1 <- async $ checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object [])
+  a1 <- async $ checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object []) Nothing
   prompt1 <- atomically $ readTBQueue (uiPromptQueue sec)
   assert "prompt1 proposes rm*" (promptProposedGlob prompt1 == "rm*")
   resolvePrompt prompt1 PermDeny
@@ -2080,25 +2080,25 @@ testTieredSecurityModalAndWhitelisting = do
   assert "PermDeny results in False" (not res1)
 
   -- Verify second invocation still prompts (not silently allowed or denied)
-  a2 <- async $ checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object [])
+  a2 <- async $ checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object []) Nothing
   prompt2 <- atomically $ readTBQueue (uiPromptQueue sec)
   resolvePrompt prompt2 PermOnce
   res2 <- wait a2
   assert "PermOnce results in True" res2
 
   -- Third invocation must prompt again because PermOnce was only for 1 call
-  a3 <- async $ checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object [])
+  a3 <- async $ checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object []) Nothing
   prompt3 <- atomically $ readTBQueue (uiPromptQueue sec)
   resolvePrompt prompt3 PermSession
   res3 <- wait a3
   assert "PermSession results in True" res3
 
   -- Fourth invocation must now be auto-allowed by session memory without prompting!
-  res4 <- checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object [])
+  res4 <- checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object []) Nothing
   assert "Subsequent call auto-allowed by PermSession" res4
 
   -- 3. Test PermAlways: writes to .lambda/config.json and hot-reloads into active memory
-  a5 <- async $ checkAuthorization sec MainAgent "pytest tests/test_api.py" (Aeson.object [])
+  a5 <- async $ checkAuthorization sec MainAgent "pytest tests/test_api.py" (Aeson.object []) Nothing
   prompt5 <- atomically $ readTBQueue (uiPromptQueue sec)
   assert "prompt5 proposes pytest*" (promptProposedGlob prompt5 == "pytest*")
   resolvePrompt prompt5 PermAlways
@@ -2106,7 +2106,7 @@ testTieredSecurityModalAndWhitelisting = do
   assert "PermAlways results in True" res5
 
   -- Verify hot-reloading: pytest tests/test_engine.py must be auto-allowed immediately by the compiled glob!
-  res6 <- checkAuthorization sec MainAgent "pytest tests/test_engine.py" (Aeson.object [])
+  res6 <- checkAuthorization sec MainAgent "pytest tests/test_engine.py" (Aeson.object []) Nothing
   assert "Subsequent pytest command auto-allowed in-memory via hot-reloaded compiled glob" res6
 
   -- Verify config file persistence: <tempWs>/.lambda/config.json must contain "pytest*"
@@ -2617,6 +2617,19 @@ testAcpFullDuplexRpcAndNotifications = do
       assert "Client RPC returned outcome allow" ("allow" `T.isInfixOf` encoded)
     Left err -> failTest ("Client RPC failed: " <> show err)
 
+  -- 4b. Verify session/request_permission schema and outcome resolution (allow_always, allow_once, reject_once, fail-closed)
+  dummyPermReply <- newEmptyTMVarIO
+  let testPromptOnce = PermissionPrompt
+        { promptId           = 7001
+        , promptCaller       = MainAgent
+        , promptTool         = "edit_file src/App.hs"
+        , promptArgs         = Aeson.object ["path" .= ("src/App.hs" :: Text)]
+        , promptProposedGlob = "edit_file*"
+        , promptReply        = dummyPermReply
+        , promptToolCallId   = Just "call_real_tool_99"
+        }
+  assert "PermissionPrompt preserves promptToolCallId" (promptToolCallId testPromptOnce == Just "call_real_tool_99")
+
   -- 5. Test Rich Notification Serialization
   let planEntries =
         [ AcpPlanEntry "Verify compiler flags" "completed" (Just "high")
@@ -2627,7 +2640,7 @@ testAcpFullDuplexRpcAndNotifications = do
   assert "Plan update contains sessionUpdate plan" ("\"sessionUpdate\":\"plan\"" `T.isInfixOf` planTxt)
   assert "Plan update contains Verify compiler flags" ("Verify compiler flags" `T.isInfixOf` planTxt)
 
-  let usageNotif = AcpSessionUpdateNotification "sess_test" (AcpUsageUpdate 1500 200000 (Just 0.0075) (Just 1000) (Just 500))
+  let usageNotif = AcpSessionUpdateNotification "sess_test" (AcpUsageUpdate 1500 200000 Nothing (Just 1000) (Just 500))
       usageTxt = TE.decodeUtf8 (BL.toStrict (Aeson.encode usageNotif))
   assert "Usage update contains usage_update" ("\"sessionUpdate\":\"usage_update\"" `T.isInfixOf` usageTxt)
   assert "Usage update contains used 1500" ("\"used\":1500" `T.isInfixOf` usageTxt)
@@ -3742,6 +3755,21 @@ testAcpStopCancellationAndToolFormatting = do
         Nothing -> failTest "Missing prompt result on cancel"
 
   putStrLn "  -> OK: ACP stop cancellation unblocks instantly, tool titles/arguments format richly, and subagent stream isolation verified."
+
+  -- 5. Verify ToolCallBlock argument token accounting and multi-compaction summary retention
+  let sampleCallSmall = ToolCall "c_small" "read_file" (Aeson.object ["path" .= ("a.txt" :: Text)])
+      sampleCallLarge = ToolCall "c_large" "edit_file" (Aeson.object ["path" .= ("a.txt" :: Text), "content" .= T.replicate 4000 "x"])
+      toksSmall = estimateTotalTokens [Turn 1 AssistantRole [ToolCallBlock sampleCallSmall]]
+      toksLarge = estimateTotalTokens [Turn 2 AssistantRole [ToolCallBlock sampleCallLarge]]
+  assert "estimateTotalTokens scales with ToolCall arguments payload" (toksLarge > toksSmall + 800)
+
+  let summaryTurn1 = Turn 1 SystemRole [TextBlock "[Context Summary: 5 historical turns compacted into working state]\n- Key Objectives: Initial Setup\n- Tools Executed: read_file\n- Active Artifacts: None"]
+      turnNext1 = Turn 2 UserRole [TextBlock "Follow up"]
+      turnNext2 = Turn 3 AssistantRole [TextBlock "Done"]
+      multiCompactedSummary = synthesizeTurnSummary [summaryTurn1, turnNext1, turnNext2]
+  assert "synthesizeTurnSummary preserves prior context from previous compactions"
+    ("Prior Context:" `T.isInfixOf` multiCompactedSummary && "Initial Setup" `T.isInfixOf` multiCompactedSummary)
+  putStrLn "  -> OK: ToolCall argument token scaling and multi-compaction context retention verified."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

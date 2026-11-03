@@ -146,12 +146,12 @@ executeToolDispatch engineState@AppEngineState{..} caller grantedGlobs ToolCall{
                   if not matchesGrant
                     then
                       -- Ungranted tool -> dynamic permission escalation
-                      checkAuthorization appSecurity caller displayCmd toolCallArgs
+                      checkAuthorization appSecurity caller displayCmd toolCallArgs (Just toolCallId)
                     else if requiresExplicitPermission
                       then
                         -- Granted capability, but sensitive operation (outside path, destructive, or webfetch)
                         -- Check session memory or prompt user JIT
-                        checkAuthorization appSecurity caller displayCmd toolCallArgs
+                        checkAuthorization appSecurity caller displayCmd toolCallArgs (Just toolCallId)
                       else
                         -- Safe local read-only workspace operation matching subagent grants -> auto-allow
                         pure True
@@ -159,7 +159,7 @@ executeToolDispatch engineState@AppEngineState{..} caller grantedGlobs ToolCall{
                 MainAgent -> do
                   if toolCallName == "spawn_specialist_subagent" || (toolCapability == ReadOnly && not requiresExplicitPermission)
                     then pure True
-                    else checkAuthorization appSecurity caller displayCmd toolCallArgs
+                    else checkAuthorization appSecurity caller displayCmd toolCallArgs (Just toolCallId)
 
               if not authorized
                 then pure $ ToolResult toolCallId ""
