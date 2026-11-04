@@ -146,6 +146,7 @@ completeInput baseDir st rawInput = do
 
             endpointCands
               | T.null baseUrl = [] -- STRICT INVARIANT: If unconfigured, NEVER guess or suggest cloud models!
+              | not (null userModels) = [] -- STRICT INVARIANT: If explicit models are configured, respect on-prem/curated list!
               | isLocalEndpoint baseUrl = [] -- STRICT INVARIANT: Never show cloud models on local endpoints!
               | isOpenAiEndpoint baseUrl =
                   [ Candidate "4o"      "4o (gpt-4o, 128k)"

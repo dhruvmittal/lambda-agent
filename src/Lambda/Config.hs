@@ -20,6 +20,7 @@ module Lambda.Config
   , deriveProviderFromUrl
   , extractProviderAndModel
   , lookupModelContextLimit
+  , lookupModelContextLimitWithConfig
   , curatedModels
   , resolveEnvTemplates
   , loadConfig
@@ -217,6 +218,7 @@ data Config = Config
   , maxSavedSessions    :: !Int
   , modelAliases        :: !(Map Text Text)
   , configuredModels    :: ![Text]
+  , modelLimits         :: !(Map Text Int)
   , themeName           :: !Text
   , customThemes        :: !(Map Text (Map Text Text))
   , mouseSupport        :: !Bool
@@ -237,6 +239,7 @@ instance Aeson.ToJSON Config where
     , "max_saved_sessions"  .= maxSavedSessions
     , "model_aliases"       .= modelAliases
     , "models"              .= configuredModels
+    , "model_limits"        .= modelLimits
     , "theme"               .= themeName
     , "themes"              .= customThemes
     , "mouse_support"       .= mouseSupport
@@ -261,6 +264,7 @@ instance Aeson.FromJSON Config where
                             Just a  -> pure a
                             Nothing -> obj .:? "aliases" .!= Map.empty
     configuredModels   <- obj .:? "models" .!= []
+    modelLimits        <- obj .:? "model_limits" .!= Map.empty
     themeName          <- obj .:? "theme" .!= "default"
     customThemes       <- obj .:? "themes" .!= Map.empty
     mMouse             <- obj .:? "mouse_support"
@@ -310,6 +314,7 @@ defaultConfig = Config
   , maxSavedSessions    = 50
   , modelAliases        = Map.empty
   , configuredModels    = []
+  , modelLimits         = Map.empty
   , themeName           = "default"
   , customThemes        = Map.empty
   , mouseSupport        = True
@@ -648,6 +653,7 @@ loadConfig wsRoot = do
               , maxSavedSessions   = pick "max_saved_sessions" (maxSavedSessions baseCfgWithLocalMd)
               , modelAliases       = mAliases
               , configuredModels   = pick "models" (configuredModels baseCfgWithLocalMd)
+              , modelLimits        = pickMap "model_limits" (modelLimits baseCfgWithLocalMd)
               , themeName          = pick "theme" (themeName baseCfgWithLocalMd)
               , customThemes       = pickMap "themes" (customThemes baseCfgWithLocalMd)
               , mouseSupport       = pick "mouse_support" (mouseSupport baseCfgWithLocalMd)
@@ -792,15 +798,26 @@ resolveModelAlias rawName =
   let clean = T.strip (T.toLower rawName)
   in Map.findWithDefault rawName clean defaultModelAliases
 
--- | Context window limits for known models (defaults to 128000)
+-- | Context window limits for known models (respecting config overrides and context_limit fallback)
+lookupModelContextLimitWithConfig :: Config -> Text -> Int
+lookupModelContextLimitWithConfig cfg modId =
+  let m = T.toLower modId
+  in case Map.lookup modId (modelLimits cfg) <|> Map.lookup m (modelLimits cfg) of
+       Just limit -> limit
+       Nothing
+         | "claude" `T.isInfixOf` m   -> 200000
+         | "o3-mini" `T.isInfixOf` m  -> 200000
+         | "32k" `T.isInfixOf` m      -> 32768
+         | "64k" `T.isInfixOf` m      -> 65536
+         | "128k" `T.isInfixOf` m     -> 131072
+         | "gpt-4o" `T.isInfixOf` m   -> 128000
+         | "deepseek" `T.isInfixOf` m -> 128000
+         | "qwen" `T.isInfixOf` m     -> 128000
+         | otherwise                  -> contextWindowLimit cfg
+
+-- | Default lookup for backwards compatibility
 lookupModelContextLimit :: Text -> Int
-lookupModelContextLimit modId
-  | "claude" `T.isInfixOf` modId   = 200000
-  | "o3-mini" `T.isInfixOf` modId  = 200000
-  | "gpt-4o" `T.isInfixOf` modId   = 128000
-  | "deepseek" `T.isInfixOf` modId = 128000
-  | "qwen" `T.isInfixOf` modId     = 128000
-  | otherwise                      = 128000
+lookupModelContextLimit = lookupModelContextLimitWithConfig defaultConfig
 
 -- | Check if api_base_url points to a local provider (Ollama, vLLM, LM Studio, etc.)
 isLocalEndpoint :: Text -> Bool

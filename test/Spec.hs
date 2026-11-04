@@ -25,7 +25,7 @@ import System.Environment (setEnv, unsetEnv)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
 
-import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, resolveEnvTemplates, persistTheme, extractProviderAndModel, parseMarkdownAgent, loadAllMarkdownAgents)
+import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, lookupModelContextLimitWithConfig, resolveEnvTemplates, persistTheme, extractProviderAndModel, parseMarkdownAgent, loadAllMarkdownAgents)
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro, expandPromptMacro)
 import Lambda.Core.EngineInterface (initEngineChannels, cmdQueue, startEngineLoop, EngineChannels(..), EngineRuntime(..), startEngineRuntime, stopEngineRuntime)
 import Lambda.Core.ModelDriver (ModelDriver(..), simpleModelDriver)
@@ -1465,6 +1465,16 @@ testDynamicModelSwitching = do
     (lookupModelContextLimit "deepseek/deepseek-r1" == 128000)
   assert "Qwen model has 128k context limit"
     (lookupModelContextLimit "qwen/qwen-2.5-coder-32b-instruct" == 128000)
+  let customCfg = defaultConfig
+        { contextWindowLimit = 32768
+        , modelLimits = Map.fromList [("work-custom", 65536)]
+        }
+  assert "Explicit modelLimits override matches"
+    (lookupModelContextLimitWithConfig customCfg "work-custom" == 65536)
+  assert "Hint in name parses 32k"
+    (lookupModelContextLimitWithConfig defaultConfig "company-model-32k" == 32768)
+  assert "Unknown model falls back to contextWindowLimit"
+    (lookupModelContextLimitWithConfig customCfg "unknown-corp-model" == 32768)
 
   -- 3. Dynamic Model Switching via Engine Loop
   sec <- initSecurity [] []

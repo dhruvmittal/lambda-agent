@@ -20,7 +20,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 
 import qualified Data.Map.Strict as Map
-import Lambda.Config (Config(..), resolveModelWithConfig, lookupModelContextLimit)
+import Lambda.Config (Config(..), resolveModelWithConfig, lookupModelContextLimitWithConfig)
 import Lambda.Core.ModelDriver (ModelDriver(..))
 import Network.HTTP.Client.TLS (newTlsManager)
 
@@ -146,7 +146,7 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       engineWorkerLoop engineState driver channels activeTaskVar
     CmdSetModel rawModel -> do
       let targetModel = resolveModelWithConfig appConfig rawModel
-          targetLimit = lookupModelContextLimit targetModel
+          targetLimit = lookupModelContextLimitWithConfig appConfig targetModel
       atomically $ do
         writeTVar appActiveModel targetModel
         writeTVar appContextLimit targetLimit

@@ -49,7 +49,10 @@ import System.IO
   , isEOF
   )
 
-import Lambda.Config (Config(..), loadConfig, curatedModels, lookupModelContextLimit)
+import Data.List (nub)
+
+import Lambda.Config (Config(..), loadConfig, curatedModels, lookupModelContextLimitWithConfig, isOpenRouterEndpoint)
+import Lambda.Driver.OpenAI (fetchEndpointModels)
 import Lambda.Core.EngineInterface
   ( EngineChannels(..)
   , EngineRuntime(..)
@@ -104,6 +107,11 @@ initAcpServerStateWithSink cfg sink = do
   rpcIdVar  <- newTVarIO 1000
   rpcMapVar <- newTVarIO Map.empty
   subCallIdVar <- newTVarIO Nothing
+  -- Asynchronously discover models from endpoint if configured
+  _ <- forkIO $ do
+    detected <- fetchEndpointModels cfg
+    unless (null detected) $ atomically $ modifyTVar' cfgVar $ \c ->
+      c { configuredModels = nub (configuredModels c ++ detected) }
   pure $ AcpServerState
     { acpConfig             = cfgVar
     , acpActiveRuntime      = rtVar
@@ -314,10 +322,13 @@ acpStandardCommands =
 buildSessionConfigOptions :: Config -> AgentMode -> Text -> Text -> [AcpConfigOption]
 buildSessionConfigOptions cfg curMode curModel curThought =
   let modelChoices =
-        let curChoice = AcpConfigOptionChoice curModel curModel (Just "Active model")
-            curated = [ AcpConfigOptionChoice m m (Just "Curated model option") | m <- curatedModels, m /= curModel ]
-            cfgCustom = [ AcpConfigOptionChoice m m (Just "User configured model") | m <- configuredModels cfg, m /= curModel && notElem m curatedModels ]
-        in curChoice : (curated ++ cfgCustom)
+        let curChoice = [AcpConfigOptionChoice curModel curModel (Just "Active model") | not (T.null curModel)]
+            showCurated = null (configuredModels cfg) && isOpenRouterEndpoint (apiBaseUrl cfg)
+            curated = if showCurated
+                        then [ AcpConfigOptionChoice m m (Just "Curated model option") | m <- curatedModels, m /= curModel ]
+                        else []
+            cfgCustom = [ AcpConfigOptionChoice m m (Just "Configured model") | m <- configuredModels cfg, m /= curModel ]
+        in curChoice ++ cfgCustom ++ curated
       modeChoices =
         [ AcpConfigOptionChoice "plan" "Plan Mode" (Just "Read-only inspection and safe planning")
         , AcpConfigOptionChoice "exec" "Exec Mode" (Just "Full mutating tool execution access")
@@ -393,14 +404,24 @@ handleSlashPrompt state mReqId sId prompt mChannels mEngine baseCfg = do
           curModel <- case mEngine of
             Just eng -> readTVarIO (appActiveModel eng)
             Nothing  -> pure (modelName baseCfg)
-          let modelsMsg = "Active model: `" <> curModel <> "`\n\nCurated models:\n"
-                <> T.unlines [ "- `" <> m <> "`" | m <- curatedModels ]
-                <> "\nTo switch models, run `/model <model-name>`\n"
+          cfg <- readTVarIO (acpConfig state)
+          let availModels = if not (null (configuredModels cfg))
+                              then configuredModels cfg
+                              else if isOpenRouterEndpoint (apiBaseUrl cfg)
+                                     then curatedModels
+                                     else []
+              modelsMsg = "Active model: `" <> curModel <> "`\n"
+                <> if null availModels
+                     then "\nTo switch models, run `/model <model-name>`\n"
+                     else "\nAvailable models:\n"
+                          <> T.unlines [ "- `" <> m <> "`" | m <- availModels ]
+                          <> "\nTo switch models, run `/model <model-name>`\n"
           sendSessionUpdate state sId (AcpAgentMessageChunk modelsMsg)
           finish
         else do
           let targetModel = args
-              targetLimit = lookupModelContextLimit targetModel
+          cfg <- readTVarIO (acpConfig state)
+          let targetLimit = lookupModelContextLimitWithConfig cfg targetModel
           case mEngine of
             Just eng -> atomically $ do
               writeTVar (appActiveModel eng) targetModel
@@ -409,12 +430,13 @@ handleSlashPrompt state mReqId sId prompt mChannels mEngine baseCfg = do
           case mChannels of
             Just ch -> atomically $ writeTBQueue (cmdQueue ch) (CmdSetModel targetModel)
             Nothing -> pure ()
-          atomically $ modifyTVar' (acpConfig state) (\c -> c { modelName = targetModel, contextWindowLimit = targetLimit })
+          let updatedCfg = cfg { modelName = targetModel, contextWindowLimit = targetLimit }
+          atomically $ writeTVar (acpConfig state) updatedCfg
           curMode <- case mEngine of
             Just eng -> readTVarIO (appMode eng)
             Nothing  -> pure PlanMode
           sendSessionUpdate state sId $ AcpConfigOptionsUpdate
-            (buildSessionConfigOptions baseCfg curMode targetModel "high")
+            (buildSessionConfigOptions updatedCfg curMode targetModel "high")
           case mEngine of
             Just eng -> broadcastUsageUpdate state eng sId
             Nothing  -> pure ()
@@ -802,7 +824,7 @@ handleAcpRequest state AcpJsonRpcRequest{..} = do
               case cfgId of
                 "model" -> case val of
                   Aeson.String mName -> do
-                    let targetLimit = lookupModelContextLimit mName
+                    let targetLimit = lookupModelContextLimitWithConfig baseCfg mName
                     case mEng of
                       Just eng -> atomically $ do
                         writeTVar (appActiveModel eng) mName

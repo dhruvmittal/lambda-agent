@@ -5,6 +5,7 @@ module Lambda.Driver.OpenAI
   ( openAiDriver
   , openAiDynamicDriver
   , openAiDynamicDriverWithManager
+  , fetchEndpointModels
   , parseSseChunk
   , splitThinkingChunks
   , processSseStream
@@ -14,7 +15,7 @@ import Control.Exception (try, SomeException)
 import Control.Monad (forM, forM_, when, unless)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?))
-import Data.Aeson.Types (parseEither)
+import Data.Aeson.Types (parseEither, parseMaybe)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.CaseInsensitive as CI
@@ -24,6 +25,7 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Data.Vector as V
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS (newTlsManager)
 import Network.HTTP.Types.Header (hContentType, hAuthorization)
@@ -309,3 +311,37 @@ splitThinkingChunks inThinking txt
       in case occurrences of
            [] -> Nothing
            xs -> Just $ minimumBy (\(_, a) (_, b) -> compare a b) xs
+
+-- | Dynamically query GET <api_base_url>/models (OpenAI/Portkey/vLLM/Ollama compatible)
+fetchEndpointModels :: Config -> IO [Text]
+fetchEndpointModels cfg
+  | T.null (apiBaseUrl cfg) = pure []
+  | otherwise = do
+      manager <- newTlsManager
+      let cleanBase = T.dropWhileEnd (== '/') (apiBaseUrl cfg)
+          endpoint = T.unpack cleanBase <> "/models"
+      res <- try $ do
+        initReq <- parseRequest endpoint
+        let customHdrs = [ (CI.mk (TE.encodeUtf8 k), TE.encodeUtf8 v) | (k, v) <- Map.toList (customHeaders cfg) ]
+            authHdrs = if T.null (apiKey cfg) then [] else [(hAuthorization, "Bearer " <> TE.encodeUtf8 (apiKey cfg))]
+            req = initReq
+              { method = "GET"
+              , requestHeaders = [(hContentType, "application/json")] ++ authHdrs ++ customHdrs
+              , checkResponse = \_ _ -> pure ()
+              }
+        withResponse req manager $ \response -> do
+          if statusCode (responseStatus response) == 200
+            then do
+              chunks <- brConsume (responseBody response)
+              let body = BL.fromChunks chunks
+              case Aeson.decode body of
+                Just (Aeson.Object obj) -> case parseMaybe (.: "data") obj of
+                  Just (Aeson.Array arr) ->
+                    pure [ mId | Aeson.Object mObj <- V.toList arr
+                               , Just (Aeson.String mId) <- [parseMaybe (.: "id") mObj] ]
+                  _ -> pure []
+                _ -> pure []
+            else pure []
+      case res of
+        Right models -> pure models
+        Left (_ :: SomeException) -> pure []
