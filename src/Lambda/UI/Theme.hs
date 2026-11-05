@@ -412,6 +412,21 @@ buildThemeAttrMap ThemePalette{..} =
        , (attrName "mdTableHeader",  withThemeBg tpAccent1 `V.withStyle` V.bold)
        , (attrName "mdTableCell",    withThemeBg tpFg)
        , (attrName "mdNormal",       withThemeBg tpFg)
+       -- Skylighting Syntax Highlighting attributes (derived from ThemePalette)
+       , (attrName "syntaxKeyword",      withThemeBg tpWarn `V.withStyle` V.bold)
+       , (attrName "syntaxType",         withThemeBg tpAccent2 `V.withStyle` V.bold)
+       , (attrName "syntaxFunction",     withThemeBg tpAccent1)
+       , (attrName "syntaxString",       withThemeBg tpSuccess)
+       , (attrName "syntaxSpecial",      withThemeBg tpWarn)
+       , (attrName "syntaxNumber",       withThemeBg tpAccent2)
+       , (attrName "syntaxComment",      withThemeBg tpFgDim `V.withStyle` V.italic)
+       , (attrName "syntaxOperator",     withThemeBg tpFgBright)
+       , (attrName "syntaxVariable",     withThemeBg tpFg)
+       , (attrName "syntaxInfo",         withThemeBg tpAccent1)
+       , (attrName "syntaxWarn",         withThemeBg tpWarn `V.withStyle` V.bold)
+       , (attrName "syntaxAlert",        withThemeBg tpError `V.withStyle` V.bold)
+       , (attrName "syntaxError",        withThemeBg tpError `V.withStyle` V.bold)
+       , (attrName "syntaxNormal",       codeBlockAttr)
        ]
 
 -- | Resolve the active AttrMap from Config (falling back to "default" if unknown).

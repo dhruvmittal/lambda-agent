@@ -80,7 +80,9 @@ library
         microlens,
         microlens-th,
         text-zipper,
-        unix
+        unix,
+        skylighting,
+        skylighting-core
 
 executable lambda
     import:           common-options
@@ -128,4 +130,6 @@ test-suite lambda-test
         vty,
         microlens,
         http-client,
-        http-client-tls
+        http-client-tls,
+        skylighting,
+        skylighting-core

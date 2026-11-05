@@ -10,6 +10,7 @@ module Lambda.UI.Markdown
   , initVtyUnicodeWidthTable
   , textVisualWidth
   , tokenVisualWidth
+  , tokenTypeToAttrName
   , MdBlock(..)
   , WordToken(..)
   ) where
@@ -29,6 +30,13 @@ import qualified Data.Text as T
 import Graphics.Vty (safeWcwidth)
 import qualified Graphics.Vty.UnicodeWidthTable.Types as VtyTable
 import qualified Graphics.Vty.UnicodeWidthTable.Install as VtyInstall
+import Skylighting
+  ( defaultSyntaxMap
+  , lookupSyntax
+  , tokenize
+  , TokenizerConfig(..)
+  , TokenType(..)
+  )
 
 import Lambda.UI.Types (ResourceName)
 
@@ -263,6 +271,49 @@ renderWrappedInlines tokens = Widget Greedy Fixed $ do
       lines' = greedyWrap maxW tokens
   render $ vBox [ hBox [ withAttr (tokAttr t) (txt (tokText t <> if tokSpace t then " " else "")) | t <- line ] | line <- lines' ]
 
+-- | Map a Skylighting TokenType to the corresponding theme AttrName
+tokenTypeToAttrName :: TokenType -> AttrName
+tokenTypeToAttrName = \case
+  KeywordTok          -> attrName "syntaxKeyword"
+  ControlFlowTok      -> attrName "syntaxKeyword"
+  ImportTok           -> attrName "syntaxKeyword"
+  PreprocessorTok     -> attrName "syntaxKeyword"
+
+  DataTypeTok         -> attrName "syntaxType"
+  AttributeTok        -> attrName "syntaxType"
+  ExtensionTok        -> attrName "syntaxType"
+
+  FunctionTok         -> attrName "syntaxFunction"
+  BuiltInTok          -> attrName "syntaxFunction"
+
+  StringTok           -> attrName "syntaxString"
+  VerbatimStringTok   -> attrName "syntaxString"
+  SpecialStringTok    -> attrName "syntaxString"
+  CharTok             -> attrName "syntaxString"
+  SpecialCharTok      -> attrName "syntaxSpecial"
+
+  DecValTok           -> attrName "syntaxNumber"
+  BaseNTok            -> attrName "syntaxNumber"
+  FloatTok            -> attrName "syntaxNumber"
+  ConstantTok         -> attrName "syntaxNumber"
+
+  CommentTok          -> attrName "syntaxComment"
+  DocumentationTok    -> attrName "syntaxComment"
+  CommentVarTok       -> attrName "syntaxComment"
+  AnnotationTok       -> attrName "syntaxComment"
+  RegionMarkerTok     -> attrName "syntaxComment"
+
+  OperatorTok         -> attrName "syntaxOperator"
+  VariableTok         -> attrName "syntaxVariable"
+
+  InformationTok      -> attrName "syntaxInfo"
+  WarningTok          -> attrName "syntaxWarn"
+  AlertTok            -> attrName "syntaxAlert"
+  ErrorTok            -> attrName "syntaxError"
+
+  OtherTok            -> attrName "syntaxNormal"
+  NormalTok           -> attrName "syntaxNormal"
+
 -- | Render individual Markdown block elements to Brick Widgets
 renderMdBlock :: MdBlock -> Widget ResourceName
 renderMdBlock (MdH1 tokens) =
@@ -282,10 +333,26 @@ renderMdBlock (MdCode mLang codeLines) =
       [ withAttr (attrName "mdCodeLang") (str $ "● " <> maybe "code" T.unpack mLang)
       , padLeft (Pad 2) $
           withAttr (attrName "mdCodeBlock") $
-            vBox (map (txt . padEmpty) codeLines)
+            vBox renderedLines
       ]
   where
     padEmpty l = if T.null l then " " else l
+    fullCode = T.unlines codeLines
+    mSyntax = mLang >>= \l -> lookupSyntax (T.toLower (T.strip l)) defaultSyntaxMap
+    cfg = TokenizerConfig defaultSyntaxMap False
+
+    renderedLines = case mSyntax of
+      Just syn ->
+        case tokenize cfg syn fullCode of
+          Right sourceLines -> map renderSourceLine sourceLines
+          Left _            -> map (txt . padEmpty) codeLines
+      Nothing -> map (txt . padEmpty) codeLines
+
+    renderSourceLine [] = txt " "
+    renderSourceLine tokens =
+      hBox [ withAttr (tokenTypeToAttrName tokType) (txt tokText)
+           | (tokType, tokText) <- tokens
+           ]
 
 renderMdBlock (MdTable rows) =
   padTopBottom 1 $ renderMdTable rows

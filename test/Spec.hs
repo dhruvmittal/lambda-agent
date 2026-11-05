@@ -24,6 +24,7 @@ import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive, doe
 import System.Environment (setEnv, unsetEnv)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
+import Skylighting (TokenType(..))
 
 import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, lookupModelContextLimitWithConfig, resolveEnvTemplates, persistTheme, extractProviderAndModel, parseMarkdownAgent, loadAllMarkdownAgents)
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro, expandPromptMacro)
@@ -88,13 +89,15 @@ import Lambda.UI.Completion (completeInput, allCommands, computeCommandCandidate
 import Lambda.UI.Draw (drawApp, renderSubAgents, renderSubAgentsSelected, renderInlineSubAgent, renderCompletionLine, renderPowerlinePrompt, wrapLineWithSpans, wrapEditorToVisual, wrapEditorToVisualWithFirstWidth, distributeSubAgentsToTurns)
 import Lambda.UI.Events (handleAppEvent, computeCommandMatches, replaceCurrentToken, cycleCompletedToken)
 import Lambda.UI.Markdown
-  ( parseMarkdownBlocks
+  ( renderMarkdown
+  , parseMarkdownBlocks
   , tokenizeInlines
   , greedyWrap
   , budgetWidths
   , initVtyUnicodeWidthTable
   , textVisualWidth
   , tokenVisualWidth
+  , tokenTypeToAttrName
   , MdBlock(..)
   , WordToken(..)
   )
@@ -1991,7 +1994,18 @@ testMarkdownParsingAndRendering = do
        [MdQuote _, MdThematicBreak, MdPara _] -> True
        _ -> False)
 
-  putStrLn "  -> OK: Robust Markdown engine parses GFM tables, inlines, greedy wrap, and streaming code fences cleanly."
+  -- 7. Syntax Highlighting Token Mapping & Code Block Rendering
+  assert "tokenTypeToAttrName correctly maps keyword, string, comment, and type tokens"
+    (tokenTypeToAttrName KeywordTok == attrName "syntaxKeyword"
+     && tokenTypeToAttrName StringTok == attrName "syntaxString"
+     && tokenTypeToAttrName CommentTok == attrName "syntaxComment"
+     && tokenTypeToAttrName DataTypeTok == attrName "syntaxType")
+
+  let renderedWidget = renderMarkdown codeDoc
+  assert "renderMarkdown produces a valid widget for highlighted code"
+    (seq renderedWidget True)
+
+  putStrLn "  -> OK: Robust Markdown engine parses GFM tables, inlines, greedy wrap, streaming code fences, and highlights code cleanly."
 
 -- 46. Verify Session Chooser, 1-Based Index/Substring Resolution & Empty Session Exclusion
 testSessionChooserAndResolutionInvariant :: IO ()
