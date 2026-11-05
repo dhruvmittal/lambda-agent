@@ -35,6 +35,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Data.Time.Format (defaultTimeLocale, formatTime)
+import Text.Read (readMaybe)
 import System.Directory (doesDirectoryExist, removeFile)
 import System.FilePath ((</>), (<.>))
 import System.IO
@@ -172,8 +173,13 @@ callClientRpc state method params = do
 -- | Handles an incoming JSON-RPC response fulfilling a server-to-client request
 handleAcpResponse :: AcpServerState -> AcpJsonRpcResponse -> IO ()
 handleAcpResponse state AcpJsonRpcResponse{..} = do
-  case Aeson.fromJSON respId of
-    Aeson.Success (i :: Int) -> do
+  let mId = case Aeson.fromJSON respId of
+        Aeson.Success (i :: Int) -> Just i
+        Aeson.Error _ -> case respId of
+          Aeson.String s -> readMaybe (T.unpack s)
+          _              -> Nothing
+  case mId of
+    Just i -> do
       mVar <- atomically $ do
         pending <- readTVar (acpPendingClientRpc state)
         case Map.lookup i pending of
@@ -188,7 +194,7 @@ handleAcpResponse state AcpJsonRpcResponse{..} = do
                 Nothing  -> Right (fromMaybe Aeson.Null respResult)
           atomically $ putTMVar v outcome
         Nothing -> pure ()
-    Aeson.Error _ -> pure ()
+    Nothing -> pure ()
 
 -- | Converts appStateVector text into structured ACP plan entries
 parsePlanEntriesFromVector :: Text -> [AcpPlanEntry]

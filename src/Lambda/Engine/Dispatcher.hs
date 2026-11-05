@@ -30,21 +30,24 @@ isPathOutsideWorkspace :: FilePath -> FilePath -> IO Bool
 isPathOutsideWorkspace wsRoot rawPath = do
   canonicalRoot <- canonicalizePath wsRoot
   let candidate = if isAbsolute rawPath then rawPath else wsRoot </> rawPath
-  exists <- doesPathExist candidate
-  canonicalTarget <- if exists
-    then canonicalizePath candidate
-    else do
-      let parent = takeDirectory candidate
-      pExists <- doesPathExist parent
-      canParent <- if pExists
-        then canonicalizePath parent
-        else pure (normalise parent)
-      pure (normalise (canParent </> takeFileName candidate))
+  canonicalTarget <- canonicalizeAncestor candidate
   let cleanRoot = normalise canonicalRoot
       cleanTarget = normalise canonicalTarget
       isContained = cleanTarget == cleanRoot
                  || (cleanRoot ++ [pathSeparator]) `isPrefixOf` cleanTarget
   pure (not isContained)
+  where
+    canonicalizeAncestor p = do
+      exists <- doesPathExist p
+      if exists
+        then canonicalizePath p
+        else do
+          let parent = takeDirectory p
+          if parent == p
+            then pure (normalise p)
+            else do
+              canParent <- canonicalizeAncestor parent
+              pure (normalise (canParent </> takeFileName p))
 
 -- | Dispatches tool calls with strict mode enforcement, workspace confinement, and JIT capability security
 executeToolDispatch
