@@ -17,7 +17,7 @@ A fast, keyboard-driven terminal AI coding and diagnostics agent in Haskell ([Br
 
 ## Configuration
 
-Loaded from `.lambda/config.json` (workspace) or `~/.config/lambdA/config.json` (global). Supports `{ENV:VAR_NAME}` expansion and `.env` files. No provider default is assumed.
+Loaded from `.lambda/config.json` (workspace) or `~/.config/lambdA/config.json` (global). Supports `{ENV:VAR_NAME}` template expansion and `.env` / `.env.local` files. No provider default is assumed.
 
 ### Local (Ollama, vLLM, LM Studio)
 Local endpoints require no API key:
@@ -30,6 +30,31 @@ Local endpoints require no API key:
 }
 ```
 
+### On-Prem & Portkey AI Gateway
+Supports custom HTTP headers (such as Portkey virtual keys, gateway configs, or corporate bearer tokens), context window overrides, and strict on-prem model isolation:
+```json
+{
+  "api_base_url": "https://portkey.internal.work.com/v1",
+  "api_key": "{ENV:PORTKEY_API_KEY}",
+  "custom_headers": {
+    "x-portkey-virtual-key": "{ENV:PORTKEY_VIRTUAL_KEY}",
+    "x-portkey-config": "enterprise-coding"
+  },
+  "model_name": "company-qwen-coder-32b",
+  "models": [
+    "company-qwen-coder-32b",
+    "company-llama-70b"
+  ],
+  "model_limits": {
+    "company-qwen-coder-32b": 32768,
+    "company-llama-70b": 65536
+  },
+  "context_limit": 32768
+}
+```
+> [!NOTE]
+> When `models` is specified or when using a non-OpenRouter endpoint, unconfigured cloud models (Claude, DeepSeek, GPT-4o) are suppressed from both TUI auto-completion and Zed's ACP model picker, complying with strict on-prem corporate privacy policies.
+
 ### Remote (OpenAI / Compatible Providers)
 ```json
 {
@@ -40,7 +65,50 @@ Local endpoints require no API key:
 }
 ```
 
-**Environment variables**: `LAMBDA_BASE_URL` (or `OPENAI_BASE_URL`), `LAMBDA_MODEL`, `LAMBDA_API_KEY` (or `OPENAI_API_KEY`), `CONTEXT_LIMIT`.
+### Security & Automated Approvals
+lambdA employs an interactive JIT security ledger. Destructive operations (mutating bash commands, edits, writes) or actions touching paths outside the workspace boundary prompt for authorization. To pre-authorize routine operations without manual approval prompts (especially useful in headless ACP or remote SSH sessions):
+```json
+{
+  "always_allow_globs": [
+    "read_file*",
+    "list_directory*",
+    "grep_search*",
+    "edit_file*",
+    "write_file*",
+    "git *",
+    "cabal test*",
+    "cargo test*"
+  ],
+  "always_deny_globs": [
+    "rm -rf /*",
+    "mkfs*",
+    ":(){ :|:& };:"
+  ]
+}
+```
+
+### Full Configuration Reference
+
+| Option | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `api_base_url` | `string` | `""` | Base URL for OpenAI-compatible endpoint (e.g. `http://localhost:11434/v1`). |
+| `api_key` | `string` | `""` | API key. Supports `{ENV:KEY_NAME}` placeholder syntax. |
+| `model_name` | `string` | `""` | Default active model ID. |
+| `models` | `string[]` | `[]` | Explicit model whitelist. When set, hides unconfigured cloud models. |
+| `model_aliases` | `object` | `{}` | Friendly shorthands mapping to full model names (e.g. `{"coder": "qwen2.5-coder:32b"}`). |
+| `model_limits` | `object` | `{}` | Per-model token context window limits (e.g. `{"my-model": 32768}`). |
+| `context_limit` | `integer` | `128000` | Fallback context window size in tokens for compaction triggers. |
+| `custom_headers` | `object` | `{}` | Key-value HTTP headers sent with every completion and `/models` request. |
+| `always_allow_globs` | `string[]` | *safe reads* | Glob patterns pre-approved to execute without prompting the security ledger. |
+| `always_deny_globs` | `string[]` | *destructive* | Glob patterns strictly blocked from execution across all modes. |
+| `max_turn_budget` | `integer` | `30` | Maximum autonomous turns before pausing for user input. |
+| `max_saved_sessions`| `integer` | `50` | Maximum session history records retained on disk. |
+| `mcp_servers` | `object` | `{}` | External Model Context Protocol servers configured via stdio JSON-RPC. |
+| `specialists` | `object` | *builtins* | Custom specialist subagent configurations with role, budget, and capabilities. |
+| `theme` | `string` | `"default"` | Active TUI theme (`default`, `gruvbox`, `dracula`, `nord`, `solarized-dark`, etc.). |
+| `mouse_support` | `boolean` | `true` | Enable/disable mouse clicking, scrolling, and accordion toggle in TUI. |
+
+**Environment variables**: `LAMBDA_BASE_URL` (or `OPENAI_BASE_URL`), `LAMBDA_MODEL`, `LAMBDA_API_KEY` (or `OPENAI_API_KEY`), `CONTEXT_LIMIT`, `LAMBDA_THEME`.
 
 ---
 
@@ -106,6 +174,40 @@ Once configured:
 - Open the Zed Assistant panel (`Ctrl+?` or `Cmd+?`).
 - Select **lambdA** as your active agent server.
 - The assistant streams thoughts, tool executions, and turn completions natively, displaying live plans, token usage telemetry, and session management.
+
+### Remote Development & SSH Permissions
+
+When connecting to a remote machine via Zed's Remote SSH, external ACP agents can encounter permission or path confinement errors if the remote working directory or permissions are not aligned:
+
+1. **Working Directory Alignment**:
+   Ensure Zed launches lambdA inside your target project directory rather than `$HOME`, preventing in-project files from being flagged as `outside_workspace`:
+   ```json
+   {
+     "agent_servers": {
+       "lambdA": {
+         "type": "custom",
+         "command": "bash",
+         "args": ["-c", "cd /path/to/project && exec lambda --acp"]
+       }
+     }
+   }
+   ```
+
+2. **Pre-Authorizing Permissions**:
+   If remote SSH client popups do not render or prompt modals are blocked by editor policy, pre-approve tool operations in your remote repository's `.lambda/config.json`:
+   ```json
+   {
+     "always_allow_globs": [
+       "read_file*",
+       "edit_file*",
+       "write_file*",
+       "list_directory*",
+       "grep_search*",
+       "git *"
+     ]
+   }
+   ```
+   This allows lambdA to execute file edits and safe tool inspections without waiting for round-trip UI modal confirmations over SSH.
 
 ---
 
