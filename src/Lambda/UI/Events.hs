@@ -118,14 +118,10 @@ handleAppEvent (AppEvent engineEv) = do
           case mStart of
             Just start -> do
               let elapsed = round (diffUTCTime now start) :: Int
-              if elapsed > 3
-                then do
-                  step <- gets uiSpinnerStep
-                  if step `mod` 12 == 0
-                    then modify $ \s -> s { uiSpinnerStep = (uiSpinnerStep s + 1) `mod` 120, uiElapsedSeconds = elapsed }
-                    else continueWithoutRedraw
-                else
-                  modify $ \s -> s { uiSpinnerStep = (uiSpinnerStep s + 1) `mod` 10, uiElapsedSeconds = elapsed }
+              modify $ \s -> s
+                { uiSpinnerStep = (uiSpinnerStep s + 1) `mod` 10
+                , uiElapsedSeconds = elapsed
+                }
             Nothing ->
               modify (spinnerStepL %~ (\x -> (x + 1) `mod` 10))
         else continueWithoutRedraw
