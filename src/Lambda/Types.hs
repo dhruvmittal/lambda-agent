@@ -266,6 +266,26 @@ data EngineEvent
   | EvDone
   | EvTick
 
+-- | Canonical Engine Lifecycle State
+data LifecycleState
+  = LifecycleIdle
+  | LifecycleWorking
+  | LifecycleBlocked !Text
+  deriving stock (Eq, Show, Generic)
+
+instance Aeson.ToJSON LifecycleState
+instance Aeson.FromJSON LifecycleState
+
+-- | Snapshot of engine lifecycle telemetry
+data TelemetrySnapshot = TelemetrySnapshot
+  { tsState        :: !LifecycleState
+  , tsSessionId    :: !(Maybe Text)
+  , tsSessionTitle :: !Text
+  } deriving stock (Eq, Show, Generic)
+
+instance Aeson.ToJSON TelemetrySnapshot
+instance Aeson.FromJSON TelemetrySnapshot
+
 -- | Frontend to Engine dispatch commands
 data FrontendCommand
   = CmdUserPrompt !Text

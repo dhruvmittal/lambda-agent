@@ -3,9 +3,11 @@
 module Main where
 
 import Control.Concurrent (threadDelay, forkIO)
-import Control.Concurrent.Async (mapConcurrently, race, async, wait, poll)
+import Control.Concurrent.Async (mapConcurrently, race, async, wait, poll, cancel)
 import Control.Concurrent.STM
 import Control.Monad (unless)
+import Data.Bits ((.|.))
+import System.Posix.Files (setFileMode, ownerReadMode, ownerWriteMode, ownerExecuteMode)
 import System.Timeout (timeout)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:?), (.:))
@@ -53,13 +55,15 @@ import Lambda.Engine.Session
   , SessionMeta(..)
   )
 import Lambda.Engine.State
-  ( initEngineState
+  ( AppEngineState(..)
+  , initEngineState
   , initEngineStateWithSession
   , addTurn
   , registerSubAgentTask
   , updateSubAgentTurns
   , resetEngineSession
   , restoreEngineSession
+  , readTelemetrySnapshot
   , appInterrupted
   , appStateVector
   , appSubAgents
@@ -72,6 +76,14 @@ import Lambda.Engine.State
   , appActiveModel
   , appContextLimit
   , appUndoStack
+  , appSecurity
+  , appActiveTask
+  )
+import Lambda.Engine.Telemetry
+  ( startTelemetryWatcher
+  , stopTelemetryWatcher
+  , sanitizeHerdrMessage
+  , formatOscTitle
   )
 import Lambda.Engine.SubAgent (submitReportTool, filterSubAgentRegistry, subAgentLoop, runEphemeralSubAgent, resumeEphemeralSubAgent, spawnSpecialistSubAgentTool, resumeSpecialistSubAgentTool, formatSpecialistCatalog, SubAgentSpec(..), SubAgentReport(..))
 import qualified Data.Map.Strict as Map
@@ -196,6 +208,7 @@ main = do
   testOpenCodeAgentCompatibilityAndSynthesis
   testHaskellArchitectHardeningAndDriverDecoupling
   testAcpStopCancellationAndToolFormatting
+  testTelemetryAndHerdrIntegration
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -3807,6 +3820,159 @@ testAcpStopCancellationAndToolFormatting = do
   assert "synthesizeTurnSummary preserves prior context from previous compactions"
     ("Prior Context:" `T.isInfixOf` multiCompactedSummary && "Initial Setup" `T.isInfixOf` multiCompactedSummary)
   putStrLn "  -> OK: ToolCall argument token scaling and multi-compaction context retention verified."
+
+-- 73. Telemetry State Derivation, OSC Formatting, Herdr CLI Lossy Conflation & Permission Prompt Cleanup
+testTelemetryAndHerdrIntegration :: IO ()
+testTelemetryAndHerdrIntegration = do
+  putStrLn "\n[Test 73] Lifecycle Telemetry, Herdr Integration & Permission Invariants"
+
+  -- 1. Verify Message Sanitization and OSC Title Formatting
+  let rawMsg = "Dangerous\nLine 1\r\nLine 2\ESC[31m\a"
+      cleanMsg = sanitizeHerdrMessage rawMsg
+  assert "sanitizeHerdrMessage strips newlines and control characters"
+    (cleanMsg == "Dangerous Line 1 Line 2[31m")
+
+  let longMsg = T.replicate 200 "x"
+      truncMsg = sanitizeHerdrMessage longMsg
+  assert "sanitizeHerdrMessage truncates to 120 chars max"
+    (T.length truncMsg == 120)
+
+  assert "formatOscTitle idle" (formatOscTitle LifecycleIdle "" == "λ (idle)")
+  assert "formatOscTitle working" (formatOscTitle LifecycleWorking "Building" == "⠋ lambdA · Building")
+  assert "formatOscTitle blocked" (formatOscTitle (LifecycleBlocked "Grant bash") "Building" == "▲ lambdA [blocked: Grant bash] · Building")
+  putStrLn "  -> OK: Message sanitization and OSC title formatting verified."
+
+  -- 2. Verify LifecycleState Derivation & Multi-Prompt Stacking/Unstacking in STM
+  cfg <- loadConfig "."
+  secState <- initSecurity [] []
+  appState <- initEngineState cfg emptyRegistry secState
+  
+  snap0 <- atomically $ readTelemetrySnapshot appState
+  prompts0 <- atomically $ readTVar (activePrompts secState)
+  assert "Initial state is LifecycleIdle" (tsState snap0 == LifecycleIdle)
+  assert "Initial pending prompts count is 0" (Map.null prompts0)
+
+  -- Mark active task
+  atomically $ writeTVar (appActiveTask appState) True
+  snap1 <- atomically $ readTelemetrySnapshot appState
+  prompts1 <- atomically $ readTVar (activePrompts secState)
+  assert "Active task state is LifecycleWorking" (tsState snap1 == LifecycleWorking)
+  assert "Working pending prompts count is 0" (Map.null prompts1)
+
+  -- Insert first blocked prompt (ID 1)
+  atomically $ modifyTVar' (activePrompts secState) (Map.insert 1 "Prompt 1: Write file foo.hs")
+  snap2 <- atomically $ readTelemetrySnapshot appState
+  prompts2 <- atomically $ readTVar (activePrompts secState)
+  assert "Blocked state reflects prompt 1" (tsState snap2 == LifecycleBlocked "Prompt 1: Write file foo.hs")
+  assert "Pending prompts count is 1" (Map.size prompts2 == 1)
+
+  -- Insert second blocked prompt (ID 2)
+  atomically $ modifyTVar' (activePrompts secState) (Map.insert 2 "Prompt 2: Execute bash rm")
+  snap3 <- atomically $ readTelemetrySnapshot appState
+  prompts3 <- atomically $ readTVar (activePrompts secState)
+  -- Map is keyed by Int, findMin returns lowest ID (prompt 1) as head
+  assert "Stacked prompt head is still prompt 1" (tsState snap3 == LifecycleBlocked "Prompt 1: Write file foo.hs")
+  assert "Pending prompts count is 2" (Map.size prompts3 == 2)
+
+  -- Unstack prompt 1
+  atomically $ modifyTVar' (activePrompts secState) (Map.delete 1)
+  snap4 <- atomically $ readTelemetrySnapshot appState
+  prompts4 <- atomically $ readTVar (activePrompts secState)
+  assert "Unstacked head switches to prompt 2" (tsState snap4 == LifecycleBlocked "Prompt 2: Execute bash rm")
+  assert "Pending prompts count is 1" (Map.size prompts4 == 1)
+
+  -- Unstack prompt 2
+  atomically $ modifyTVar' (activePrompts secState) (Map.delete 2)
+  snap5 <- atomically $ readTelemetrySnapshot appState
+  prompts5 <- atomically $ readTVar (activePrompts secState)
+  assert "Returning from blocked resumes LifecycleWorking" (tsState snap5 == LifecycleWorking)
+  assert "Pending prompts count is 0" (Map.null prompts5)
+
+  -- Complete active task
+  atomically $ writeTVar (appActiveTask appState) False
+  snap6 <- atomically $ readTelemetrySnapshot appState
+  assert "Task complete returns to LifecycleIdle" (tsState snap6 == LifecycleIdle)
+  putStrLn "  -> OK: LifecycleState derivation, multi-prompt stacking and unstacking verified."
+
+  -- 3. Verify Security Prompt Cancellation cleans activePrompts and calls onPromptResolved
+  resolvedRecords <- newIORef ([] :: [(Int, PermissionLevel)])
+  let testOnResolved pId lvl = modifyIORef' resolvedRecords ((pId, lvl) :)
+  secStateCustom <- initSecurity [] []
+  let secStateInstrumented = secStateCustom { onPromptResolved = testOnResolved }
+  
+  -- Simulate checkAuthorization blocked on user confirmation
+  authAsync <- async $ checkAuthorization secStateInstrumented MainAgent "write_file" (Aeson.object ["path" .= ("secret.txt" :: Text)]) Nothing
+  -- Wait until prompt is queued in activePrompts
+  let waitPromptRegistered = do
+        prompts <- atomically $ readTVar (activePrompts secStateInstrumented)
+        if Map.null prompts
+          then threadDelay 10000 >> waitPromptRegistered
+          else pure ()
+  waitPromptRegistered
+  
+  promptsBefore <- atomically $ readTVar (activePrompts secStateInstrumented)
+  assert "checkAuthorization registers prompt in activePrompts" (Map.size promptsBefore == 1)
+  let [(pId, promptDesc)] = Map.toList promptsBefore
+  assert "Prompt desc contains tool name" ("write_file" `T.isInfixOf` promptDesc)
+
+  -- Cancel the thread (simulating user Ctrl+C or ACP cancel)
+  cancel authAsync
+  -- Wait briefly for finally block to execute
+  threadDelay 50000
+
+  promptsAfter <- atomically $ readTVar (activePrompts secStateInstrumented)
+  assert "activePrompts is drained on cancellation" (Map.null promptsAfter)
+  recs <- readIORef resolvedRecords
+  assert "onPromptResolved was triggered with PermDeny on cancellation"
+    (recs == [(pId, PermDeny)])
+  putStrLn "  -> OK: Permission prompt cancellation bracket and activePrompts cleanup verified."
+
+  -- 4. Verify Herdr Telemetry Watcher Conflation, Subprocess Execution & Release
+  let tmpMockScript = "test/mock-herdr.sh"
+      tmpLogFile = "test/mock-herdr.log"
+  _ <- doesFileExist tmpLogFile >>= \exists -> if exists then removeFile tmpLogFile else pure ()
+  TIO.writeFile tmpMockScript "#!/bin/sh\necho \"$@\" >> \"$MOCK_HERDR_LOG\"\n"
+  setFileMode tmpMockScript (ownerReadMode .|. ownerWriteMode .|. ownerExecuteMode)
+
+  setEnv "HERDR_ENV" "1"
+  setEnv "HERDR_PANE_ID" "pane-lambdA-99"
+  setEnv "HERDR_BIN_PATH" tmpMockScript
+  setEnv "MOCK_HERDR_LOG" tmpLogFile
+
+  watcherApp <- initEngineState cfg emptyRegistry secState
+  watcherHandle <- startTelemetryWatcher watcherApp
+
+  -- Initial state is LifecycleIdle -> watcher should invoke report-agent
+  threadDelay 150000
+  
+  -- Trigger fast state transitions to test conflation
+  atomically $ writeTVar (appActiveTask watcherApp) True
+  threadDelay 20000
+  atomically $ modifyTVar' (activePrompts secState) (Map.insert 10 "Blocked on confirm")
+  threadDelay 200000
+
+  -- Stop telemetry watcher (must emit release-agent)
+  stopTelemetryWatcher watcherHandle
+  threadDelay 100000
+
+  logContent <- TIO.readFile tmpLogFile
+  let logLines = lines (T.unpack logContent)
+  
+  assert "Herdr reported initial idle state"
+    (any (\l -> "report-agent" `T.isInfixOf` T.pack l && "--state idle" `T.isInfixOf` T.pack l) logLines)
+  assert "Herdr reported blocked state with pane id and message"
+    (any (\l -> "report-agent" `T.isInfixOf` T.pack l && "--state blocked" `T.isInfixOf` T.pack l && "--message Blocked on confirm" `T.isInfixOf` T.pack l) logLines)
+  assert "Herdr released agent on watcher shutdown"
+    (any (\l -> "release-agent" `T.isInfixOf` T.pack l && "pane-lambdA-99" `T.isInfixOf` T.pack l) logLines)
+
+  -- Cleanup
+  unsetEnv "HERDR_ENV"
+  unsetEnv "HERDR_PANE_ID"
+  unsetEnv "HERDR_BIN_PATH"
+  unsetEnv "MOCK_HERDR_LOG"
+  removeFile tmpMockScript
+  removeFile tmpLogFile
+  putStrLn "  -> OK: Herdr CLI lossy conflation, subprocess execution, and release-agent teardown verified."
 
 assert :: String -> Bool -> IO ()
 assert desc condition =

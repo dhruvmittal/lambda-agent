@@ -91,7 +91,14 @@ handleAppEvent (AppEvent engineEv) = do
       case uiCurrentPrompt s of
         Nothing -> s { uiCurrentPrompt = Just prompt }
         Just _  -> s { uiPendingPrompts = uiPendingPrompts s |> prompt }
-    EvPermissionResolved _ _ -> pure ()
+    EvPermissionResolved pId _ -> modify $ \s ->
+      let filteredPending = Seq.filter (\p -> promptId p /= pId) (uiPendingPrompts s)
+      in case uiCurrentPrompt s of
+           Just cur | promptId cur == pId ->
+             case filteredPending of
+               nextP :<| rest -> s { uiCurrentPrompt = Just nextP, uiPendingPrompts = rest }
+               Seq.Empty      -> s { uiCurrentPrompt = Nothing, uiPendingPrompts = Seq.Empty }
+           _ -> s { uiPendingPrompts = filteredPending }
     EvModelSwitched newModel newLimit -> do
       modify ((modelNameL .~ newModel) . (contextLimitL .~ newLimit))
       vScrollToEnd (viewportScroll ChatView)

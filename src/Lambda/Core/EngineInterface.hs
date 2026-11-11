@@ -34,6 +34,7 @@ import Lambda.Engine.SubAgent (spawnSpecialistSubAgentTool, resumeSpecialistSubA
 import Lambda.Provider.Builtin (builtinToolsWithManager)
 import Lambda.Provider.Mcp (McpClient, startAndLoadMcpServers, stopMcpClient)
 import Lambda.Driver.OpenAI (openAiDynamicDriver)
+import Lambda.Engine.Telemetry (TelemetryHandle, startTelemetryWatcher, stopTelemetryWatcher)
 import Lambda.Types
 
 data EngineChannels = EngineChannels
@@ -68,6 +69,7 @@ data EngineRuntime = EngineRuntime
   , erWorkerAsync :: !(Async ())
   , erPromptAsync :: !(Async ())
   , erMcpClients  :: ![McpClient]
+  , erTelemetry   :: !TelemetryHandle
   }
 
 -- | Bootstraps and starts a complete autonomous engine runtime with background tasks
@@ -90,23 +92,36 @@ startEngineRuntime cfg maybeSess mOverrideDriver = do
   atomically $ writeTVar (appToolRegistry engineState) fullRegistry
 
   channels <- initEngineChannels (appEventQueue engineState)
+
+  -- Wire prompt resolution notification from SecurityState to EngineEvent queue
+  let secWithNotify = (appSecurity engineState)
+        { onPromptResolved = \pId lvl ->
+            emitEngineEvent engineState (EvPermissionResolved pId lvl)
+        }
+  -- Update appSecurity reference in engineState
+  let engineStateWithSec = engineState { appSecurity = secWithNotify }
+
+  telemetryHdl <- startTelemetryWatcher engineStateWithSec
+
   activeTaskVar <- newTVarIO Nothing
-  workerAsync <- async $ engineWorkerLoop engineState driver channels activeTaskVar
+  workerAsync <- async $ engineWorkerLoop engineStateWithSec driver channels activeTaskVar
   promptAsync <- async $ forever $ do
-    prompt <- atomically $ readTBQueue (uiPromptQueue (appSecurity engineState))
-    emitEngineEvent engineState (EvPermissionRequired prompt)
+    prompt <- atomically $ readTBQueue (uiPromptQueue (appSecurity engineStateWithSec))
+    emitEngineEvent engineStateWithSec (EvPermissionRequired prompt)
 
   pure EngineRuntime
-    { erEngineState = engineState
+    { erEngineState = engineStateWithSec
     , erChannels    = channels
     , erWorkerAsync = workerAsync
     , erPromptAsync = promptAsync
     , erMcpClients  = mcpClients
+    , erTelemetry   = telemetryHdl
     }
 
 -- | Safely shuts down background workers and spawned MCP server child processes
 stopEngineRuntime :: EngineRuntime -> IO ()
 stopEngineRuntime EngineRuntime{..} = do
+  stopTelemetryWatcher erTelemetry
   cancel erWorkerAsync
   cancel erPromptAsync
   mapM_ stopMcpClient erMcpClients
@@ -298,6 +313,7 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       -- 2. Run agent conversation loop in async task so cmdQueue remains responsive
       let maxBudget = max 1 (maxTurnBudget appConfig)
       turnTask <- async $ (`finally` cleanupTurn) $ do
+        atomically $ writeTVar appActiveTask True
         turnRes <- try $ runAgentTurnLoop engineState driver channels 1 maxBudget
         case turnRes of
           Left (ex :: SomeException) -> do
@@ -307,6 +323,7 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
           Right () -> pure ()
 
         atomically $ do
+          writeTVar appActiveTask False
           curVec <- readTVar appStateVector
           let updatedVec = T.unlines $ map (\l -> if "BLOCKED_ON:" `T.isPrefixOf` l then "BLOCKED_ON: User input" else l) (T.lines curVec)
           writeTVar appStateVector updatedVec
@@ -319,7 +336,9 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       atomically $ writeTVar activeTaskVar (Just turnTask)
       engineWorkerLoop engineState driver channels activeTaskVar
   where
-    cleanupTurn = atomically $ writeTVar activeTaskVar Nothing
+    cleanupTurn = atomically $ do
+      writeTVar activeTaskVar Nothing
+      writeTVar appActiveTask False
 
 runAgentTurnLoop
   :: AppEngineState

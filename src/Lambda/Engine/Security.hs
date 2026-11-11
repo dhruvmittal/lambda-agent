@@ -12,8 +12,12 @@ module Lambda.Engine.Security
   ) where
 
 import Control.Concurrent.STM
+import Control.Exception (finally)
+import Control.Monad (unless)
 import qualified Data.Aeson as Aeson
 import Data.List (isSuffixOf)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -32,6 +36,8 @@ data SecurityState = SecurityState
   , sessionDenyList       :: !(TVar (Set Text))
   , uiPromptQueue         :: !(TBQueue PermissionPrompt)
   , promptCounter         :: !(TVar Int)
+  , activePrompts         :: !(TVar (Map Int Text))
+  , onPromptResolved      :: !(Int -> PermissionLevel -> IO ())
   }
 
 -- | Compile a security glob, supporting both single-level wildcard and recursive slash-traversal
@@ -67,6 +73,7 @@ initSecurityWithRoot wsRoot allowList denyList = do
   sDeny  <- newTVarIO Set.empty
   queue  <- newTBQueueIO 64
   pCount <- newTVarIO 1
+  aPrompts <- newTVarIO Map.empty
   let cAllow = concatMap compileSecurityGlob allowList
       cDeny  = concatMap compileSecurityGlob denyList
   tAllowPats <- newTVarIO allowList
@@ -81,6 +88,8 @@ initSecurityWithRoot wsRoot allowList denyList = do
     , sessionDenyList       = sDeny
     , uiPromptQueue         = queue
     , promptCounter         = pCount
+    , activePrompts         = aPrompts
+    , onPromptResolved      = \_ _ -> pure ()
     }
 
 initSecurity :: [String] -> [String] -> IO SecurityState
@@ -112,15 +121,22 @@ checkAuthorization SecurityState{..} caller cmd payload mToolCallId = do
               else do
                 -- Step 4: Bubble interactive prompt to TUI
                 let proposedGlob = T.pack (deriveSecurityGlob cmd)
-                (_reqId, replyVar) <- atomically $ do
+                (rId, replyVar) <- atomically $ do
                   rId <- readTVar promptCounter
                   writeTVar promptCounter (rId + 1)
                   reply <- newEmptyTMVar
                   let req = PermissionPrompt rId caller cmd payload proposedGlob reply mToolCallId
                   writeTBQueue uiPromptQueue req
+                  modifyTVar' activePrompts (Map.insert rId cmd)
                   pure (rId, reply)
 
-                choice <- atomically $ takeTMVar replyVar
+                let cleanupPrompt = do
+                      atomically $ modifyTVar' activePrompts (Map.delete rId)
+                      wasResolved <- atomically $ not <$> isEmptyTMVar replyVar
+                      unless wasResolved $
+                        onPromptResolved rId PermDeny
+
+                choice <- (`finally` cleanupPrompt) $ atomically $ takeTMVar replyVar
                 case choice of
                   PermAlways -> do
                     let globStr = T.unpack proposedGlob
@@ -151,15 +167,22 @@ requestGrantApproval SecurityState{..} sId hypothesis requestedGlobs = do
         ]
       proposedGlob = T.intercalate ", " requestedGlobs
 
-  (_reqId, replyVar) <- atomically $ do
+  (rId, replyVar) <- atomically $ do
     rId <- readTVar promptCounter
     writeTVar promptCounter (rId + 1)
     reply <- newEmptyTMVar
     let req = PermissionPrompt rId (SubAgentId sId hypothesis) grantDesc payload proposedGlob reply Nothing
     writeTBQueue uiPromptQueue req
+    modifyTVar' activePrompts (Map.insert rId grantDesc)
     pure (rId, reply)
 
-  choice <- atomically $ takeTMVar replyVar
+  let cleanupGrant = do
+        atomically $ modifyTVar' activePrompts (Map.delete rId)
+        wasResolved <- atomically $ not <$> isEmptyTMVar replyVar
+        unless wasResolved $
+          onPromptResolved rId PermDeny
+
+  choice <- (`finally` cleanupGrant) $ atomically $ takeTMVar replyVar
   case choice of
     PermAlways -> do
       mapM_ (persistAllowGlob securityWorkspaceRoot . T.unpack) requestedGlobs

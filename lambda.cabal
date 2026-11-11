@@ -51,6 +51,7 @@ library
         Lambda.UI.Events
         Lambda.UI.Completion
         Lambda.UI.Theme
+        Lambda.Engine.Telemetry
         Lambda.Server.Acp.Types
         Lambda.Server.Acp
     build-depends:
@@ -63,6 +64,7 @@ library
         unordered-containers,
         stm,
         async,
+        process,
         typed-process,
         http-client,
         http-client-tls,
@@ -132,4 +134,5 @@ test-suite lambda-test
         http-client,
         http-client-tls,
         skylighting,
+        unix,
         skylighting-core

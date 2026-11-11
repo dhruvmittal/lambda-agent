@@ -17,6 +17,7 @@ module Lambda.Engine.State
   , persistCurrentSession
   , resetEngineSession
   , restoreEngineSession
+  , readTelemetrySnapshot
   ) where
 
 import Control.Concurrent.STM
@@ -24,12 +25,14 @@ import Control.Monad (unless)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
+import qualified Data.Text as T
 import Data.Time.Clock (getCurrentTime)
+import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 
 import Lambda.Config (Config(..))
 import Lambda.Core.ToolProvider (ToolRegistry)
-import Lambda.Engine.Security (SecurityState)
+import Lambda.Engine.Security (SecurityState(..))
 import Lambda.Engine.Session
   ( Session(..)
   , deriveTitle
@@ -55,6 +58,7 @@ data AppEngineState = AppEngineState
   , appSession      :: !(TVar Session)
   , appSessionDir   :: !FilePath
   , appUndoStack    :: !(TVar [[Turn]])
+  , appActiveTask   :: !(TVar Bool)
   }
 
 initEngineState :: Config -> ToolRegistry -> SecurityState -> IO AppEngineState
@@ -88,6 +92,7 @@ initEngineStateWithSession cfg reg sec maybeSess = do
   undoVar   <- newTVarIO []
   activeModVar <- newTVarIO (modelName cfg)
   ctxLimitVar  <- newTVarIO (contextWindowLimit cfg)
+  activeTask   <- newTVarIO False
   pure AppEngineState
     { appConfig       = cfg
     , appActiveModel  = activeModVar
@@ -105,7 +110,23 @@ initEngineStateWithSession cfg reg sec maybeSess = do
     , appSession      = sessVar
     , appSessionDir   = sessDir
     , appUndoStack    = undoVar
+    , appActiveTask   = activeTask
     }
+
+-- | Derives the current canonical lifecycle state and telemetry snapshot in STM
+readTelemetrySnapshot :: AppEngineState -> STM TelemetrySnapshot
+readTelemetrySnapshot AppEngineState{..} = do
+  prompts <- readTVar (activePrompts appSecurity)
+  isWorking <- readTVar appActiveTask
+  sess <- readTVar appSession
+  let state = case Map.lookupMin prompts of
+        Just (_, promptDesc) -> LifecycleBlocked promptDesc
+        Nothing
+          | isWorking -> LifecycleWorking
+          | otherwise -> LifecycleIdle
+      sid = sessionId sess
+      title = sessionTitle sess
+  pure $ TelemetrySnapshot state (Just sid) title
 
 addTurn :: AppEngineState -> Role -> [ContentBlock] -> IO Turn
 addTurn AppEngineState{..} role blocks = atomically $ do
