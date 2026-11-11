@@ -225,7 +225,7 @@ testThinkingEviction = do
         [ ThinkingBlock 2 "Turn 3 active thinking." Visible
         , TextBlock "Active answer 3."
         ]
-      sanitized = sanitizeForApiPayload [turn1, turn2, turn3]
+      SanitizedTurns sanitized = sanitizeForApiPayload [turn1, turn2, turn3]
 
   -- Turn 1 should have NO thinking block
   let t1Blocks = turnBlocks (head sanitized)
@@ -321,8 +321,8 @@ testSecurityGlobMatching = do
 testModeFiltering :: IO ()
 testModeFiltering = do
   putStrLn "\n[Test 5] Dual-Gate Mode Safety (/plan vs /exec)"
-  let readTool = ToolDefinition "read_file" "Read file" (Aeson.object []) ReadOnly False (\_ _ -> pure (ToolResult "" "" "" Nothing))
-      destTool = ToolDefinition "write_file" "Write file" (Aeson.object []) Destructive False (\_ _ -> pure (ToolResult "" "" "" Nothing))
+  let readTool = ToolDefinition "read_file" "Read file" (Aeson.object []) ReadOnly False (\_ _ -> pure (ToolResult "" "" "" Nothing)) Universal
+      destTool = ToolDefinition "write_file" "Write file" (Aeson.object []) Destructive False (\_ _ -> pure (ToolResult "" "" "" Nothing)) Universal
       reg = registerTools [readTool, destTool] emptyRegistry
 
   let planSchemas = toolsToOpenAISchema PlanMode reg
@@ -752,7 +752,7 @@ testDepth1StarGraphSchemaExclusion :: IO ()
 testDepth1StarGraphSchemaExclusion = do
   putStrLn "\n[Test 21] Depth-1 Star Graph Invariant"
   repVar <- newTVarIO Nothing
-  let dummyTool name = ToolDefinition name "desc" (Aeson.object []) ReadOnly False (\_ _ -> pure (ToolResult "" "" "" Nothing))
+  let dummyTool name = ToolDefinition name "desc" (Aeson.object []) ReadOnly False (\_ _ -> pure (ToolResult "" "" "" Nothing)) (if "spawn_" `T.isPrefixOf` name || "resume_" `T.isPrefixOf` name then RootOnly else Universal)
       baseReg = registerTools
         [ dummyTool "spawn_specialist_subagent"
         , dummyTool "spawn_diagnostic_subagent"
@@ -816,7 +816,7 @@ testDynamicPermissionEscalation = do
   sec <- initSecurity [] []
   cfg <- loadConfig "."
   let dummyBashTool = ToolDefinition "bash" "Run bash" (Aeson.object []) Destructive False
-        (\_ _ -> pure (ToolResult "call_1" "Command executed successfully" "" Nothing))
+        (\_ _ -> pure (ToolResult "call_1" "Command executed successfully" "" Nothing)) Universal
       reg = registerTool dummyBashTool emptyRegistry
   es <- initEngineState cfg reg sec
 
@@ -2883,6 +2883,7 @@ testLazyMcpGatewayAndModeEnforcement = do
         , toolParameters  = Aeson.object ["type" .= ("object" :: Text)]
         , toolCapability  = ReadOnly
         , toolIsMcp       = True
+        , toolScope       = Universal
         , toolExecute     = \_ _ -> pure (ToolResult "call_read" "symbols: [foo, bar]" "" Nothing)
         }
       mutateMcpTool = ToolDefinition
@@ -2891,6 +2892,7 @@ testLazyMcpGatewayAndModeEnforcement = do
         , toolParameters  = Aeson.object ["type" .= ("object" :: Text)]
         , toolCapability  = Destructive
         , toolIsMcp       = True
+        , toolScope       = Universal
         , toolExecute     = \_ _ -> pure (ToolResult "call_mut" "memory node updated" "" Nothing)
         }
       baseReg = registerTools [readMcpTool, mutateMcpTool, callMcpToolDefinition] emptyRegistry

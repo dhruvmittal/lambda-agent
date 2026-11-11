@@ -35,7 +35,8 @@ import Control.Applicative ((<|>))
 import Control.Exception (catch, IOException)
 import Control.Monad (forM)
 import Data.Char (isSpace)
-import Data.List (nub, isPrefixOf)
+import Data.Containers.ListUtils (nubOrd)
+import Data.List (foldl', isPrefixOf)
 import Data.Maybe (fromMaybe)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:?), (.!=))
@@ -506,7 +507,7 @@ parseMarkdownAgent rawContent =
                                                _ -> st
                           _ -> st
 
-             finalSt = foldl step defaultScannerState fmLines
+             finalSt = foldl' step defaultScannerState fmLines
          in if fmHidden finalSt
               then Nothing
               else
@@ -514,14 +515,14 @@ parseMarkdownAgent rawContent =
                     allowed = fmAllowGlobs finalSt
                     denied = fmDenyGlobs finalSt
                     effectiveCaps
-                      | not (null explicitCaps) = nub explicitCaps
+                      | not (null explicitCaps) = nubOrd explicitCaps
                       | otherwise =
                           let base = if fmWildDeny finalSt then [] else defaultOpenCodeCapabilities
                               deniedWithBash = if fmBashSpecific finalSt && "bash*" `notElem` allowed
                                                  then "bash*" : denied
                                                  else denied
                               filteredBase = filter (`notElem` deniedWithBash) base
-                          in nub (filteredBase ++ allowed)
+                          in nubOrd (filteredBase ++ allowed)
                     fallbackDesc = case filter (not . T.null . T.strip) (T.lines rawBody) of
                       (l:_) -> T.take 80 (T.dropWhile (\c -> c == '#' || isSpace c) l)
                       []    -> "Custom specialist subagent"
@@ -535,7 +536,7 @@ parseMarkdownAgent rawContent =
                      , specialistPrompt       = effectivePrompt
                      , specialistBudget       = fmBudget finalSt
                      , specialistCapabilities = effectiveCaps
-                     , specialistDenyGlobs    = nub (fmCmdDenyGlobs finalSt)
+                     , specialistDenyGlobs    = nubOrd (fmCmdDenyGlobs finalSt)
                      , specialistModel        = fmModel finalSt
                      }
 

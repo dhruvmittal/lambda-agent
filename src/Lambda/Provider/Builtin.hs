@@ -80,6 +80,7 @@ callMcpToolDefinition = ToolDefinition
   , toolCapability = ReadOnly
   , toolIsMcp = False
   , toolExecute = \_ _ -> pure (ToolResult "" "" "call_mcp_tool dispatched via engine" Nothing)
+  , toolScope = Universal
   }
 
 -- | Bash execution tool with timeout and OOB artifact spooling
@@ -103,6 +104,7 @@ bashTool wsRoot artDir = ToolDefinition
       ]
   , toolCapability = Destructive
   , toolIsMcp = False
+  , toolScope = Universal
   , toolExecute = \_caller args -> do
       case parseEither (Aeson.withObject "bash" $ \o -> (,) <$> o .: "command" <*> (o .:? "timeout_seconds")) args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
@@ -232,6 +234,7 @@ listDirectoryTool wsRoot = ToolDefinition
       ]
   , toolCapability = ReadOnly
   , toolIsMcp = False
+  , toolScope = Universal
   , toolExecute = \_caller args -> do
       let parseArgs = Aeson.withObject "list_directory" $ \o -> do
             p <- o .:? "path" .!= "."
@@ -276,6 +279,7 @@ readFileTool wsRoot = ToolDefinition
       ]
   , toolCapability = ReadOnly
   , toolIsMcp = False
+  , toolScope = Universal
   , toolExecute = \caller args -> do
       let parseArgs = Aeson.withObject "read_file" $ \o -> do
             p <- o .: "path"
@@ -331,6 +335,7 @@ writeFileTool wsRoot = ToolDefinition
       ]
   , toolCapability = Destructive
   , toolIsMcp = False
+  , toolScope = Universal
   , toolExecute = \_caller args -> do
       let parseArgs = Aeson.withObject "write_file" $ \o -> do
             p <- o .: "path"
@@ -370,6 +375,7 @@ editFileTool wsRoot = ToolDefinition
       ]
   , toolCapability = Destructive
   , toolIsMcp = False
+  , toolScope = Universal
   , toolExecute = \_caller args -> do
       let parseArgs = Aeson.withObject "edit_file" $ \o -> do
             p <- o .: "path"
@@ -463,6 +469,7 @@ fetchUrlToolWithManager mMgr artDir = ToolDefinition
       ]
   , toolCapability = ReadOnly
   , toolIsMcp = False
+  , toolScope = Universal
   , toolExecute = \_caller args -> do
       case parseEither (Aeson.withObject "fetch_url" (.: "url")) args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing

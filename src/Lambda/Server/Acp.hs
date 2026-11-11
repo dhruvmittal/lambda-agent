@@ -18,7 +18,7 @@ module Lambda.Server.Acp
   , broadcastUsageUpdate
   ) where
 
-import Control.Concurrent (forkIO)
+import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch, try, finally)
@@ -50,7 +50,7 @@ import System.IO
   , isEOF
   )
 
-import Data.List (nub)
+import Data.Containers.ListUtils (nubOrd)
 
 import Lambda.Config (Config(..), loadConfig, curatedModels, lookupModelContextLimitWithConfig, isOpenRouterEndpoint)
 import Lambda.Driver.OpenAI (fetchEndpointModels)
@@ -83,6 +83,7 @@ data AcpServerState = AcpServerState
   , acpNextRpcId          :: !(TVar Int)
   , acpPendingClientRpc   :: !(TVar (Map Int (TMVar (Either Aeson.Value Aeson.Value))))
   , acpActiveSubAgentCallId :: !(TVar (Maybe Text))
+  , acpForwarderThread    :: !(TVar (Maybe ThreadId))
   }
 
 initAcpServerState :: Config -> IO AcpServerState
@@ -108,11 +109,12 @@ initAcpServerStateWithSink cfg sink = do
   rpcIdVar  <- newTVarIO 1000
   rpcMapVar <- newTVarIO Map.empty
   subCallIdVar <- newTVarIO Nothing
+  fwdThreadVar <- newTVarIO Nothing
   -- Asynchronously discover models from endpoint if configured
   _ <- forkIO $ do
     detected <- fetchEndpointModels cfg
     unless (null detected) $ atomically $ modifyTVar' cfgVar $ \c ->
-      c { configuredModels = nub (configuredModels c ++ detected) }
+      c { configuredModels = nubOrd (configuredModels c ++ detected) }
   pure $ AcpServerState
     { acpConfig             = cfgVar
     , acpActiveRuntime      = rtVar
@@ -128,6 +130,7 @@ initAcpServerStateWithSink cfg sink = do
     , acpNextRpcId          = rpcIdVar
     , acpPendingClientRpc   = rpcMapVar
     , acpActiveSubAgentCallId = subCallIdVar
+    , acpForwarderThread    = fwdThreadVar
     }
 
 -- | Sends a JSON-RPC 2.0 response to the configured output sink
@@ -501,7 +504,13 @@ startAcpSessionWithSession state mCwd maybeSess = do
   cfg <- loadConfig effectiveRoot
   atomically $ writeTVar (acpConfig state) cfg
 
-  -- Stop any previous runtime before bootstrapping the new session
+  -- Stop any previous runtime and forwarder thread before bootstrapping the new session
+  mPrevFwd <- readTVarIO (acpForwarderThread state)
+  case mPrevFwd of
+    Just tid -> killThread tid
+    Nothing  -> pure ()
+  atomically $ writeTVar (acpForwarderThread state) Nothing
+
   mPrevRuntime <- readTVarIO (acpActiveRuntime state)
   case mPrevRuntime of
     Just prevRt -> stopEngineRuntime prevRt
@@ -522,7 +531,8 @@ startAcpSessionWithSession state mCwd maybeSess = do
     writeTVar (acpActiveSessionId state) sId
 
   -- Forward engine events to ACP session/update
-  _ <- forkIO $ forwardEngineEvents state channels sId
+  fwdTid <- forkIO $ forwardEngineEvents state channels sId
+  atomically $ writeTVar (acpForwarderThread state) (Just fwdTid)
 
   -- 7. Broadcast available commands update, mode, config options, and initial title
   sendSessionUpdate state sId $ AcpAvailableCommandsUpdate acpStandardCommands

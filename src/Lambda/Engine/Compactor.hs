@@ -2,7 +2,8 @@
 {-# LANGUAGE RecordWildCards #-}
 
 module Lambda.Engine.Compactor
-  ( sanitizeForApiPayload
+  ( SanitizedTurns(..)
+  , sanitizeForApiPayload
   , pruneHistoricalThinking
   , turnsToOpenAIPayload
   , isThinkingBlock
@@ -60,16 +61,20 @@ defaultAgentSystemPrompt = T.unlines
   , "   - Never use `fetch_url` for local files or `file://` links; `fetch_url` is exclusively for remote HTTP/HTTPS endpoints."
   ]
 
+-- | Opaque wrapper guaranteeing that historical reasoning blocks have been pruned before egress.
+newtype SanitizedTurns = SanitizedTurns { unSanitizedTurns :: [Turn] }
+  deriving (Eq, Show)
+
 -- | Strips raw internal reasoning blocks from previous turns before remote API wire egress.
 -- Current active turn keeps reasoning so the model maintains its local deduction scratchpad.
-sanitizeForApiPayload :: [Turn] -> [Turn]
-sanitizeForApiPayload [] = []
+sanitizeForApiPayload :: [Turn] -> SanitizedTurns
+sanitizeForApiPayload [] = SanitizedTurns []
 sanitizeForApiPayload turns =
   let total = length turns
       sanitizeTurn idx turn
         | idx == total - 1 = turn
         | otherwise        = pruneHistoricalThinking turn
-  in zipWith sanitizeTurn [0..] turns
+  in SanitizedTurns (zipWith sanitizeTurn [0..] turns)
 
 pruneHistoricalThinking :: Turn -> Turn
 pruneHistoricalThinking turn =
@@ -85,7 +90,7 @@ isThinkingBlock _                  = False
 -- Correctly generates native assistant `tool_calls` and `tool` role responses!
 turnsToOpenAIPayload :: [Turn] -> [Aeson.Value]
 turnsToOpenAIPayload turns =
-  let sanitized = sanitizeForApiPayload turns
+  let SanitizedTurns sanitized = sanitizeForApiPayload turns
       isUiBanner (Turn _ SystemRole blks) =
         let txt = T.concat [ t | TextBlock t <- blks ]
         in "lambdA initialized." `T.isPrefixOf` txt

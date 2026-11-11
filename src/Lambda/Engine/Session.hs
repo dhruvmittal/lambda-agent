@@ -28,6 +28,7 @@ module Lambda.Engine.Session
 import Control.Monad (forM, forM_, void, when)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?))
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.List (isSuffixOf, sortOn)
 import Data.Map.Strict (Map)
@@ -209,8 +210,8 @@ loadSession sessionsDir sid = do
   if not exists
     then pure $ Left $ "Session file not found: " <> T.pack path
     else do
-      content <- BL.readFile path
-      case Aeson.eitherDecode content of
+      content <- BS.readFile path
+      case Aeson.eitherDecodeStrict' content of
         Left err -> pure $ Left $ "Failed to parse session JSON: " <> T.pack err
         Right s  -> pure $ Right s
 
@@ -225,8 +226,8 @@ listSessions sessionsDir = do
       let jsonFiles = filter (\f -> takeExtension f == ".json" && not (".tmp" `isSuffixOf` f)) entries
       metas <- fmap catMaybes $ forM jsonFiles $ \f -> do
         let path = sessionsDir </> f
-        content <- BL.readFile path
-        case Aeson.eitherDecode content of
+        content <- BS.readFile path
+        case Aeson.eitherDecodeStrict' content of
           Right (s :: Session) -> pure $ Just (sessionToMeta s)
           Left _               -> pure Nothing
       pure $ sortOn (Down . metaUpdatedAt) metas
@@ -310,8 +311,8 @@ cleanEmptySessions sessionsDir = do
     let jsonFiles = filter (\f -> takeExtension f == ".json" && not (".tmp" `isSuffixOf` f)) entries
     deleted <- forM jsonFiles $ \f -> do
       let path = sessionsDir </> f
-      content <- BL.readFile path
-      case Aeson.eitherDecode content of
+      content <- BS.readFile path
+      case Aeson.eitherDecodeStrict' content of
         Right (s :: Session) ->
           let isStub = length (sessionTurns s) <= 1
                      && Map.null (sessionSubAgents s)

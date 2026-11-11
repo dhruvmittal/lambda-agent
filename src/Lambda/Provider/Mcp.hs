@@ -131,6 +131,7 @@ parseMcpTool _serverName rpcClient (Aeson.Object obj) = do
     , toolParameters  = tSchema
     , toolCapability  = tCap
     , toolIsMcp       = True
+    , toolScope       = Universal
     , toolExecute     = \_caller argsVal -> do
         callRes <- sendRequest rpcClient "tools/call" $ Aeson.object
           [ "name"      .= tName

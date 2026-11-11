@@ -195,12 +195,13 @@ processSseStream reader callback = do
 -- | Intermediate representation of SSE deltas
 parseSseItems :: Text -> Either Bool [Either StreamChunk Text]
 parseSseItems rawLine
-  | "data: [DONE]" `T.isInfixOf` rawLine = Left True
-  | "data: " `T.isPrefixOf` rawLine =
-      let payload = T.drop 6 rawLine
-      in case Aeson.decode (BL.fromStrict $ TE.encodeUtf8 payload) of
-           Just (Aeson.Object obj) -> Right (extractDeltas obj)
-           _                       -> Right []
+  | "data:" `T.isPrefixOf` rawLine =
+      let payload = T.strip (T.drop 5 rawLine)
+      in if payload == "[DONE]"
+           then Left True
+           else case Aeson.decode (BL.fromStrict $ TE.encodeUtf8 payload) of
+                  Just (Aeson.Object obj) -> Right (extractDeltas obj)
+                  _                       -> Right []
   | otherwise = Right []
 
 -- | Pure function for single-chunk testing (delegates with initial inThinking = False)

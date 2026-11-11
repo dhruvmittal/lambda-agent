@@ -5,6 +5,7 @@ module Lambda.Engine.SubAgent
   ( SubAgentSpec(..)
   , SubAgentReport(..)
   , SubAgentResult
+  , SubAgentRegistry(..)
   , runEphemeralSubAgent
   , resumeEphemeralSubAgent
   , spawnSpecialistSubAgentTool
@@ -26,7 +27,7 @@ import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?), (.!=))
 import Data.Aeson.Types (parseEither)
 import qualified Data.ByteString.Lazy as BL
-import Data.List (nub)
+import Data.Containers.ListUtils (nubOrd)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
@@ -36,7 +37,7 @@ import Text.Read (readMaybe)
 
 import Lambda.Config (Config(..), SpecialistConfig(..))
 import Lambda.Core.ModelDriver (ModelDriver(..))
-import Lambda.Core.ToolProvider (ToolDefinition(..), ToolRegistry(..), toolsToOpenAISchema)
+import Lambda.Core.ToolProvider (ToolDefinition(..), ToolRegistry(..), ToolScope(..), toolsToOpenAISchema)
 import Lambda.Engine.Dispatcher (executeToolDispatch)
 import Lambda.Engine.State
 import Lambda.Types
@@ -87,6 +88,7 @@ submitReportTool reportVar = ToolDefinition
       ]
   , toolCapability = ReadOnly
   , toolIsMcp = False
+  , toolScope = Universal
   , toolExecute = \_caller args -> do
       case parseEither parseReport args of
         Left err -> pure $ ToolResult "" "" ("Invalid submit_report arguments: " <> T.pack err) Nothing
@@ -107,11 +109,18 @@ submitReportTool reportVar = ToolDefinition
       art <- o .:? "artifact_path"
       pure $ SubAgentReport s sum' det art
 
+-- | An opaque, type-verified subagent tool registry that statically guarantees no RootOnly tools
+-- (such as subagent recursion or session resumption) can ever be held by a subagent.
+newtype SubAgentRegistry = SubAgentRegistry { unSubAgentRegistry :: ToolRegistry }
+
 -- | Filters out any recursive spawn and resume tools to strictly enforce a Depth-1 Star Graph,
 -- and injects the synthetic submitReportTool.
 filterSubAgentRegistry :: ToolDefinition -> ToolRegistry -> ToolRegistry
 filterSubAgentRegistry repTool (ToolRegistry m) =
-  let withoutSubControl = Map.filterWithKey (\k _ -> not ("spawn_" `T.isPrefixOf` k || "resume_" `T.isPrefixOf` k)) m
+  let withoutSubControl = Map.filterWithKey (\k t ->
+        toolScope t == Universal
+        && not ("spawn_" `T.isPrefixOf` k || "resume_" `T.isPrefixOf` k
+             || "spawn_" `T.isPrefixOf` toolName t || "resume_" `T.isPrefixOf` toolName t)) m
       withReport = Map.insert (toolName repTool) repTool withoutSubControl
   in ToolRegistry withReport
 
@@ -143,7 +152,7 @@ runEphemeralSubAgent engineState@AppEngineState{..} driver SubAgentSpec{..} = do
       defaultCaps = maybe [] specialistCapabilities mSpecialist
       defaultBud = maybe 6 specialistBudget mSpecialist
       effectiveBudget = max 1 (if subTurnBudget > 0 then subTurnBudget else defaultBud)
-      combinedGlobs = if null subGrantedGlobs then defaultCaps else nub (defaultCaps ++ subGrantedGlobs)
+      combinedGlobs = if null subGrantedGlobs then defaultCaps else nubOrd (defaultCaps ++ subGrantedGlobs)
 
   task <- registerSubAgentTaskWithParent engineState subAgentRoleName subTaskDescription effectiveBudget parentTurnId
   let sId = subAgentId task
@@ -450,6 +459,7 @@ spawnSpecialistSubAgentTool engineState driver =
         ]
     , toolCapability = ReadOnly
     , toolIsMcp = False
+    , toolScope = RootOnly
     , toolExecute = \_caller args -> do
         case parseEither parseSpecialistArgs args of
           Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
@@ -509,7 +519,7 @@ resumeEphemeralSubAgent engineState@AppEngineState{..} driver sId addBudget mNew
               defaultCaps = maybe [] specialistCapabilities mSpecialist
               effectiveAddBudget = max 1 (if addBudget > 0 then addBudget else maybe 6 specialistBudget mSpecialist)
               newTotalBudget = max 1 (subAgentBudget task + effectiveAddBudget)
-              combinedGlobs = nub (defaultCaps ++ additionalGrants)
+              combinedGlobs = nubOrd (defaultCaps ++ additionalGrants)
               isDestructiveGlob g = any (`T.isPrefixOf` g) ["bash*", "write_file*", "edit_file*", "replace_lines*"]
               effectiveGrants = if curMode == PlanMode
                 then filter (not . isDestructiveGlob) combinedGlobs
@@ -601,6 +611,7 @@ resumeSpecialistSubAgentTool engineState driver =
         ]
     , toolCapability = ReadOnly
     , toolIsMcp = False
+    , toolScope = RootOnly
     , toolExecute = \_caller args -> do
         case parseEither parseResumeArgs args of
           Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing

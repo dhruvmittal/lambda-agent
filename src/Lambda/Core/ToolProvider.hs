@@ -2,7 +2,8 @@
 {-# LANGUAGE RecordWildCards #-}
 
 module Lambda.Core.ToolProvider
-  ( ToolDefinition(..)
+  ( ToolScope(..)
+  , ToolDefinition(..)
   , ToolRegistry(..)
   , emptyRegistry
   , registerTool
@@ -20,6 +21,13 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Lambda.Types
 
+-- | Execution scope of a tool: RootOnly (orchestrator only, e.g. spawning/resuming subagents)
+-- or Universal (callable by both orchestrator and subagents).
+data ToolScope
+  = RootOnly
+  | Universal
+  deriving (Eq, Show)
+
 data ToolDefinition = ToolDefinition
   { toolName        :: !Text
   , toolDescription :: !Text
@@ -27,6 +35,7 @@ data ToolDefinition = ToolDefinition
   , toolCapability  :: !ToolCapability
   , toolIsMcp       :: !Bool
   , toolExecute     :: !(CallerContext -> Aeson.Value -> IO ToolResult)
+  , toolScope       :: !ToolScope
   }
 
 data ToolRegistry = ToolRegistry
