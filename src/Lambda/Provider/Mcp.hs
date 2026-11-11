@@ -19,7 +19,7 @@ import Data.Aeson.Types (parseEither)
 import qualified Data.ByteString.Lazy as BL
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (mapMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -57,7 +57,7 @@ startMcpClient name cmd args envMap = do
             if locExists then pure locCandidate else pure cmd
 
   currEnv <- getEnvironment
-  let currPath = maybe "" id (lookup "PATH" currEnv)
+  let currPath = fromMaybe "" (lookup "PATH" currEnv)
       npmBin = home </> ".npm-global" </> "bin"
       augmentedPath = if T.pack npmBin `T.isInfixOf` T.pack currPath
                         then currPath

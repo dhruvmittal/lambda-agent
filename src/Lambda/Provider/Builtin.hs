@@ -25,6 +25,7 @@ import Data.Aeson ((.=), (.:), (.:?), (.!=))
 import Data.Aeson.Types (parseEither)
 import qualified Data.ByteString.Lazy as BL
 import Data.List (isPrefixOf)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -112,7 +113,7 @@ bashTool wsRoot artDir = ToolDefinition
           let isUnbounded = case mTimeout of
                 Just t  -> t <= 0
                 Nothing -> False
-              reqTimeout = maybe 120 id mTimeout
+              reqTimeout = fromMaybe 120 mTimeout
               effTimeout = max 1 (min 7200 reqTimeout)
 
           createDirectoryIfMissing True artDir

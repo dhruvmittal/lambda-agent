@@ -342,9 +342,11 @@ resolveSessionId sessionsDir rawTarget = do
       meaningful <- listMeaningfulSessions sessionsDir
       -- 1. Try 1-based numeric index against meaningful sessions
       case reads (T.unpack target) of
-        [(idx, "")] | idx >= 1 && idx <= length meaningful ->
-          pure $ Right (metaId (meaningful !! (idx - 1)))
-        [(idx, "")] | idx < 1 || idx > length meaningful ->
+        [(idx, "")] | idx >= 1 ->
+          case drop (idx - 1) meaningful of
+            (m:_) -> pure $ Right (metaId m)
+            []    -> pure $ Left $ "Session index " <> target <> " out of range (1.." <> T.pack (show (length meaningful)) <> ")."
+        [(idx, "")] | idx < 1 ->
           pure $ Left $ "Session index " <> target <> " out of range (1.." <> T.pack (show (length meaningful)) <> ")."
         _ -> do
           -- 2. Check exact session ID match (in meaningful or all sessions)

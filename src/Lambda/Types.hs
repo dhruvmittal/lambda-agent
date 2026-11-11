@@ -10,6 +10,7 @@ import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?), (.!=))
 import qualified Data.ByteString.Lazy as BL
 import Data.Map.Strict (Map)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -197,8 +198,8 @@ formatWorkingState WorkingState{..} =
   T.unlines
     [ "GOAL: " <> wsGoal
     , "INVARIANTS: [" <> T.intercalate ", " wsInvariants <> "]"
-    , "ACTIVE_HYPOTHESIS: " <> maybe "None" id wsActiveHypothesis
-    , "BLOCKED_ON: " <> maybe "Ready" id wsBlockedOn
+    , "ACTIVE_HYPOTHESIS: " <> fromMaybe "None" wsActiveHypothesis
+    , "BLOCKED_ON: " <> fromMaybe "Ready" wsBlockedOn
     ]
 
 parseWorkingState :: Text -> WorkingState
@@ -207,8 +208,8 @@ parseWorkingState txt =
       findPrefix pfx = case filter (pfx `T.isPrefixOf`) ls of
         (l:_) -> Just (T.strip (T.drop (T.length pfx) l))
         []    -> Nothing
-      goal = maybe "Awaiting task" id (findPrefix "GOAL:")
-      invarsRaw = maybe "" id (findPrefix "INVARIANTS:")
+      goal = fromMaybe "Awaiting task" (findPrefix "GOAL:")
+      invarsRaw = fromMaybe "" (findPrefix "INVARIANTS:")
       invars = parseInvariants invarsRaw
       hypo = case findPrefix "ACTIVE_HYPOTHESIS:" of
         Just h | h /= "None" && not (T.null h) -> Just h

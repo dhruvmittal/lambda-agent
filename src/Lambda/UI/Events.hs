@@ -1,3 +1,4 @@
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 
@@ -814,17 +815,17 @@ handleCommand cmdText = do
         else liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdSetGoal newGoal)
     cmd | cmd `elem` ["/model", "/models"] -> do
       let baseUrl = apiBaseUrl (uiConfig st)
-          providerStr = case () of
-            _ | T.null baseUrl ->
-                  "⚠️ Provider: Not configured (set api_base_url in .lambda/config.json or export LAMBDA_BASE_URL)"
-            _ | isLocalEndpoint baseUrl ->
-                  "Provider: Local (" <> baseUrl <> ")"
-            _ | isOpenAiEndpoint baseUrl ->
-                  "Provider: OpenAI (" <> baseUrl <> ")"
-            _ | isOpenRouterEndpoint baseUrl ->
-                  "Provider: OpenRouter (" <> baseUrl <> ")"
-            _ ->
-                  "Provider: " <> baseUrl
+          providerStr =
+            if | T.null baseUrl ->
+                   "⚠️ Provider: Not configured (set api_base_url in .lambda/config.json or export LAMBDA_BASE_URL)"
+               | isLocalEndpoint baseUrl ->
+                   "Provider: Local (" <> baseUrl <> ")"
+               | isOpenAiEndpoint baseUrl ->
+                   "Provider: OpenAI (" <> baseUrl <> ")"
+               | isOpenRouterEndpoint baseUrl ->
+                   "Provider: OpenRouter (" <> baseUrl <> ")"
+               | otherwise ->
+                   "Provider: " <> baseUrl
           modelStr = if T.null (uiModelName st)
                        then "Active model: ⚠️ None configured"
                        else "Active model: " <> uiModelName st <> " (context limit: " <> T.pack (show (uiContextLimit st)) <> " tokens)"
@@ -1058,6 +1059,11 @@ resolveActiveModal level = do
         Seq.Empty      -> put st { uiCurrentPrompt = Nothing }
     Nothing -> pure ()
 
+-- Helper to apply a function n times
+applyN :: Int -> (a -> a) -> a -> a
+applyN 0 _ x = x
+applyN n f x = applyN (n - 1) f (f x)
+
 -- | Deletes backwards by word respecting whitespace boundaries (like Readline ^W)
 deleteWordBackward :: Z.TextZipper Text -> Z.TextZipper Text
 deleteWordBackward z =
@@ -1069,8 +1075,8 @@ deleteWordBackward z =
        else
          let trimmed = T.dropWhileEnd isSpace before
              keep    = T.dropWhileEnd (not . isSpace) trimmed
-             count   = T.length before - T.length keep
-         in iterate Z.deletePrevChar z !! max 1 count
+             count   = max 1 (T.length before - T.length keep)
+         in applyN count Z.deletePrevChar z
 
 -- | Moves cursor backward by word respecting whitespace boundaries (like Readline Alt+B)
 moveWordBackward :: Z.TextZipper Text -> Z.TextZipper Text
@@ -1083,8 +1089,8 @@ moveWordBackward z =
        else
          let trimmed = T.dropWhileEnd isSpace before
              keep    = T.dropWhileEnd (not . isSpace) trimmed
-             count   = T.length before - T.length keep
-         in iterate Z.moveLeft z !! max 1 count
+             count   = max 1 (T.length before - T.length keep)
+         in applyN count Z.moveLeft z
 
 -- | Moves cursor forward by word respecting whitespace boundaries (like Readline Alt+F)
 moveWordForward :: Z.TextZipper Text -> Z.TextZipper Text
@@ -1097,8 +1103,8 @@ moveWordForward z =
        else
          let trimmed = T.dropWhile isSpace after
              keep    = T.dropWhile (not . isSpace) trimmed
-             count   = T.length after - T.length keep
-         in iterate Z.moveRight z !! max 1 count
+             count   = max 1 (T.length after - T.length keep)
+         in applyN count Z.moveRight z
 
 -- | Deletes forward by word respecting whitespace boundaries (like Readline Alt+D)
 deleteWordForward :: Z.TextZipper Text -> Z.TextZipper Text
@@ -1111,8 +1117,8 @@ deleteWordForward z =
        else
          let trimmed = T.dropWhile isSpace after
              keep    = T.dropWhile (not . isSpace) trimmed
-             count   = T.length after - T.length keep
-         in iterate Z.deleteChar z !! max 1 count
+             count   = max 1 (T.length after - T.length keep)
+         in applyN count Z.deleteChar z
 
 -- Lens helper for editor zooming
 uiEditorLens :: Functor f => (E.Editor Text ResourceName -> f (E.Editor Text ResourceName)) -> UIState -> f UIState

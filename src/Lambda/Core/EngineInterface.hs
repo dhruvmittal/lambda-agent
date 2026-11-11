@@ -1,3 +1,4 @@
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 
@@ -289,10 +290,9 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
               | otherwise = currentGoal
             updatedVec = if hasGoal
               then T.unlines $ map (\l ->
-                case () of
-                  _ | "GOAL:" `T.isPrefixOf` l -> "GOAL: " <> newGoal
-                  _ | "BLOCKED_ON:" `T.isPrefixOf` l -> "BLOCKED_ON: Model execution"
-                  _ -> l) linesVec
+                if | "GOAL:" `T.isPrefixOf` l -> "GOAL: " <> newGoal
+                   | "BLOCKED_ON:" `T.isPrefixOf` l -> "BLOCKED_ON: Model execution"
+                   | otherwise -> l) linesVec
               else "GOAL: " <> newGoal
                 <> "\nINVARIANTS: [Safe workspace ops, User grant required]"
                 <> "\nACTIVE_HYPOTHESIS: Formulating execution path"

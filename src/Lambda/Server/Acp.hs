@@ -23,6 +23,7 @@ import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch, try, finally)
 import Control.Monad (unless, when)
+import Data.Foldable (for_, traverse_)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?))
 import Data.Aeson.Types (parseEither)
@@ -381,12 +382,8 @@ handleSlashPrompt state mReqId sId prompt mChannels mEngine baseCfg = do
         Nothing  -> pure ()
   case cmd of
     "/plan" -> do
-      case mEngine of
-        Just eng -> atomically $ writeTVar (appMode eng) PlanMode
-        Nothing  -> pure ()
-      case mChannels of
-        Just ch -> atomically $ writeTBQueue (cmdQueue ch) (CmdSetMode PlanMode)
-        Nothing -> pure ()
+      for_ mEngine $ \eng -> atomically $ writeTVar (appMode eng) PlanMode
+      for_ mChannels $ \ch -> atomically $ writeTBQueue (cmdQueue ch) (CmdSetMode PlanMode)
       curModel <- case mEngine of
         Just eng -> readTVarIO (appActiveModel eng)
         Nothing  -> pure (modelName baseCfg)
@@ -397,12 +394,8 @@ handleSlashPrompt state mReqId sId prompt mChannels mEngine baseCfg = do
       finish
 
     "/exec" -> do
-      case mEngine of
-        Just eng -> atomically $ writeTVar (appMode eng) ExecMode
-        Nothing  -> pure ()
-      case mChannels of
-        Just ch -> atomically $ writeTBQueue (cmdQueue ch) (CmdSetMode ExecMode)
-        Nothing -> pure ()
+      for_ mEngine $ \eng -> atomically $ writeTVar (appMode eng) ExecMode
+      for_ mChannels $ \ch -> atomically $ writeTBQueue (cmdQueue ch) (CmdSetMode ExecMode)
       curModel <- case mEngine of
         Just eng -> readTVarIO (appActiveModel eng)
         Nothing  -> pure (modelName baseCfg)
@@ -506,15 +499,11 @@ startAcpSessionWithSession state mCwd maybeSess = do
 
   -- Stop any previous runtime and forwarder thread before bootstrapping the new session
   mPrevFwd <- readTVarIO (acpForwarderThread state)
-  case mPrevFwd of
-    Just tid -> killThread tid
-    Nothing  -> pure ()
+  traverse_ killThread mPrevFwd
   atomically $ writeTVar (acpForwarderThread state) Nothing
 
   mPrevRuntime <- readTVarIO (acpActiveRuntime state)
-  case mPrevRuntime of
-    Just prevRt -> stopEngineRuntime prevRt
-    Nothing     -> pure ()
+  traverse_ stopEngineRuntime mPrevRuntime
 
   mOverrideDriver <- readTVarIO (acpDriverOverride state)
   runtime <- startEngineRuntime cfg maybeSess mOverrideDriver

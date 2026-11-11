@@ -1,3 +1,4 @@
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 
@@ -67,14 +68,14 @@ computeCommandCandidates rawInput =
 completeInput :: FilePath -> UIState -> Text -> IO (Maybe CompletionState)
 completeInput baseDir st rawInput = do
   let clean = T.dropWhile (== ' ') (T.filter (\c -> c /= '\n' && c /= '\r') rawInput)
-  case () of
+  if
     -- 1. Slash command name completion (e.g. "/p" -> "/plan")
-    _ | "/" `T.isPrefixOf` clean && not (" " `T.isInfixOf` clean) -> do
+    | "/" `T.isPrefixOf` clean && not (" " `T.isInfixOf` clean) -> do
         let cands = computeCommandCandidates clean
         pure $ toCompletionState cands
 
     -- 2. /session argument completion (MRU sorted, meaningful sessions only)
-    _ | "/session " `T.isPrefixOf` clean -> do
+    | "/session " `T.isPrefixOf` clean -> do
         let sessArg = T.drop 9 clean
             sessDir = baseDir </> ".lambda" </> "sessions"
         exists <- doesDirectoryExist sessDir
@@ -104,7 +105,7 @@ completeInput baseDir st rawInput = do
             pure $ toCompletionState (extraClean ++ extraPrune ++ formatted)
 
     -- 3. /sub, /resume, and /reup argument completion (active subagent IDs + main for /sub)
-    _ | "/sub " `T.isPrefixOf` clean || "/resume " `T.isPrefixOf` clean || "/reup " `T.isPrefixOf` clean -> do
+    | "/sub " `T.isPrefixOf` clean || "/resume " `T.isPrefixOf` clean || "/reup " `T.isPrefixOf` clean -> do
         let isSub = "/sub " `T.isPrefixOf` clean
             subArg
               | "/sub " `T.isPrefixOf` clean    = T.drop 5 clean
@@ -122,7 +123,7 @@ completeInput baseDir st rawInput = do
         pure $ toCompletionState (activeSubs ++ mainOpt)
 
     -- 4. /mode argument completion
-    _ | "/mode " `T.isPrefixOf` clean -> do
+    | "/mode " `T.isPrefixOf` clean -> do
         let modeArg = T.drop 6 clean
             allModes =
               [ Candidate "plan" "plan (read-only safe)"
@@ -132,7 +133,7 @@ completeInput baseDir st rawInput = do
         pure $ toCompletionState matched
 
     -- 5. /model and /models argument completion
-    _ | "/model " `T.isPrefixOf` clean || "/models " `T.isPrefixOf` clean -> do
+    | "/model " `T.isPrefixOf` clean || "/models " `T.isPrefixOf` clean -> do
         let modArg = if "/models " `T.isPrefixOf` clean then T.drop 8 clean else T.drop 7 clean
             cfg = uiConfig st
             baseUrl = apiBaseUrl cfg
@@ -179,7 +180,7 @@ completeInput baseDir st rawInput = do
         pure $ toCompletionState matched
 
     -- 5. /think argument completion
-    _ | "/think " `T.isPrefixOf` clean -> do
+    | "/think " `T.isPrefixOf` clean -> do
         let thinkArg = T.drop 7 clean
             thinkOpts =
               [ Candidate "toggle" "toggle (switch reasoning visibility)"
@@ -190,7 +191,7 @@ completeInput baseDir st rawInput = do
         pure $ toCompletionState matched
 
     -- 6. /theme argument completion
-    _ | "/theme " `T.isPrefixOf` clean || "/themes " `T.isPrefixOf` clean -> do
+    | "/theme " `T.isPrefixOf` clean || "/themes " `T.isPrefixOf` clean -> do
         let tArg = T.toLower $ if "/themes " `T.isPrefixOf` clean then T.drop 8 clean else T.drop 7 clean
             cfg = uiConfig st
             activeTheme = T.toLower (themeName cfg)
@@ -203,7 +204,7 @@ completeInput baseDir st rawInput = do
         pure $ toCompletionState matched
 
     -- 7. /prompt and /p argument completion (templates from .lambda/prompts/*.md)
-    _ | "/prompt " `T.isPrefixOf` clean || "/p " `T.isPrefixOf` clean -> do
+    | "/prompt " `T.isPrefixOf` clean || "/p " `T.isPrefixOf` clean -> do
         let pArg = if "/prompt " `T.isPrefixOf` clean then T.drop 8 clean else T.drop 3 clean
         macroNames <- catch (listPromptMacros baseDir) (\(_ :: SomeException) -> pure [])
         let matched = [ Candidate m (".lambda/prompts/" <> m <> ".md")
@@ -213,7 +214,7 @@ completeInput baseDir st rawInput = do
         pure $ toCompletionState matched
 
     -- 8. Specialist '@agent' and filesystem path completion (words starting with '@' or containing '/')
-    _ -> do
+    | otherwise -> do
         let lastToken = case T.words clean of
               [] -> ""
               ws -> last ws
