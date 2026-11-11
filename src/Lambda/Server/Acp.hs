@@ -297,6 +297,10 @@ formatToolCallTitle tc =
           case parseEither (.: "path") o of
             Right (p :: Text) -> " " <> p
             _ -> ""
+        ("fetch_url", Just o) ->
+          case parseEither (.: "url") o of
+            Right (u :: Text) -> " " <> u
+            _ -> ""
         _ -> ""
   in name <> detail
 
@@ -308,6 +312,7 @@ determineToolKind = \case
   "grep_search"    -> "read"
   "file_search"    -> "read"
   "fetch_web"      -> "read"
+  "fetch_url"      -> "read"
   "edit_file"      -> "edit"
   "write_file"     -> "edit"
   _                -> "execute"

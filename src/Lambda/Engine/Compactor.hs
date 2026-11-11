@@ -54,6 +54,10 @@ defaultAgentSystemPrompt = T.unlines
   , "   - External MCP tools (like StormDrain persistent memory) are accessed via `call_mcp_tool`."
   , "   - Available tools and parameters are listed in the `call_mcp_tool` function specification."
   , "   - Always invoke `call_mcp_tool` with `{\"name\": \"<tool_name>\", \"arguments\": { ... }}`."
+  , ""
+  , "6. **File Reading & Tool Discipline**:"
+  , "   - Always use `read_file` (or specialist subagents) for local workspace files and `file://` URIs."
+  , "   - Never use `fetch_url` for local files or `file://` links; `fetch_url` is exclusively for remote HTTP/HTTPS endpoints."
   ]
 
 -- | Strips raw internal reasoning blocks from previous turns before remote API wire egress.

@@ -381,6 +381,9 @@ testDirectoryTools = do
   let readTool = readFileTool "."
   resReadDir <- toolExecute readTool MainAgent (Aeson.object ["path" Aeson..= ("src" :: Text)])
   assert "read_file on directory lists contents gracefully" ("Specified path is a directory" `T.isInfixOf` resultStdout resReadDir)
+
+  resReadFileUri <- toolExecute readTool MainAgent (Aeson.object ["path" Aeson..= ("file://src" :: Text)])
+  assert "read_file handles file:// URI prefix" ("Specified path is a directory" `T.isInfixOf` resultStdout resReadFileUri)
   putStrLn "  -> OK: Directory listing and directory fallback in read_file work correctly."
 
 -- 8. Verify Context Window Estimation
@@ -428,7 +431,16 @@ testFetchUrlTool = do
   assert "Tool name is fetch_url" (toolName tool == "fetch_url")
   assert "Tool capability is ReadOnly" (toolCapability tool == ReadOnly)
   assert "Tool description mentions HTML" ("HTML" `T.isInfixOf` toolDescription tool)
-  putStrLn "  -> OK: fetch_url tool registered with ReadOnly capability and correct schema."
+
+  resFile <- toolExecute tool MainAgent (Aeson.object ["url" Aeson..= ("file:///workspace/README.md" :: Text)])
+  assert "fetch_url rejects file:// with helpful steering message"
+    ("read_file" `T.isInfixOf` resultStderr resFile)
+
+  resNonHttp <- toolExecute tool MainAgent (Aeson.object ["url" Aeson..= ("src/Main.hs" :: Text)])
+  assert "fetch_url rejects non-http URLs with helpful steering message"
+    ("read_file" `T.isInfixOf` resultStderr resNonHttp)
+
+  putStrLn "  -> OK: fetch_url tool registered with ReadOnly capability, correct schema, and file-redirect guards."
 
 -- 11. Verify Systems Engineering Persistent System Prompt
 testPersistentSystemPrompt :: IO ()
@@ -438,6 +450,7 @@ testPersistentSystemPrompt = do
   assert "System prompt includes Hypothesis-Driven Problem Solving" ("Hypothesis-Driven" `T.isInfixOf` defaultAgentSystemPrompt)
   assert "System prompt includes spawn_specialist_subagent instruction" ("spawn_specialist_subagent" `T.isInfixOf` defaultAgentSystemPrompt)
   assert "System prompt includes mode discipline" ("[/plan]" `T.isInfixOf` defaultAgentSystemPrompt)
+  assert "System prompt includes file reading guidance" ("read_file" `T.isInfixOf` defaultAgentSystemPrompt)
 
   -- Wire payload stripping of UI banners
   let bannerTurn1 = Turn 1 SystemRole [TextBlock "lambdA initialized. Enter a goal or press /help for commands."]

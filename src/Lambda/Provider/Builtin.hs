@@ -24,6 +24,7 @@ import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?), (.!=))
 import Data.Aeson.Types (parseEither)
 import qualified Data.ByteString.Lazy as BL
+import Data.List (isPrefixOf)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -202,9 +203,18 @@ bashTool wsRoot artDir = ToolDefinition
               pure $ ToolResult "" (compactOutput <> exitStatus) "" mArtifact
   }
 
--- | Resolves a path, preserving absolute paths and making relative paths workspace-relative
+-- | Strips file:// URIs (e.g. file:///home/foo -> /home/foo, file://foo -> foo)
+stripFileUri :: FilePath -> FilePath
+stripFileUri p
+  | "file://localhost" `isPrefixOf` p = drop 16 p
+  | "file://" `isPrefixOf` p          = drop 7 p
+  | otherwise                         = p
+
+-- | Resolves a path, stripping any file:// URI prefix, preserving absolute paths and making relative paths workspace-relative
 resolvePath :: FilePath -> FilePath -> FilePath
-resolvePath wsRoot p = if isAbsolute p then p else wsRoot </> p
+resolvePath wsRoot rawP =
+  let p = stripFileUri rawP
+  in if isAbsolute p then p else wsRoot </> p
 
 -- | Directory listing tool
 listDirectoryTool :: FilePath -> ToolDefinition
@@ -245,13 +255,13 @@ listDirectoryTool wsRoot = ToolDefinition
 readFileTool :: FilePath -> ToolDefinition
 readFileTool wsRoot = ToolDefinition
   { toolName = "read_file"
-  , toolDescription = "Read the contents of a file with optional start_line and line_count parameters. For large files (>250 lines), the primary agent should specify start_line/line_count or delegate to 'spawn_specialist_subagent'."
+  , toolDescription = "Read the contents of a file with optional start_line and line_count parameters. Accepts workspace-relative paths, absolute paths, or file:// URIs. For large files (>250 lines), the primary agent should specify start_line/line_count or delegate to 'spawn_specialist_subagent'."
   , toolParameters = Aeson.object
       [ "type" .= ("object" :: Text)
       , "properties" .= Aeson.object
           [ "path" .= Aeson.object
               [ "type" .= ("string" :: Text)
-              , "description" .= ("Path to file relative to workspace." :: Text)
+              , "description" .= ("Path to file relative to workspace, absolute path, or file:// URI." :: Text)
               ]
           , "start_line" .= Aeson.object
               [ "type" .= ("integer" :: Text)
@@ -440,13 +450,13 @@ fetchUrlTool = fetchUrlToolWithManager Nothing
 fetchUrlToolWithManager :: Maybe Manager -> FilePath -> ToolDefinition
 fetchUrlToolWithManager mMgr artDir = ToolDefinition
   { toolName = "fetch_url"
-  , toolDescription = "Fetch web page or API content via HTTP/HTTPS GET. Cleans HTML markup into text, and spools large responses to disk."
+  , toolDescription = "Fetch remote web page or API content via HTTP/HTTPS GET. Cleans HTML markup into text, and spools large responses to disk. Exclusively for HTTP and HTTPS URLs. Do NOT use to inspect or open local files or file:// URIs; use 'read_file' instead."
   , toolParameters = Aeson.object
       [ "type" .= ("object" :: Text)
       , "properties" .= Aeson.object
           [ "url" .= Aeson.object
               [ "type" .= ("string" :: Text)
-              , "description" .= ("The absolute HTTP or HTTPS URL to fetch." :: Text)
+              , "description" .= ("The absolute HTTP or HTTPS URL to fetch (e.g. https://example.com). Do NOT provide local file paths or file:// URIs." :: Text)
               ]
           ]
       , "required" .= (["url"] :: [Text])
@@ -456,28 +466,38 @@ fetchUrlToolWithManager mMgr artDir = ToolDefinition
   , toolExecute = \_caller args -> do
       case parseEither (Aeson.withObject "fetch_url" (.: "url")) args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
-        Right rawUrl -> do
-          res <- try $ do
-            manager <- maybe newTlsManager pure mMgr
-            req <- parseRequest (T.unpack rawUrl)
-            let req' = req
-                  { requestHeaders =
-                      [ (hUserAgent, "lambdA/0.1 (+https://github.com/dhruv/lambdA)")
-                      , (hAccept, "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8")
-                      ]
-                  , responseTimeout = responseTimeoutMicro (30 * 1000000)
-                  }
-            response <- httpLbs req' manager
-            let bodyBs = responseBody response
-                bodyText = TE.decodeUtf8Lenient (BL.toStrict bodyBs)
-                cleanedText = stripHtmlTags bodyText
-            pure cleanedText
-          case res of
-            Left (ex :: SomeException) ->
-              pure $ ToolResult "" "" ("Failed to fetch URL: " <> T.pack (show ex)) Nothing
-            Right content -> do
-              (compact, mArtifact) <- spoolDiagnosticArtifact artDir "fetch_url" content
-              pure $ ToolResult "" compact "" mArtifact
+        Right rawUrl
+          | "file://" `T.isPrefixOf` rawUrl ->
+              let stripped = T.drop 7 rawUrl
+              in pure $ ToolResult "" ""
+                   ("Error: 'fetch_url' is exclusively for HTTP/HTTPS web endpoints. To read local files (including file:// URIs), use 'read_file' with path: \"" <> stripped <> "\".")
+                   Nothing
+          | not ("http://" `T.isPrefixOf` rawUrl || "https://" `T.isPrefixOf` rawUrl) ->
+              pure $ ToolResult "" ""
+                   ("Error: 'fetch_url' only supports http:// and https:// URLs. For local files, use 'read_file' with path: \"" <> rawUrl <> "\".")
+                   Nothing
+          | otherwise -> do
+              res <- try $ do
+                manager <- maybe newTlsManager pure mMgr
+                req <- parseRequest (T.unpack rawUrl)
+                let req' = req
+                      { requestHeaders =
+                          [ (hUserAgent, "lambdA/0.1 (+https://github.com/dhruv/lambdA)")
+                          , (hAccept, "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8")
+                          ]
+                      , responseTimeout = responseTimeoutMicro (30 * 1000000)
+                      }
+                response <- httpLbs req' manager
+                let bodyBs = responseBody response
+                    bodyText = TE.decodeUtf8Lenient (BL.toStrict bodyBs)
+                    cleanedText = stripHtmlTags bodyText
+                pure cleanedText
+              case res of
+                Left (ex :: SomeException) ->
+                  pure $ ToolResult "" "" ("Failed to fetch URL: " <> T.pack (show ex)) Nothing
+                Right content -> do
+                  (compact, mArtifact) <- spoolDiagnosticArtifact artDir "fetch_url" content
+                  pure $ ToolResult "" compact "" mArtifact
   }
 
 -- | Simple HTML tag stripper that eliminates script/style blocks and tags
