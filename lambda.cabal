@@ -135,4 +135,5 @@ test-suite lambda-test
         http-client-tls,
         skylighting,
         unix,
-        skylighting-core
+        skylighting-core,
+        QuickCheck

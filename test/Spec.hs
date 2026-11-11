@@ -27,6 +27,7 @@ import System.Environment (setEnv, unsetEnv)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
 import Skylighting (TokenType(..))
+import qualified Test.QuickCheck as QC
 
 import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, lookupModelContextLimitWithConfig, resolveEnvTemplates, persistTheme, extractProviderAndModel, parseMarkdownAgent, loadAllMarkdownAgents)
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro, expandPromptMacro)
@@ -209,6 +210,7 @@ main = do
   testHaskellArchitectHardeningAndDriverDecoupling
   testAcpStopCancellationAndToolFormatting
   testTelemetryAndHerdrIntegration
+  testQuickCheckAlgebraicLaws
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -3975,6 +3977,98 @@ testTelemetryAndHerdrIntegration = do
   removeFile tmpMockScript
   removeFile tmpLogFile
   putStrLn "  -> OK: Herdr CLI lossy conflation, subprocess execution, and release-agent teardown verified."
+
+-- 76. QuickCheck Pure Algebraic & Structural Invariant Laws
+testQuickCheckAlgebraicLaws :: IO ()
+testQuickCheckAlgebraicLaws = do
+  putStrLn "\n[Test 76] QuickCheck Pure Algebraic & Structural Invariant Laws"
+
+  -- 1. Compaction Idempotence Law
+  -- sanitizeForApiPayload . sanitizeForApiPayload == sanitizeForApiPayload
+  let prop_compactionIdempotence (turns :: [Turn]) =
+        let s1 = sanitizeForApiPayload turns
+            s2 = sanitizeForApiPayload (unSanitizedTurns s1)
+        in s1 == s2
+  res1 <- QC.quickCheckResult (QC.withMaxSuccess 100 prop_compactionIdempotence)
+  case res1 of
+    QC.Success {} -> assert "Compaction sanitizeForApiPayload is idempotent" True
+    _ -> failTest "QuickCheck compaction idempotence property failed!"
+
+  -- 2. Compactor Structural Invariant: when older turns are compacted away,
+  -- the recent uncompacted dialogue never begins with an orphaned ToolRole whose
+  -- AssistantRole was summarized away.
+  let prop_compactorNoOrphanToolRole (QC.Positive maxToks) (QC.Positive recentCount) (turns :: [Turn]) =
+        let validDialogue = not (null turns) && turnRole (head turns) /= ToolRole
+        in validDialogue QC.==>
+          let compacted = compactHistory maxToks recentCount turns
+              hasSummary = any (\t -> turnRole t == SystemRole && "[Context Summary:" `T.isPrefixOf` T.concat [ txt | TextBlock txt <- turnBlocks t ]) compacted
+              recentTurns = if hasSummary then drop 1 compacted else compacted
+          in case recentTurns of
+               (firstRecent:_) -> if hasSummary then turnRole firstRecent /= ToolRole else True
+               []              -> True
+  res2 <- QC.quickCheckResult (QC.withMaxSuccess 100 prop_compactorNoOrphanToolRole)
+  case res2 of
+    QC.Success {} -> assert "Compacted history never starts recent section with orphaned ToolRole" True
+    _ -> failTest "QuickCheck compactor orphaned ToolRole invariant failed!"
+
+  -- 3. WorkingState Codec Round-Trip Invariant
+  let prop_workingStateRoundTrip (goal :: String) (invs :: [String]) (mHypo :: Maybe String) (mBlocked :: Maybe String) =
+        let cleanGoal = if null goal then "Awaiting task" else T.strip (T.filter (\c -> c /= '\n' && c /= '\r') (T.pack goal))
+            cleanInvs = filter (not . T.null) [ T.strip (T.filter (\c -> c /= '\n' && c /= '\r' && c /= ',' && c /= '[' && c /= ']') (T.pack i)) | i <- invs ]
+            cleanHypo = case fmap (T.strip . T.filter (\c -> c /= '\n' && c /= '\r') . T.pack) mHypo of
+              Just h | not (T.null h) && h /= "None" -> Just h
+              _ -> Nothing
+            cleanBlocked = case fmap (T.strip . T.filter (\c -> c /= '\n' && c /= '\r') . T.pack) mBlocked of
+              Just b | not (T.null b) && b /= "Ready" && b /= "None" -> Just b
+              _ -> Nothing
+            ws = WorkingState
+              { wsGoal = if T.null cleanGoal then "Awaiting task" else cleanGoal
+              , wsInvariants = cleanInvs
+              , wsActiveHypothesis = cleanHypo
+              , wsBlockedOn = cleanBlocked
+              }
+            formatted = formatWorkingState ws
+            parsed = parseWorkingState formatted
+        in wsGoal parsed == wsGoal ws
+           && wsInvariants parsed == wsInvariants ws
+           && wsActiveHypothesis parsed == wsActiveHypothesis ws
+           && wsBlockedOn parsed == wsBlockedOn ws
+  res3 <- QC.quickCheckResult (QC.withMaxSuccess 100 prop_workingStateRoundTrip)
+  case res3 of
+    QC.Success {} -> assert "WorkingState formatWorkingState / parseWorkingState round-trip verified" True
+    _ -> failTest "QuickCheck WorkingState codec round-trip property failed!"
+
+  -- 4. Streaming Tag Splitter Chunk-Framing Invariance (Monoid Homomorphism)
+  -- For any JSON-safe string without XML brackets, encoding as an SSE delta payload
+  -- reconstructs the exact original text chunk.
+  let prop_chunkStreamEquivalence (QC.PrintableString s) =
+        let txt = T.filter (\c -> c /= '<' && c /= '>' && c /= '"' && c /= '\\') (T.pack s)
+            jsonPayload = Aeson.encode (Aeson.object ["choices" .= [Aeson.object ["delta" .= Aeson.object ["content" .= txt]]]])
+            rawLine = "data: " <> TE.decodeUtf8 (BL.toStrict jsonPayload)
+            chunk1 = parseSseChunk rawLine
+        in not (T.null txt) QC.==> (chunk1 == [ChunkText txt])
+  res4 <- QC.quickCheckResult (QC.withMaxSuccess 100 prop_chunkStreamEquivalence)
+  case res4 of
+    QC.Success {} -> assert "Streaming chunk SSE parser obeys delta text preservation" True
+    _ -> failTest "QuickCheck streaming SSE parser text preservation failed!"
+
+  putStrLn "  -> OK: QuickCheck algebraic laws (compaction idempotence, non-orphaned tool roles, working state codec, and delta text preservation) verified."
+
+instance QC.Arbitrary Role where
+  arbitrary = QC.elements [UserRole, AssistantRole, ToolRole, SystemRole]
+
+instance QC.Arbitrary BlockVisibility where
+  arbitrary = QC.elements [Visible, Collapsed]
+
+instance QC.Arbitrary ContentBlock where
+  arbitrary = QC.oneof
+    [ TextBlock . T.pack <$> QC.arbitrary
+    , ThinkingBlock <$> QC.arbitrary <*> (T.pack <$> QC.arbitrary) <*> QC.arbitrary
+    , ToolResultBlock <$> (ToolResult <$> (T.pack <$> QC.arbitrary) <*> (T.pack <$> QC.arbitrary) <*> (T.pack <$> QC.arbitrary) <*> pure Nothing)
+    ]
+
+instance QC.Arbitrary Turn where
+  arbitrary = Turn <$> QC.arbitrary <*> QC.arbitrary <*> QC.arbitrary
 
 assert :: String -> Bool -> IO ()
 assert desc condition =
