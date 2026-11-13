@@ -3955,6 +3955,16 @@ testTelemetryAndHerdrIntegration = do
   atomically $ modifyTVar' (activePrompts secState) (Map.insert 10 "Blocked on confirm")
   threadDelay 200000
 
+  -- Persist session file and transition back to idle (task completion)
+  sessNow <- readTVarIO (appSession watcherApp)
+  let sessFile = appSessionDir watcherApp </> (T.unpack (sessionId sessNow) <> ".json")
+  createDirectoryIfMissing True (appSessionDir watcherApp)
+  TIO.writeFile sessFile "{}"
+  atomically $ do
+    modifyTVar' (activePrompts secState) (Map.delete 10)
+    writeTVar (appActiveTask watcherApp) False
+  threadDelay 200000
+
   -- Stop telemetry watcher (must emit release-agent)
   stopTelemetryWatcher watcherHandle
   threadDelay 100000
@@ -3966,10 +3976,21 @@ testTelemetryAndHerdrIntegration = do
     (any (\l -> "report-agent" `T.isInfixOf` T.pack l && "--state idle" `T.isInfixOf` T.pack l) logLines)
   assert "Herdr reported blocked state with pane id and message"
     (any (\l -> "report-agent" `T.isInfixOf` T.pack l && "--state blocked" `T.isInfixOf` T.pack l && "--message Blocked on confirm" `T.isInfixOf` T.pack l) logLines)
+  assert "Herdr reported idle completion with plain resume command name (not a path)"
+    (any (\l ->
+      let ws = words l
+          afterDashDash = drop 1 (dropWhile (/= "--") ws)
+      in "--state" `elem` ws && "idle" `elem` ws
+         && "--agent-session-id" `elem` ws
+         && case afterDashDash of
+              (cmd:_) -> not ('/' `elem` cmd)
+              []      -> False
+      ) logLines)
   assert "Herdr released agent on watcher shutdown"
     (any (\l -> "release-agent" `T.isInfixOf` T.pack l && "pane-lambdA-99" `T.isInfixOf` T.pack l) logLines)
 
   -- Cleanup
+  _ <- doesFileExist sessFile >>= \exists -> if exists then removeFile sessFile else pure ()
   unsetEnv "HERDR_ENV"
   unsetEnv "HERDR_PANE_ID"
   unsetEnv "HERDR_BIN_PATH"

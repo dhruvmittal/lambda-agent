@@ -21,7 +21,7 @@ import qualified Data.Text.IO as TIO
 import Data.Word (Word64)
 import System.Directory (doesFileExist)
 import System.Environment (getExecutablePath, lookupEnv)
-import System.FilePath ((</>), (<.>))
+import System.FilePath ((</>), (<.>), takeFileName)
 import System.IO (hFlush, hIsTerminalDevice, stdout)
 import System.Process (createProcess, proc, CreateProcess(..), waitForProcess, interruptProcessGroupOf)
 import System.Timeout (timeout)
@@ -72,6 +72,9 @@ startTelemetryWatcher engineState@AppEngineState{..} = do
   let herdrActive = mHerdrEnv == Just "1" && mHerdrPane /= Nothing
       herdrPaneId = maybe "" id mHerdrPane
       herdrBinCmd = maybe "herdr" id mHerdrBin
+      execName    = case takeFileName execPath of
+        "" -> "lambda"
+        nm -> nm
 
   -- 1-slot mailbox for lossy conflation (ensures at most 1 process in flight)
   mailboxSlot <- newTVarIO (Nothing :: Maybe TelemetrySnapshot)
@@ -114,7 +117,7 @@ startTelemetryWatcher engineState@AppEngineState{..} = do
             LifecycleBlocked reason -> ("blocked", ["--message", T.unpack (sanitizeHerdrMessage reason)])
 
           resumeArgs = case mPersistedSid of
-            Just sid -> ["--agent-session-id", T.unpack sid, "--", execPath, "--session", T.unpack sid]
+            Just sid -> ["--agent-session-id", T.unpack sid, "--", execName, "--session", T.unpack sid]
             Nothing  -> []
 
           reportArgs =
