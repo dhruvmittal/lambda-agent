@@ -322,6 +322,9 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
               emitEngineEvent engineState (EvError $ "Engine loop failure: " <> T.pack (show ex))
           Right () -> pure ()
 
+        -- Auto-save session state before signalling task completion so telemetry sees the persisted file
+        persistCurrentSession engineState
+
         atomically $ do
           writeTVar appActiveTask False
           curVec <- readTVar appStateVector
@@ -329,8 +332,6 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
           writeTVar appStateVector updatedVec
           writeTQueue appEventQueue (EvWorkingStateUpdate updatedVec)
 
-        -- Auto-save session state after turn completion
-        persistCurrentSession engineState
         emitEngineEvent engineState EvDone
 
       atomically $ writeTVar activeTaskVar (Just turnTask)

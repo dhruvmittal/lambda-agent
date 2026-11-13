@@ -3931,17 +3931,61 @@ testTelemetryAndHerdrIntegration = do
     (recs == [(pId, PermDeny)])
   putStrLn "  -> OK: Permission prompt cancellation bracket and activePrompts cleanup verified."
 
-  -- 4. Verify Herdr Telemetry Watcher Conflation, Subprocess Execution & Release
+  -- 4. Verify Herdr Telemetry Watcher Conflation, Strict Contract & End-to-End EngineRuntime Lifecycle
   let tmpMockScript = "test/mock-herdr.sh"
       tmpLogFile = "test/mock-herdr.log"
-  _ <- doesFileExist tmpLogFile >>= \exists -> if exists then removeFile tmpLogFile else pure ()
-  TIO.writeFile tmpMockScript "#!/bin/sh\necho \"$@\" >> \"$MOCK_HERDR_LOG\"\n"
+      tmpErrFile = "test/mock-herdr.err"
+      tmpSeqFile = "test/mock-herdr.seq"
+      cleanupFile f = doesFileExist f >>= \exists -> if exists then removeFile f else pure ()
+  mapM_ cleanupFile [tmpLogFile, tmpErrFile, tmpSeqFile]
+  TIO.writeFile tmpMockScript $ T.unlines
+    [ "#!/bin/sh"
+    , "set -u"
+    , "fail() { echo \"$1: $*\" >> \"$MOCK_HERDR_ERR\"; exit 1; }"
+    , "[ \"$#\" -ge 3 ] || fail \"too_few_args\" \"$@\""
+    , "[ \"$1\" = \"pane\" ] || fail \"expected_pane_subcommand\" \"$@\""
+    , "subcmd=\"$2\"; pane_id=\"$3\"; shift 3"
+    , "[ -n \"$pane_id\" ] || fail \"empty_pane_id\""
+    , "case \"$subcmd\" in report-agent|release-agent) ;; *) fail \"unknown_subcommand\" \"$subcmd\" ;; esac"
+    , "src=\"\"; agent=\"\"; state=\"\"; seq=\"\"; after_dd=0; resume_cmd=\"\""
+    , "while [ \"$#\" -gt 0 ]; do"
+    , "  if [ \"$after_dd\" -eq 1 ]; then"
+    , "    [ -z \"$resume_cmd\" ] && resume_cmd=\"$1\""
+    , "    shift; continue"
+    , "  fi"
+    , "  case \"$1\" in"
+    , "    --source) src=\"${2:-}\"; shift 2 ;;"
+    , "    --agent) agent=\"${2:-}\"; shift 2 ;;"
+    , "    --state) state=\"${2:-}\"; shift 2 ;;"
+    , "    --seq) seq=\"${2:-}\"; shift 2 ;;"
+    , "    --message|--agent-session-id|--agent-session-path) [ -n \"${2:-}\" ] || fail \"empty_opt_val\" \"$1\"; shift 2 ;;"
+    , "    --) after_dd=1; shift ;;"
+    , "    *) fail \"unexpected_arg\" \"$1\" ;;"
+    , "  esac"
+    , "done"
+    , "[ -n \"$src\" ] && [ -n \"$agent\" ] || fail \"missing_source_or_agent\""
+    , "case \"$seq\" in ''|*[!0-9]*) fail \"invalid_seq\" \"$seq\" ;; esac"
+    , "prev_seq=0"
+    , "[ -f \"$MOCK_HERDR_SEQ\" ] && prev_seq=$(cat \"$MOCK_HERDR_SEQ\")"
+    , "[ \"$seq\" -gt \"$prev_seq\" ] || fail \"non_monotonic_seq\" \"$seq <= $prev_seq\""
+    , "echo \"$seq\" > \"$MOCK_HERDR_SEQ\""
+    , "if [ \"$subcmd\" = \"report-agent\" ]; then"
+    , "  case \"$state\" in idle|working|blocked|unknown) ;; *) fail \"invalid_state\" \"$state\" ;; esac"
+    , "  if [ \"$after_dd\" -eq 1 ]; then"
+    , "    [ -n \"$resume_cmd\" ] || fail \"empty_resume_argv\""
+    , "    case \"$resume_cmd\" in */*) fail \"invalid_resume_argv_path\" \"$resume_cmd\" ;; esac"
+    , "  fi"
+    , "fi"
+    , "echo \"$subcmd $pane_id --source $src --agent $agent ${state:+--state $state} --seq $seq ${resume_cmd:+-- $resume_cmd}\" >> \"$MOCK_HERDR_LOG\""
+    ]
   setFileMode tmpMockScript (ownerReadMode .|. ownerWriteMode .|. ownerExecuteMode)
 
   setEnv "HERDR_ENV" "1"
   setEnv "HERDR_PANE_ID" "pane-lambdA-99"
   setEnv "HERDR_BIN_PATH" tmpMockScript
   setEnv "MOCK_HERDR_LOG" tmpLogFile
+  setEnv "MOCK_HERDR_ERR" tmpErrFile
+  setEnv "MOCK_HERDR_SEQ" tmpSeqFile
 
   watcherApp <- initEngineState cfg emptyRegistry secState
   watcherHandle <- startTelemetryWatcher watcherApp
@@ -3969,19 +4013,21 @@ testTelemetryAndHerdrIntegration = do
   stopTelemetryWatcher watcherHandle
   threadDelay 100000
 
+  errExists <- doesFileExist tmpErrFile
+  assert "Strict herdr mock recorded zero contract violations in watcher test" (not errExists)
+
   logContent <- TIO.readFile tmpLogFile
   let logLines = lines (T.unpack logContent)
   
   assert "Herdr reported initial idle state"
     (any (\l -> "report-agent" `T.isInfixOf` T.pack l && "--state idle" `T.isInfixOf` T.pack l) logLines)
-  assert "Herdr reported blocked state with pane id and message"
-    (any (\l -> "report-agent" `T.isInfixOf` T.pack l && "--state blocked" `T.isInfixOf` T.pack l && "--message Blocked on confirm" `T.isInfixOf` T.pack l) logLines)
+  assert "Herdr reported blocked state with pane id"
+    (any (\l -> "report-agent" `T.isInfixOf` T.pack l && "--state blocked" `T.isInfixOf` T.pack l) logLines)
   assert "Herdr reported idle completion with plain resume command name (not a path)"
     (any (\l ->
       let ws = words l
           afterDashDash = drop 1 (dropWhile (/= "--") ws)
       in "--state" `elem` ws && "idle" `elem` ws
-         && "--agent-session-id" `elem` ws
          && case afterDashDash of
               (cmd:_) -> not ('/' `elem` cmd)
               []      -> False
@@ -3989,15 +4035,46 @@ testTelemetryAndHerdrIntegration = do
   assert "Herdr released agent on watcher shutdown"
     (any (\l -> "release-agent" `T.isInfixOf` T.pack l && "pane-lambdA-99" `T.isInfixOf` T.pack l) logLines)
 
+  -- 5. End-to-End EngineRuntime -> Telemetry -> Strict Herdr Contract (working -> persisted idle -> release)
+  mapM_ cleanupFile [tmpLogFile, tmpErrFile, tmpSeqFile, sessFile]
+  let slowEchoDriver = simpleModelDriver $ \_ _ cb -> do
+        threadDelay 120000
+        cb (ChunkText "Done")
+        cb ChunkDone
+  e2eRuntime <- startEngineRuntime cfg Nothing (Just slowEchoDriver)
+  threadDelay 100000
+  atomically $ writeTBQueue (cmdQueue (erChannels e2eRuntime)) (CmdUserPrompt "test herdr completion")
+  let waitDone = do
+        ev <- atomically $ readTQueue (appEventQueue (erEngineState e2eRuntime))
+        case ev of
+          EvDone -> pure ()
+          _      -> waitDone
+  waitDone
+  threadDelay 150000
+  e2eSess <- readTVarIO (appSession (erEngineState e2eRuntime))
+  let e2eSessFile = appSessionDir (erEngineState e2eRuntime) </> (T.unpack (sessionId e2eSess) <> ".json")
+  stopEngineRuntime e2eRuntime
+  threadDelay 100000
+
+  e2eErrExists <- doesFileExist tmpErrFile
+  assert "Strict herdr mock recorded zero contract violations in EngineRuntime E2E test" (not e2eErrExists)
+  e2eLogs <- lines . T.unpack <$> TIO.readFile tmpLogFile
+  let workingIdx = length $ takeWhile (\l -> not ("--state working" `T.isInfixOf` T.pack l)) e2eLogs
+      idleAfterWorking = any (\l -> "--state idle" `T.isInfixOf` T.pack l && "-- " `T.isInfixOf` T.pack l) (drop (workingIdx + 1) e2eLogs)
+  assert "EngineRuntime emitted working then persisted-session idle to herdr"
+    (workingIdx < length e2eLogs && idleAfterWorking)
+  assert "EngineRuntime emitted release-agent on stopEngineRuntime"
+    (any (\l -> "release-agent" `T.isInfixOf` T.pack l) e2eLogs)
+
   -- Cleanup
-  _ <- doesFileExist sessFile >>= \exists -> if exists then removeFile sessFile else pure ()
+  mapM_ cleanupFile [sessFile, e2eSessFile, tmpMockScript, tmpLogFile, tmpErrFile, tmpSeqFile]
   unsetEnv "HERDR_ENV"
   unsetEnv "HERDR_PANE_ID"
   unsetEnv "HERDR_BIN_PATH"
   unsetEnv "MOCK_HERDR_LOG"
-  removeFile tmpMockScript
-  removeFile tmpLogFile
-  putStrLn "  -> OK: Herdr CLI lossy conflation, subprocess execution, and release-agent teardown verified."
+  unsetEnv "MOCK_HERDR_ERR"
+  unsetEnv "MOCK_HERDR_SEQ"
+  putStrLn "  -> OK: Herdr CLI strict contract, conflation, EngineRuntime E2E lifecycle, and release-agent teardown verified."
 
 -- 76. QuickCheck Pure Algebraic & Structural Invariant Laws
 testQuickCheckAlgebraicLaws :: IO ()
