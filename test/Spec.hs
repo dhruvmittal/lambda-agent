@@ -2,10 +2,12 @@
 
 module Main where
 
+import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay, forkIO)
 import Control.Concurrent.Async (mapConcurrently, race, async, wait, poll, cancel)
 import Control.Concurrent.STM
-import Control.Monad (unless)
+import Control.Exception (catch, IOException)
+import Control.Monad (unless, void)
 import Data.Bits ((.|.))
 import System.Posix.Files (setFileMode, ownerReadMode, ownerWriteMode, ownerExecuteMode)
 import System.Timeout (timeout)
@@ -29,7 +31,7 @@ import System.FilePath ((</>))
 import Skylighting (TokenType(..))
 import qualified Test.QuickCheck as QC
 
-import Lambda.Config (loadConfig, Config(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, lookupModelContextLimitWithConfig, resolveEnvTemplates, persistTheme, extractProviderAndModel, parseMarkdownAgent, loadAllMarkdownAgents)
+import Lambda.Config (loadConfig, Config(..), McpServerConfig(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, lookupModelContextLimitWithConfig, resolveEnvTemplates, persistTheme, extractProviderAndModel, parseMarkdownAgent, loadAllMarkdownAgents)
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro, expandPromptMacro)
 import Lambda.Core.EngineInterface (initEngineChannels, cmdQueue, startEngineLoop, EngineChannels(..), EngineRuntime(..), startEngineRuntime, stopEngineRuntime)
 import Lambda.Core.ModelDriver (ModelDriver(..), simpleModelDriver)
@@ -90,7 +92,7 @@ import Lambda.Engine.SubAgent (submitReportTool, filterSubAgentRegistry, subAgen
 import qualified Data.Map.Strict as Map
 import Brick.BChan (newBChan, writeBChan)
 import Brick.AttrMap (attrName, attrMap)
-import Brick.Main (customMainWithVty, App(..), showFirstCursor)
+import Brick.Main (customMainWithVty, App(..), showFirstCursor, halt)
 import Brick.Types (vSize, Size(..))
 import qualified Brick.Widgets.Edit as E
 import qualified Graphics.Vty as V
@@ -100,7 +102,7 @@ import Lambda.Provider.Builtin (builtinTools, builtinToolsWithManager, callMcpTo
 import Lambda.Provider.Mcp (inferCapability, parseMcpCallResult, startAndLoadMcpServers, stopMcpClient)
 import Lambda.UI.Completion (completeInput, allCommands, computeCommandCandidates, slidingCandidateWindow)
 import Lambda.UI.Draw (drawApp, renderSubAgents, renderSubAgentsSelected, renderInlineSubAgent, renderCompletionLine, renderPowerlinePrompt, wrapLineWithSpans, wrapEditorToVisual, wrapEditorToVisualWithFirstWidth, distributeSubAgentsToTurns)
-import Lambda.UI.Events (handleAppEvent, computeCommandMatches, replaceCurrentToken, cycleCompletedToken)
+import Lambda.UI.Events (handleAppEvent, applyEngineEvent, computeCommandMatches, replaceCurrentToken, cycleCompletedToken)
 import Lambda.UI.Markdown
   ( renderMarkdown
   , parseMarkdownBlocks
@@ -114,7 +116,7 @@ import Lambda.UI.Markdown
   , MdBlock(..)
   , WordToken(..)
   )
-import Lambda.UI.Types (CompletionState(..), Candidate(..), simpleCandidate, ResourceName(..), UIState(..), isGeneratingL, spinnerStepL, workingStateL, turnsL, defaultUIState)
+import Lambda.UI.Types (CompletionState(..), Candidate(..), simpleCandidate, ResourceName(..), UIState(..), SessionChooserState(..), isGeneratingL, spinnerStepL, workingStateL, turnsL, defaultUIState)
 import Lambda.UI.Theme (ThemePalette(..), builtinThemes, builtinThemeNames, parseHexColor, resolveThemePalette, resolveThemeAttrMap)
 import Lambda.Types
 import Lens.Micro ((&), (^.), (.~), (%~))
@@ -127,6 +129,7 @@ import Lambda.Server.Acp
   , AcpServerState(..)
   , formatToolCallTitle
   , determineToolKind
+  , parsePlanEntriesFromVector
   , broadcastUsageUpdate
   )
 import Lambda.Server.Acp.Types
@@ -211,6 +214,12 @@ main = do
   testAcpStopCancellationAndToolFormatting
   testTelemetryAndHerdrIntegration
   testQuickCheckAlgebraicLaws
+  testUiDrawThemeAndAcpHelpers
+  testApplyEngineEventInvariants
+  testSecurityAndSubAgentInvariants
+  testAcpSlashCommandsAndErrors
+  testDeterministicMcpStdioMock
+  testEngineLoopCoreInvariants
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -4151,6 +4160,440 @@ testQuickCheckAlgebraicLaws = do
     _ -> failTest "QuickCheck streaming SSE parser text preservation failed!"
 
   putStrLn "  -> OK: QuickCheck algebraic laws (compaction idempotence, non-orphaned tool roles, working state codec, and delta text preservation) verified."
+
+-- 77. Pure UI Draw, Theme Engine & ACP Helpers (Spec-Driven)
+testUiDrawThemeAndAcpHelpers :: IO ()
+testUiDrawThemeAndAcpHelpers = do
+  putStrLn "\n[Test 77] Pure UI Draw, Theme Engine & ACP Helpers"
+  eQueue <- atomically (newTQueue :: STM (TQueue EngineEvent))
+  chans <- initEngineChannels eQueue
+  let cfg = defaultConfig { workspaceRoot = "." }
+      baseUI = defaultUIState chans cfg
+  now <- getCurrentTime
+  replyVar <- newEmptyTMVarIO
+
+  let sampleTask = SubAgentTask
+        { subAgentId = 1
+        , subAgentRole = "surveyor"
+        , subAgentHypothesis = "Inspecting module boundaries"
+        , subAgentTurnCount = 2
+        , subAgentBudget = 8
+        , subAgentStatus = SubAgentRunning
+        , subAgentArtifact = Nothing
+        , subAgentTurns = [Turn 10 AssistantRole [TextBlock "Scanning files..."]]
+        , subAgentParentTurnId = Just 1
+        }
+      samplePrompt = PermissionPrompt
+        { promptId = 42
+        , promptCaller = MainAgent
+        , promptTool = "bash"
+        , promptArgs = Aeson.object ["command" .= ("echo hello" :: Text)]
+        , promptProposedGlob = "echo*"
+        , promptReply = replyVar
+        , promptToolCallId = Just "call_42"
+        }
+      sampleMeta = SessionMeta
+        { metaId = "sess_1"
+        , metaParentId = Nothing
+        , metaCreatedAt = now
+        , metaUpdatedAt = now
+        , metaTitle = "Test Session"
+        , metaTurnCount = 2
+        , metaSubAgentCount = 1
+        , metaMode = PlanMode
+        }
+      fixtures :: [(String, UIState)]
+      fixtures =
+        [ ("idle default", baseUI)
+        , ("generating+thinking+subagent", baseUI
+            { uiIsGenerating = True
+            , uiThinkingVisible = True
+            , uiTurns =
+                [ Turn 1 UserRole [TextBlock "Analyze repo"]
+                , Turn 2 AssistantRole [ThinkingBlock 1 "Checking types..." Visible, TextBlock "Working on it."]
+                ]
+            , uiSubAgents = Map.singleton 1 sampleTask
+            })
+        , ("permission prompt", baseUI { uiCurrentPrompt = Just samplePrompt })
+        , ("session chooser", baseUI { uiSessionChooser = Just (SessionChooserState [sampleMeta] 0 "sess_1") })
+        , ("hud overlay", baseUI { uiShowHud = True })
+        , ("selected subagent", baseUI { uiSubAgents = Map.singleton 1 sampleTask, uiSelectedSubAgent = Just 1 })
+        ]
+
+  let renderAtSize (w, h) (label, st) = do
+        assert ("drawApp non-empty for " <> label) (not (null (drawApp st)))
+        inChan <- atomically (newTChan :: STM (TChan InternalEvent))
+        let mockIn = Input
+              { eventChannel      = inChan
+              , shutdownInput     = pure ()
+              , restoreInputState = pure ()
+              , inputLogMsg       = const (pure ())
+              }
+        (_, mockOut) <- mockTerminal (w, h)
+        mockVty <- V.mkVtyFromPair mockIn mockOut
+        let app :: App UIState EngineEvent ResourceName
+            app = App
+              { appDraw         = drawApp
+              , appChooseCursor = showFirstCursor
+              , appHandleEvent  = \_ -> halt
+              , appStartEvent   = pure ()
+              , appAttrMap      = const (resolveThemeAttrMap cfg)
+              }
+        atomically $ writeTChan inChan (InputEvent (V.EvKey V.KEsc []))
+        void $ customMainWithVty mockVty (pure mockVty) Nothing app st
+
+  mapM_ (\sz -> mapM_ (renderAtSize sz) fixtures) [(40, 12), (80, 24), (160, 50)]
+
+  assert "parseHexColor #000000" (parseHexColor "#000000" == Just (V.linearColor 0 0 0))
+  assert "parseHexColor #ffffff" (parseHexColor "#ffffff" == Just (V.linearColor 255 255 255))
+  assert "parseHexColor rejects empty" (parseHexColor "" == Nothing)
+  assert "parseHexColor rejects #12" (parseHexColor "#12" == Nothing)
+  assert "parseHexColor rejects #zzzzzz" (parseHexColor "#zzzzzz" == Nothing)
+  mapM_ (\tName -> do
+    assert ("resolveThemePalette " <> T.unpack tName) (isJust (resolveThemePalette cfg tName))
+    let am = resolveThemeAttrMap (cfg { themeName = tName })
+    seq am (pure ())
+    ) builtinThemeNames
+  assert "resolveThemePalette unknown -> Nothing" (isNothing (resolveThemePalette cfg "nonexistent-theme-xyz"))
+  let fallbackAm = resolveThemeAttrMap (cfg { themeName = "nonexistent-theme-xyz" })
+  seq fallbackAm (pure ())
+
+  let tcRead    = ToolCall "c1" "read_file" (Aeson.object ["path" .= ("src/Main.hs" :: Text)])
+      tcWrite   = ToolCall "c2" "write_file" (Aeson.object ["path" .= ("out.txt" :: Text)])
+      tcEdit    = ToolCall "c3" "edit_file" (Aeson.object ["path" .= ("src/Lib.hs" :: Text)])
+      tcBash    = ToolCall "c4" "bash" (Aeson.object ["command" .= ("cabal test" :: Text)])
+      tcSub     = ToolCall "c5" "spawn_specialist_subagent" (Aeson.object ["role" .= ("surveyor" :: Text)])
+      tcUnknown = ToolCall "c6" "custom_mystery_tool" (Aeson.object ["foo" .= ("bar" :: Text)])
+  mapM_ (\tc -> assert ("formatToolCallTitle non-empty for " <> T.unpack (toolCallName tc))
+                  (not (T.null (formatToolCallTitle tc))))
+    [tcRead, tcWrite, tcEdit, tcBash, tcSub, tcUnknown]
+  assert "formatToolCallTitle bash mentions command or bash"
+    ("cabal test" `T.isInfixOf` formatToolCallTitle tcBash || "bash" `T.isInfixOf` formatToolCallTitle tcBash)
+
+  assert "determineToolKind read_file == read" (determineToolKind "read_file" == "read")
+  assert "determineToolKind write_file == edit" (determineToolKind "write_file" == "edit")
+  assert "determineToolKind edit_file == edit" (determineToolKind "edit_file" == "edit")
+  assert "determineToolKind bash == execute" (determineToolKind "bash" == "execute")
+  assert "determineToolKind list_directory == read" (determineToolKind "list_directory" == "read")
+  assert "determineToolKind unknown == execute" (determineToolKind "custom_mystery_tool" == "execute")
+
+  let validVec = T.unlines
+        [ "GOAL: Implement black-box tests"
+        , "INVARIANTS: [no_crash, pure_state]"
+        , "ACTIVE_HYPOTHESIS: Testing parser"
+        , "BLOCKED_ON: Ready"
+        ]
+      entriesValid = parsePlanEntriesFromVector validVec
+  assert "parsePlanEntriesFromVector parses valid vector" (not (null entriesValid))
+  assert "parsePlanEntriesFromVector empty -> []" (null (parsePlanEntriesFromVector ""))
+  assert "parsePlanEntriesFromVector malformed does not crash" (length (parsePlanEntriesFromVector "garbage without keys") >= 0)
+  putStrLn "  -> OK: Pure UI draw, Theme engine, and ACP helpers verified."
+
+-- 78. Pure applyEngineEvent State Machine Invariants (Spec-Driven)
+testApplyEngineEventInvariants :: IO ()
+testApplyEngineEventInvariants = do
+  putStrLn "\n[Test 78] Pure applyEngineEvent State Machine Invariants"
+  eQueue <- atomically (newTQueue :: STM (TQueue EngineEvent))
+  chans <- initEngineChannels eQueue
+  let baseUI = defaultUIState chans defaultConfig
+  rv1 <- newEmptyTMVarIO
+  rv2 <- newEmptyTMVarIO
+  rv3 <- newEmptyTMVarIO
+  let mkPrompt pid rv = PermissionPrompt pid MainAgent "bash" (Aeson.object []) "echo*" rv Nothing
+      p1 = mkPrompt 1 rv1
+      p2 = mkPrompt 2 rv2
+      p3 = mkPrompt 3 rv3
+      toListSeq = foldr (:) []
+
+  let s1 = applyEngineEvent (EvPermissionRequired p1) baseUI
+  assert "EvPermissionRequired on empty sets uiCurrentPrompt"
+    (fmap promptId (uiCurrentPrompt s1) == Just 1 && Seq.null (uiPendingPrompts s1))
+
+  let s2 = applyEngineEvent (EvPermissionRequired p3) (applyEngineEvent (EvPermissionRequired p2) s1)
+  assert "EvPermissionRequired on occupied appends FIFO to uiPendingPrompts"
+    (fmap promptId (uiCurrentPrompt s2) == Just 1
+     && fmap promptId (toListSeq (uiPendingPrompts s2)) == [2, 3])
+
+  let sRemPending = applyEngineEvent (EvPermissionResolved 2 PermOnce) s2
+  assert "EvPermissionResolved on pending removes p2, keeps p1 current"
+    (fmap promptId (uiCurrentPrompt sRemPending) == Just 1
+     && fmap promptId (toListSeq (uiPendingPrompts sRemPending)) == [3])
+
+  let sUnknown = applyEngineEvent (EvPermissionResolved 999 PermDeny) sRemPending
+  assert "EvPermissionResolved unknown ID leaves prompts unchanged"
+    (fmap promptId (uiCurrentPrompt sUnknown) == Just 1
+     && fmap promptId (toListSeq (uiPendingPrompts sUnknown)) == [3])
+
+  let sPromoted = applyEngineEvent (EvPermissionResolved 1 PermAlways) sUnknown
+  assert "EvPermissionResolved on current promotes p3"
+    (fmap promptId (uiCurrentPrompt sPromoted) == Just 3
+     && Seq.null (uiPendingPrompts sPromoted))
+
+  let sEmpty = applyEngineEvent (EvPermissionResolved 3 PermOnce) sPromoted
+  assert "EvPermissionResolved on last prompt sets Nothing"
+    (isNothing (uiCurrentPrompt sEmpty) && Seq.null (uiPendingPrompts sEmpty))
+
+  let prop_turnAdded (initTurns :: [Turn]) (newTurn :: Turn) =
+        let st = baseUI { uiTurns = initTurns }
+            st' = applyEngineEvent (EvTurnAdded newTurn) st
+        in length (uiTurns st') == length initTurns + 1
+           && take (length initTurns) (uiTurns st') == initTurns
+           && case reverse (uiTurns st') of
+                (added:_) -> turnId added == turnId newTurn && turnRole added == turnRole newTurn
+                []        -> False
+      prop_doneAndErrorClearsGenerating (wasGen :: Bool) (QC.PrintableString errTxt) =
+        let st = baseUI { uiIsGenerating = wasGen }
+            stDone = applyEngineEvent EvDone st
+            stErr  = applyEngineEvent (EvError (T.pack errTxt)) st
+        in not (uiIsGenerating stDone) && not (uiIsGenerating stErr)
+
+  r1 <- QC.quickCheckResult (QC.withMaxSuccess 100 prop_turnAdded)
+  case r1 of
+    QC.Success {} -> assert "QuickCheck EvTurnAdded appends turn" True
+    _             -> failTest "QuickCheck EvTurnAdded failed"
+  r2 <- QC.quickCheckResult (QC.withMaxSuccess 100 prop_doneAndErrorClearsGenerating)
+  case r2 of
+    QC.Success {} -> assert "QuickCheck EvDone/EvError clears uiIsGenerating" True
+    _             -> failTest "QuickCheck EvDone/EvError failed"
+
+  let sErr = applyEngineEvent (EvError "boom failure") (baseUI { uiIsGenerating = True })
+  assert "EvError records error turn or message in uiTurns"
+    (not (uiIsGenerating sErr) && any (\t -> "boom failure" `T.isInfixOf` T.pack (show t)) (uiTurns sErr))
+  putStrLn "  -> OK: applyEngineEvent invariants verified."
+
+-- 79. Security Precedence & SubAgent Registry Filtering (Spec-Driven)
+testSecurityAndSubAgentInvariants :: IO ()
+testSecurityAndSubAgentInvariants = do
+  putStrLn "\n[Test 79] Security Precedence & SubAgent Registry Filtering"
+  assert "deriveSecurityGlob git status" (deriveSecurityGlob "git status -s" == "git status*")
+  assert "deriveSecurityGlob cargo test" (deriveSecurityGlob "cargo test --lib" == "cargo test*")
+  assert "deriveSecurityGlob nix build" (deriveSecurityGlob "nix build .#default" == "nix build*")
+  assert "deriveSecurityGlob single command ls" (deriveSecurityGlob "ls -la" == "ls*")
+  assert "deriveSecurityGlob outside_workspace" (deriveSecurityGlob "outside_workspace: read_file /etc/hosts" == "outside_workspace: read_file*")
+  assert "deriveSecurityGlob empty safe" (length (deriveSecurityGlob "") >= 0)
+
+  secDenyFirst <- initSecurity ["rm*", "bash*"] ["rm -rf /*"]
+  denied <- checkAuthorization secDenyFirst MainAgent "rm -rf /*" (Aeson.object []) Nothing
+  assert "Deny-first: command matching both allow and deny returns False" (not denied)
+
+  let tmpWs = "/tmp/lambda_spec_sec_ws"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+  sec <- initSecurityWithRoot tmpWs [] []
+
+  aSess <- async $ checkAuthorization sec MainAgent "echo session_ok" (Aeson.object []) Nothing
+  pSess <- atomically $ readTBQueue (uiPromptQueue sec)
+  resolvePrompt pSess PermSession
+  rSess <- wait aSess
+  assert "PermSession allows first call" rSess
+  rSess2 <- checkAuthorization sec MainAgent "echo session_ok" (Aeson.object []) Nothing
+  assert "PermSession allows subsequent identical call without prompt" rSess2
+  cfgExistsAfterSess <- doesFileExist (tmpWs </> ".lambda" </> "config.json")
+  assert "PermSession does not persist to .lambda/config.json" (not cfgExistsAfterSess)
+
+  aNever <- async $ checkAuthorization sec MainAgent "curl http://example.com" (Aeson.object []) Nothing
+  pNever <- atomically $ readTBQueue (uiPromptQueue sec)
+  resolvePrompt pNever PermNever
+  rNever <- wait aNever
+  assert "PermNever denies first call" (not rNever)
+  rNever2 <- checkAuthorization sec MainAgent "curl http://example.com" (Aeson.object []) Nothing
+  assert "PermNever denies subsequent identical call without prompting" (not rNever2)
+  emptyQ <- atomically $ isEmptyTBQueue (uiPromptQueue sec)
+  assert "PermNever did not queue second prompt" emptyQ
+
+  aAlways <- async $ checkAuthorization sec MainAgent "pytest tests/" (Aeson.object []) Nothing
+  pAlways <- atomically $ readTBQueue (uiPromptQueue sec)
+  resolvePrompt pAlways PermAlways
+  rAlways <- wait aAlways
+  assert "PermAlways allows call" rAlways
+  cfgExistsAfterAlways <- doesFileExist (tmpWs </> ".lambda" </> "config.json")
+  assert "PermAlways creates .lambda/config.json" cfgExistsAfterAlways
+  removeDirectoryRecursive tmpWs
+
+  reportVar <- newTVarIO Nothing
+  let mkDummyTool nm cap sc = ToolDefinition nm ("desc " <> nm) (Aeson.object []) cap False (\_ _ -> pure (ToolResult "" "" "" Nothing)) sc
+      reportDef = submitReportTool reportVar
+      sampleReg = registerTools
+        [ mkDummyTool "read_file" ReadOnly Universal
+        , mkDummyTool "root_only_tool" Destructive RootOnly
+        , mkDummyTool "spawn_custom" Destructive Universal
+        , mkDummyTool "resume_custom" Destructive Universal
+        , reportDef
+        ] emptyRegistry
+      filtered = filterSubAgentRegistry reportDef sampleReg
+      toolsList = Map.elems (registeredTools filtered)
+  assert "filterSubAgentRegistry removes all RootOnly tools" (all (\t -> toolScope t /= RootOnly) toolsList)
+  assert "filterSubAgentRegistry removes all spawn_* tools" (all (\t -> not ("spawn_" `T.isPrefixOf` toolName t)) toolsList)
+  assert "filterSubAgentRegistry removes all resume_* tools" (all (\t -> not ("resume_" `T.isPrefixOf` toolName t)) toolsList)
+  assert "filterSubAgentRegistry retains submit_report" (Map.member "submit_report" (registeredTools filtered))
+  assert "filterSubAgentRegistry retains Universal read_file" (Map.member "read_file" (registeredTools filtered))
+  putStrLn "  -> OK: Security precedence and SubAgent registry invariants verified."
+
+-- 80. ACP Slash Commands & JSON-RPC Error Handling (Spec-Driven)
+testAcpSlashCommandsAndErrors :: IO ()
+testAcpSlashCommandsAndErrors = do
+  putStrLn "\n[Test 80] ACP Slash Commands & JSON-RPC Error Handling"
+  let cfg = defaultConfig { apiBaseUrl = "", mcpServers = Map.empty, workspaceRoot = "." }
+  outQ <- newTQueueIO
+  state <- initAcpServerStateWithSink cfg (atomically . writeTQueue outQ)
+
+  handleAcpRequest state (AcpJsonRpcRequest (Just (Aeson.toJSON (1 :: Int))) "session/new" (Just (Aeson.object ["cwd" .= ("." :: Text)])))
+  msgsNew <- drainQueue outQ
+  let extractSessionId [] = Nothing
+      extractSessionId (b:bs) = case Aeson.decode b of
+        Just (AcpJsonRpcResponse _ (Just (Aeson.Object o)) _) ->
+          parseMaybe (.: "sessionId") o <|> extractSessionId bs
+        _ -> extractSessionId bs
+  (sid :: Text) <- case extractSessionId msgsNew of
+    Just s  -> pure s
+    Nothing -> failTest "Failed to create ACP session" >> pure ""
+
+  let runSlash reqIdNum cmdTxt = do
+        handleAcpRequest state $ AcpJsonRpcRequest
+          (Just (Aeson.toJSON (reqIdNum :: Int)))
+          "session/prompt"
+          (Just (Aeson.object ["sessionId" .= sid, "prompt" .= [Aeson.object ["type" .= ("text" :: Text), "text" .= cmdTxt]]]))
+        drainQueue outQ
+
+  mapM_ (\(idx, cmd) -> do
+    resps <- runSlash idx cmd
+    let hasOkResp = any (\b -> case Aeson.decode b of
+          Just (AcpJsonRpcResponse rId mRes mErr) -> rId == Aeson.toJSON idx && isJust mRes && isNothing mErr
+          _ -> False) resps
+    assert ("Slash command " <> T.unpack cmd <> " returned success response") hasOkResp
+    ) (zip [10..] ["/plan", "/exec", "/model", "/compact", "/clear", "/help", "/commands"])
+
+  let expectError reqIdNum method mParams label = do
+        handleAcpRequest state (AcpJsonRpcRequest (Just (Aeson.toJSON (reqIdNum :: Int))) method mParams)
+        resps <- drainQueue outQ
+        let hasErr = any (\b -> case Aeson.decode b of
+              Just (AcpJsonRpcResponse rId _ (Just _)) -> rId == Aeson.toJSON reqIdNum
+              _ -> False) resps
+        assert ("JSON-RPC error expected for: " <> label) hasErr
+
+  expectError 100 "unknown/nonexistent_method" Nothing "unknown method"
+  expectError 101 "session/set_mode" Nothing "missing session/set_mode params"
+  expectError 104 "session/set_mode" (Just (Aeson.object [])) "invalid session/set_mode params"
+  expectError 102 "session/prompt" Nothing "missing session/prompt params"
+  expectError 103 "session/load" (Just (Aeson.object ["sessionId" .= ("no-such-session-xyz" :: Text)])) "unknown session in session/load"
+  putStrLn "  -> OK: ACP slash commands and JSON-RPC protocol errors verified."
+
+-- 81. Deterministic POSIX sh MCP Stdio Mock (Spec-Driven)
+testDeterministicMcpStdioMock :: IO ()
+testDeterministicMcpStdioMock = do
+  putStrLn "\n[Test 81] Deterministic POSIX sh MCP Stdio Mock"
+  let shScript = T.unlines
+        [ "while IFS= read -r line; do"
+        , "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p')"
+        , "  case \"$line\" in"
+        , "    *\"\\\"method\\\":\\\"initialize\\\"\"*|*\"\\\"method\\\": \\\"initialize\\\"\"*)"
+        , "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"mock-mcp\",\"version\":\"1.0\"}}}\\n' \"$id\""
+        , "      ;;"
+        , "    *\"tools/list\"*)"
+        , "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"tools\":[{\"name\":\"read_mock_item\",\"description\":\"Read item\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}}}},{\"name\":\"write_mock_item\",\"description\":\"Write item\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}}}}]}}\\n' \"$id\""
+        , "      ;;"
+        , "    *\"tools/call\"*)"
+        , "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"mock-ok\"}],\"isError\":false}}\\n' \"$id\""
+        , "      ;;"
+        , "  esac"
+        , "done"
+        ]
+      srvCfg = McpServerConfig "sh" ["-c", shScript] Map.empty
+
+  (clients, tools) <- startAndLoadMcpServers (Map.singleton "mock" srvCfg)
+  assert "Loaded 1 MCP client" (length clients == 1)
+  assert "Loaded 2 MCP tools" (length tools == 2)
+
+  let mReadTool  = filter (\t -> toolName t == "read_mock_item") tools
+      mWriteTool = filter (\t -> toolName t == "write_mock_item") tools
+  assert "read_mock_item inferred ReadOnly" (fmap toolCapability mReadTool == [ReadOnly])
+  assert "write_mock_item inferred Destructive" (fmap toolCapability mWriteTool == [Destructive])
+
+  case mReadTool of
+    (rt:_) -> do
+      res <- toolExecute rt MainAgent (Aeson.object ["key" .= ("k1" :: Text)])
+      assert "MCP tools/call returned mock-ok" ("mock-ok" `T.isInfixOf` resultStdout res)
+    [] -> failTest "read_mock_item missing"
+
+  mapM_ stopMcpClient clients
+  putStrLn "  -> OK: Deterministic MCP stdio mock verified."
+
+-- 82. Engine Loop Core Invariants (Spec-Driven)
+testEngineLoopCoreInvariants :: IO ()
+testEngineLoopCoreInvariants = do
+  putStrLn "\n[Test 82] Engine Loop Core Invariants (Rewind, Budget, Switch, Exception)"
+  let tmpRoot = "/tmp/lambda_spec_engine_core"
+      tmpSess = tmpRoot </> "sessions"
+  removeDirectoryRecursive tmpRoot `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpSess
+
+  let baseCfg = defaultConfig
+        { apiBaseUrl = ""
+        , mcpServers = Map.empty
+        , workspaceRoot = tmpRoot
+        , maxTurnBudget = 2
+        }
+  sec <- initSecurityWithRoot tmpRoot [] []
+  sess <- newSession
+  let dummyTool = ToolDefinition "dummy_ro" "Dummy read" (Aeson.object []) ReadOnly False (\_ _ -> pure (ToolResult "" "ok" "" Nothing)) Universal
+      reg = registerTool dummyTool emptyRegistry
+
+  esRewind <- initEngineStateWithSession baseCfg reg sec (Just sess { sessionTurns = [Turn 1 UserRole [TextBlock "u1"], Turn 2 AssistantRole [TextBlock "a1"]] })
+  let esRewind' = esRewind { appSessionDir = tmpSess }
+      runningTask = SubAgentTask 1 "surveyor" "hyp" 1 5 SubAgentRunning Nothing [] (Just 1)
+  atomically $ writeTVar (appSubAgents esRewind') (Map.singleton 1 runningTask)
+  chansRewind <- initEngineChannels (appEventQueue esRewind')
+  let noopDriver = simpleModelDriver (\_ _ cb -> cb ChunkDone)
+  startEngineLoop esRewind' noopDriver chansRewind
+  atomically $ writeTBQueue (cmdQueue chansRewind) (CmdRewindTurns 1)
+  threadDelay 50000
+  subAgentsAfter <- readTVarIO (appSubAgents esRewind')
+  assert "CmdRewindTurns transitions SubAgentRunning to SubAgentBlocked"
+    (fmap subAgentStatus (Map.lookup 1 subAgentsAfter) == Just (SubAgentBlocked "Cancelled on session rewind"))
+
+  esBudget <- initEngineStateWithSession baseCfg reg sec (Just sess)
+  let esBudget' = esBudget { appSessionDir = tmpSess }
+  chansBudget <- initEngineChannels (appEventQueue esBudget')
+  let infiniteToolDriver = simpleModelDriver $ \_ _ cb -> do
+        cb (ChunkToolCallStart "call_loop" "dummy_ro")
+        cb (ChunkToolCallArgs "call_loop" "{}")
+        cb ChunkDone
+  startEngineLoop esBudget' infiniteToolDriver chansBudget
+  atomically $ writeTBQueue (cmdQueue chansBudget) (CmdUserPrompt "loop")
+  threadDelay 150000
+  evsBudget <- drainQueue (appEventQueue esBudget')
+  assert "maxTurnBudget stops loop and emits EvDone" (any (\ev -> case ev of EvDone -> True; _ -> False) evsBudget)
+
+  atomically $ writeTBQueue (cmdQueue chansRewind) (CmdSwitchSession "nonexistent-session-999")
+  threadDelay 50000
+  evsSwitch <- drainQueue (appEventQueue esRewind')
+  assert "CmdSwitchSession nonexistent ID emits EvError"
+    (any (\ev -> case ev of EvError _ -> True; _ -> False) evsSwitch)
+
+  let throwingDriver = simpleModelDriver (\_ _ _ -> error "driver exploded")
+  esThrow1 <- initEngineStateWithSession baseCfg reg sec (Just sess)
+  let esThrow1' = esThrow1 { appSessionDir = tmpSess }
+  chansT1 <- initEngineChannels (appEventQueue esThrow1')
+  startEngineLoop esThrow1' throwingDriver chansT1
+  atomically $ writeTBQueue (cmdQueue chansT1) (CmdUserPrompt "trigger error")
+  threadDelay 50000
+  evsT1 <- drainQueue (appEventQueue esThrow1')
+  assert "Uncaught ModelDriver exception emits EvError when appInterrupted == False"
+    (any (\ev -> case ev of EvError _ -> True; _ -> False) evsT1)
+
+  esThrow2 <- initEngineStateWithSession baseCfg reg sec (Just sess)
+  let esThrow2' = esThrow2 { appSessionDir = tmpSess }
+      interruptedThrowDriver = simpleModelDriver (\_ _ _ -> atomically (writeTVar (appInterrupted esThrow2') True) >> error "interrupted explosion")
+  chansT2 <- initEngineChannels (appEventQueue esThrow2')
+  startEngineLoop esThrow2' interruptedThrowDriver chansT2
+  atomically $ writeTBQueue (cmdQueue chansT2) (CmdUserPrompt "trigger interrupted error")
+  threadDelay 50000
+  evsT2 <- drainQueue (appEventQueue esThrow2')
+  assert "Uncaught ModelDriver exception suppresses EvError when appInterrupted == True"
+    (not (any (\ev -> case ev of EvError _ -> True; _ -> False) evsT2))
+
+  removeDirectoryRecursive tmpRoot
+  putStrLn "  -> OK: Engine loop core invariants verified."
 
 instance QC.Arbitrary Role where
   arbitrary = QC.elements [UserRole, AssistantRole, ToolRole, SystemRole]

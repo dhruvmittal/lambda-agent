@@ -4,6 +4,7 @@
 
 module Lambda.UI.Events
   ( handleAppEvent
+  , applyEngineEvent
   , allCommands
   , computeCommandMatches
   , replaceCurrentToken
@@ -52,70 +53,75 @@ import Lambda.UI.Completion (completeInput, allCommands, computeCommandCandidate
 import Lambda.UI.Theme (ThemePalette(..), builtinThemeNames, resolveThemePalette)
 import Lambda.UI.Types
 
+-- | Pure state transition for engine-originated events (testable without Brick EventM).
+applyEngineEvent :: EngineEvent -> UIState -> UIState
+applyEngineEvent engineEv s = case engineEv of
+  EvTurnAdded turn ->
+    let vis = uiThinkingVisible s
+        adjusted = setThinkingVis (if vis then Visible else Collapsed) turn
+    in turnsL %~ (++ [adjusted]) $ s
+  EvTurnUpdated turn ->
+    let vis = uiThinkingVisible s
+        adjusted = setThinkingVis (if vis then Visible else Collapsed) turn
+    in turnsL %~ updateMatchingTurn adjusted $ s
+  EvSessionSwitched _ mode turns subs ->
+    let vis = uiThinkingVisible s
+        adjustedTurns = map (setThinkingVis (if vis then Visible else Collapsed)) turns
+        adjustedSubs = Map.map (\t -> t { subAgentTurns = map (setThinkingVis (if vis then Visible else Collapsed)) (subAgentTurns t) }) subs
+    in s
+      { uiTurns = adjustedTurns
+      , uiSubAgents = adjustedSubs
+      , uiMode = mode
+      , uiSelectedSubAgent = Nothing
+      , uiIsGenerating = False
+      , uiExecutionStart = Nothing
+      }
+  EvSubAgentUpdate task ->
+    let vis = uiThinkingVisible s
+        adjustedTurns = map (setThinkingVis (if vis then Visible else Collapsed)) (subAgentTurns task)
+        adjustedTask = task { subAgentTurns = adjustedTurns }
+        sId = subAgentId task
+    in s { uiSubAgents = Map.insert sId adjustedTask (uiSubAgents s) }
+  EvWorkingStateUpdate ws -> workingStateL .~ ws $ s
+  EvPermissionRequired prompt ->
+    case uiCurrentPrompt s of
+      Nothing -> s { uiCurrentPrompt = Just prompt }
+      Just _  -> s { uiPendingPrompts = uiPendingPrompts s |> prompt }
+  EvPermissionResolved pId _ ->
+    let filteredPending = Seq.filter (\p -> promptId p /= pId) (uiPendingPrompts s)
+    in case uiCurrentPrompt s of
+         Just cur | promptId cur == pId ->
+           case filteredPending of
+             nextP :<| rest -> s { uiCurrentPrompt = Just nextP, uiPendingPrompts = rest }
+             Seq.Empty      -> s { uiCurrentPrompt = Nothing, uiPendingPrompts = Seq.Empty }
+         _ -> s { uiPendingPrompts = filteredPending }
+  EvModelSwitched newModel newLimit ->
+    ((modelNameL .~ newModel) . (contextLimitL .~ newLimit)) s
+  EvError err ->
+    let tId = negate (1000 + length (uiTurns s))
+    in s
+      { uiTurns = uiTurns s ++ [Turn tId SystemRole [TextBlock ("⚠️ Error: " <> err)]]
+      , uiIsGenerating = False
+      , uiExecutionStart = Nothing
+      , uiElapsedSeconds = 0
+      }
+  EvDone ->
+    s { uiIsGenerating = False, uiExecutionStart = Nothing, uiElapsedSeconds = 0 }
+  EvStreamChunk _ -> s
+  EvTick          -> s
+  where
+    updateMatchingTurn updatedTurn turns =
+      let rev = reverse turns
+          go [] = []
+          go (t:rest)
+            | turnId t == turnId updatedTurn = updatedTurn : rest
+            | otherwise                      = t : go rest
+      in reverse (go rev)
+
 handleAppEvent :: BrickEvent ResourceName EngineEvent -> EventM ResourceName UIState ()
 handleAppEvent (AppEvent engineEv) = do
   case engineEv of
-    EvTurnAdded turn -> do
-      vis <- gets uiThinkingVisible
-      let adjusted = setThinkingVis (if vis then Visible else Collapsed) turn
-      modify (turnsL %~ (++ [adjusted]))
-      vScrollToEnd (viewportScroll ChatView)
-    EvTurnUpdated turn -> do
-      vis <- gets uiThinkingVisible
-      let adjusted = setThinkingVis (if vis then Visible else Collapsed) turn
-      modify (turnsL %~ updateMatchingTurn adjusted)
-      vScrollToEnd (viewportScroll ChatView)
-    EvSessionSwitched _ mode turns subs -> do
-      vis <- gets uiThinkingVisible
-      let adjustedTurns = map (setThinkingVis (if vis then Visible else Collapsed)) turns
-          adjustedSubs = Map.map (\t -> t { subAgentTurns = map (setThinkingVis (if vis then Visible else Collapsed)) (subAgentTurns t) }) subs
-      modify $ \s -> s
-        { uiTurns = adjustedTurns
-        , uiSubAgents = adjustedSubs
-        , uiMode = mode
-        , uiSelectedSubAgent = Nothing
-        , uiIsGenerating = False
-        , uiExecutionStart = Nothing
-        }
-      vScrollToEnd (viewportScroll ChatView)
-    EvSubAgentUpdate task -> do
-      st <- get
-      let vis = uiThinkingVisible st
-          adjustedTurns = map (setThinkingVis (if vis then Visible else Collapsed)) (subAgentTurns task)
-          adjustedTask = task { subAgentTurns = adjustedTurns }
-          sId = subAgentId task
-      put st { uiSubAgents = Map.insert sId adjustedTask (uiSubAgents st) }
-      when (uiSelectedSubAgent st == Just sId) $
-        vScrollToEnd (viewportScroll SubAgentView)
-    EvWorkingStateUpdate ws -> modify (workingStateL .~ ws)
-    EvPermissionRequired prompt -> modify $ \s ->
-      case uiCurrentPrompt s of
-        Nothing -> s { uiCurrentPrompt = Just prompt }
-        Just _  -> s { uiPendingPrompts = uiPendingPrompts s |> prompt }
-    EvPermissionResolved pId _ -> modify $ \s ->
-      let filteredPending = Seq.filter (\p -> promptId p /= pId) (uiPendingPrompts s)
-      in case uiCurrentPrompt s of
-           Just cur | promptId cur == pId ->
-             case filteredPending of
-               nextP :<| rest -> s { uiCurrentPrompt = Just nextP, uiPendingPrompts = rest }
-               Seq.Empty      -> s { uiCurrentPrompt = Nothing, uiPendingPrompts = Seq.Empty }
-           _ -> s { uiPendingPrompts = filteredPending }
-    EvModelSwitched newModel newLimit -> do
-      modify ((modelNameL .~ newModel) . (contextLimitL .~ newLimit))
-      vScrollToEnd (viewportScroll ChatView)
-    EvError err -> do
-      tId <- gets (\s -> negate (1000 + length (uiTurns s)))
-      modify $ \s -> s
-        { uiTurns = uiTurns s ++ [Turn tId SystemRole [TextBlock ("⚠️ Error: " <> err)]]
-        , uiIsGenerating = False
-        , uiExecutionStart = Nothing
-        , uiElapsedSeconds = 0
-        }
-      vScrollToEnd (viewportScroll ChatView)
     EvStreamChunk _ -> continueWithoutRedraw
-    EvDone -> do
-      modify $ \s -> s { uiIsGenerating = False, uiExecutionStart = Nothing, uiElapsedSeconds = 0 }
-      vScrollToEnd (viewportScroll ChatView)
     EvTick -> do
       gen <- gets uiIsGenerating
       hasRunningSubs <- gets (any (\t -> subAgentStatus t == SubAgentRunning) . Map.elems . uiSubAgents)
@@ -133,14 +139,21 @@ handleAppEvent (AppEvent engineEv) = do
             Nothing ->
               modify (spinnerStepL %~ (\x -> (x + 1) `mod` 10))
         else continueWithoutRedraw
-  where
-    updateMatchingTurn updatedTurn turns =
-      let rev = reverse turns
-          go [] = []
-          go (t:rest)
-            | turnId t == turnId updatedTurn = updatedTurn : rest
-            | otherwise                      = t : go rest
-      in reverse (go rev)
+    EvSubAgentUpdate task -> do
+      st <- get
+      put (applyEngineEvent engineEv st)
+      when (uiSelectedSubAgent st == Just (subAgentId task)) $
+        vScrollToEnd (viewportScroll SubAgentView)
+    _ -> do
+      modify (applyEngineEvent engineEv)
+      case engineEv of
+        EvTurnAdded _           -> vScrollToEnd (viewportScroll ChatView)
+        EvTurnUpdated _         -> vScrollToEnd (viewportScroll ChatView)
+        EvSessionSwitched{}     -> vScrollToEnd (viewportScroll ChatView)
+        EvModelSwitched{}       -> vScrollToEnd (viewportScroll ChatView)
+        EvError _               -> vScrollToEnd (viewportScroll ChatView)
+        EvDone                  -> vScrollToEnd (viewportScroll ChatView)
+        _                       -> pure ()
 
 -- =========================================================================
 -- Terminal Conventions & Signal Controls

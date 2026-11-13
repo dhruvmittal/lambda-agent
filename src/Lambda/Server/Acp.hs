@@ -15,6 +15,7 @@ module Lambda.Server.Acp
   , startAcpSessionWithSession
   , formatToolCallTitle
   , determineToolKind
+  , parsePlanEntriesFromVector
   , broadcastUsageUpdate
   ) where
 
@@ -803,6 +804,8 @@ handleAcpRequest state AcpJsonRpcRequest{..} = do
               sendAcpResponse state rId (Just (Aeson.object ["status" .= ("deleted" :: Text)])) Nothing
             Aeson.Error err ->
               sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= err ]))
+        (Just rId, Nothing) ->
+          sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= ("Missing params" :: Text) ]))
         _ -> pure ()
 
     "session/close" -> do
@@ -822,6 +825,8 @@ handleAcpRequest state AcpJsonRpcRequest{..} = do
               sendAcpResponse state rId (Just (Aeson.object ["status" .= ("closed" :: Text)])) Nothing
             Aeson.Error err ->
               sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= err ]))
+        (Just rId, Nothing) ->
+          sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= ("Missing params" :: Text) ]))
         _ -> pure ()
 
     "session/set_config_option" -> do
@@ -892,6 +897,8 @@ handleAcpRequest state AcpJsonRpcRequest{..} = do
                   sendAcpResponse state rId (Just (Aeson.object ["status" .= ("ok" :: Text), "configOptions" .= opts])) Nothing
             Aeson.Error err ->
               sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= err ]))
+        (Just rId, Nothing) ->
+          sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= ("Missing params" :: Text) ]))
         _ -> pure ()
 
     "session/prompt" -> do
@@ -945,6 +952,8 @@ handleAcpRequest state AcpJsonRpcRequest{..} = do
               sendAcpResponse state rId (Just (Aeson.object ["status" .= ("ok" :: Text), "configOptions" .= opts])) Nothing
             Aeson.Error err ->
               sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= err ]))
+        (Just rId, Nothing) ->
+          sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= ("Missing params" :: Text) ]))
         _ -> pure ()
 
     m | m `elem` ["session/cancel", "session/stop", "$/cancel_request", "$/cancelRequest"] -> do
@@ -1012,6 +1021,8 @@ handleAcpRequest state AcpJsonRpcRequest{..} = do
                   sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32000 :: Int), "message" .= err ]))
             Aeson.Error err ->
               sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= err ]))
+        (Just rId, Nothing) ->
+          sendAcpResponse state rId Nothing (Just (Aeson.object [ "code" .= (-32602 :: Int), "message" .= ("Missing params" :: Text) ]))
         _ -> pure ()
 
     _ -> do
