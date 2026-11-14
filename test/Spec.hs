@@ -7,7 +7,7 @@ import Control.Concurrent (threadDelay, forkIO)
 import Control.Concurrent.Async (mapConcurrently, race, async, wait, poll, cancel)
 import Control.Concurrent.STM
 import Control.Exception (catch, IOException)
-import Control.Monad (unless, void)
+import Control.Monad (forM_, unless, void)
 import Data.Bits ((.|.))
 import System.Posix.Files (setFileMode, ownerReadMode, ownerWriteMode, ownerExecuteMode)
 import System.Timeout (timeout)
@@ -19,6 +19,7 @@ import qualified Data.ByteString.Lazy as BL
 import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef')
 import Data.Maybe (mapMaybe, isNothing, isJust)
 import qualified Data.Sequence as Seq
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -31,7 +32,7 @@ import System.FilePath ((</>))
 import Skylighting (TokenType(..))
 import qualified Test.QuickCheck as QC
 
-import Lambda.Config (loadConfig, Config(..), McpServerConfig(..), SpecialistConfig(..), defaultConfig, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, lookupModelContextLimitWithConfig, resolveEnvTemplates, persistTheme, extractProviderAndModel, parseMarkdownAgent, loadAllMarkdownAgents)
+import Lambda.Config (loadConfig, Config(..), McpServerConfig(..), SpecialistConfig(..), defaultConfig, defaultAllowGlobs, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, lookupModelContextLimitWithConfig, resolveEnvTemplates, persistTheme, extractProviderAndModel, parseMarkdownAgent, loadAllMarkdownAgents)
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro, expandPromptMacro)
 import Lambda.Core.EngineInterface (initEngineChannels, cmdQueue, startEngineLoop, EngineChannels(..), EngineRuntime(..), startEngineRuntime, stopEngineRuntime)
 import Lambda.Core.ModelDriver (ModelDriver(..), simpleModelDriver)
@@ -40,8 +41,13 @@ import Lambda.Provider.JsonRpc (startRpcClient, stopRpcClient, sendRequest, Json
 import Lambda.Driver.OpenAI (openAiDynamicDriver, openAiDynamicDriverWithManager, parseSseChunk, splitThinkingChunks, processSseStream)
 import Lambda.Engine.Artifacts
 import Lambda.Engine.Compactor
-import Lambda.Engine.Dispatcher (executeToolDispatch)
-import Lambda.Engine.Security (initSecurity, initSecurityWithRoot, deriveSecurityGlob, checkAuthorization, resolvePrompt, SecurityState(..))
+import Lambda.Engine.Dispatcher (executeToolDispatch, executeToolDispatchWithPerms)
+import Lambda.Engine.Security
+  ( initSecurity, initSecurityWithRoot, deriveSecurityGlob
+  , checkAuthorization, resolvePrompt, SecurityState(..)
+  , PolicyRules(..), CallerGrantContext(..), SecuritySubject(..), AuthEvaluation(..)
+  , matchGlob, splitShellPipeline, hasUnsafeShellSyntax, applyDecision, evaluateSubject
+  )
 import Lambda.Engine.Session
   ( exportSessionTrace
   , loadSession
@@ -118,7 +124,8 @@ import Lambda.UI.Markdown
   )
 import Lambda.UI.Types (CompletionState(..), Candidate(..), simpleCandidate, ResourceName(..), UIState(..), SessionChooserState(..), isGeneratingL, spinnerStepL, workingStateL, turnsL, defaultUIState)
 import Lambda.UI.Theme (ThemePalette(..), builtinThemes, builtinThemeNames, parseHexColor, resolveThemePalette, resolveThemeAttrMap)
-import Lambda.Types
+import Lambda.Types hiding (Session)
+import qualified Lambda.Types (PermissionScope(Session))
 import Lens.Micro ((&), (^.), (.~), (%~))
 import Network.HTTP.Client.TLS (newTlsManager)
 import Lambda.Server.Acp
@@ -131,6 +138,7 @@ import Lambda.Server.Acp
   , determineToolKind
   , parsePlanEntriesFromVector
   , broadcastUsageUpdate
+  , startAcpSession
   )
 import Lambda.Server.Acp.Types
 
@@ -220,6 +228,8 @@ main = do
   testAcpSlashCommandsAndErrors
   testDeterministicMcpStdioMock
   testEngineLoopCoreInvariants
+  testPermissionAlgebraAndPipelineSpec
+  testPermissionIntegrationSpec
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -317,14 +327,14 @@ testSecurityGlobMatching = do
 
   -- Test static allowlist
   canGitStatus <- checkAuthorization sec MainAgent "git status --short" (Aeson.object []) Nothing
-  assert "git status matches allowlist" canGitStatus
+  assert "git status matches allowlist" (canGitStatus == Authorized)
 
   canGitDiff <- checkAuthorization sec MainAgent "git diff HEAD~1" (Aeson.object []) Nothing
-  assert "git diff matches allowlist" canGitDiff
+  assert "git diff matches allowlist" (canGitDiff == Authorized)
 
   -- Test static denylist
   canRmRf <- checkAuthorization sec MainAgent "rm -rf /*" (Aeson.object []) Nothing
-  assert "rm -rf /* is blocked by denylist" (not canRmRf)
+  assert "rm -rf /* is blocked by denylist" (case canRmRf of DeniedByPolicy _ _ -> True; _ -> False)
 
   putStrLn "  -> OK: Static whitelist and blacklist glob matching verified."
 
@@ -521,6 +531,7 @@ testSubAgentViewportInvariant = do
         , subAgentArtifact = Just ".lambda/artifacts/subagent_1.log"
         , subAgentTurns = []
         , subAgentParentTurnId = Nothing
+        , subAgentPermissions = emptySubAgentPermissions
         }
       sampleMap = Map.singleton 1 sampleTask
       widget = renderSubAgents sampleMap
@@ -748,7 +759,7 @@ testBudgetExhaustionDiagnostics = do
         cb (ChunkText "Still analyzing...")
         cb ChunkDone
 
-  res <- subAgentLoop es dummyDriver sId [] turnsVar attemptedVar repVar 3 2
+  res <- subAgentLoop es dummyDriver sId emptySubAgentPermissions turnsVar attemptedVar repVar 3 2
   case res of
     Left err -> failTest ("Unexpected subAgentLoop failure: " <> T.unpack err)
     Right rep -> do
@@ -846,10 +857,11 @@ testDynamicPermissionEscalation = do
   -- Read the escalation prompt from uiPromptQueue
   prompt <- atomically $ readTBQueue (uiPromptQueue sec)
   assert "Prompt caller matches" (promptCaller prompt == caller)
-  assert "Prompt tool matches" (promptTool prompt == "perf stat ./bin")
+  assert "Prompt tool matches" (promptTool prompt == "bash")
+  assert "Prompt rules include perf*" ("perf*" `elem` promptRules prompt)
 
   -- User grants one-time approval to the subagent
-  atomically $ putTMVar (promptReply prompt) PermOnce
+  atomically $ putTMVar (promptReply prompt) (PermissionResponse Allow Once)
 
   -- Subagent unblocks and completes execution
   resB <- wait dispatchHandle
@@ -860,10 +872,10 @@ testDynamicPermissionEscalation = do
   let call2 = ToolCall "call_2" "bash" (Aeson.object ["command" .= ("rm -rf /" :: Text)])
   denyHandle <- async $ executeToolDispatch es caller ["read_file*"] call2
   promptDeny <- atomically $ readTBQueue (uiPromptQueue sec)
-  atomically $ putTMVar (promptReply promptDeny) PermNo
+  atomically $ putTMVar (promptReply promptDeny) (PermissionResponse Deny Once)
   resC <- wait denyHandle
   assert "Subagent call is rejected when user denies permission"
-    ("Permission Denied" `T.isInfixOf` resultStderr resC)
+    ("Blocked by user decision" `T.isInfixOf` resultStderr resC)
 
   putStrLn "  -> OK: Ungranted subagent tool call triggers dynamic user permission escalation and honors user decision."
 
@@ -886,7 +898,7 @@ testSessionSerialization = do
         [ Turn 1 UserRole [TextBlock "Explore files"]
         , Turn 2 AssistantRole [TextBlock "Files explored successfully"]
         ]
-      subTask = SubAgentTask 1 "surveyor" "Verify workspace structure" 1 16 (SubAgentSuccess "Structure OK") Nothing subTurns Nothing
+      subTask = SubAgentTask 1 "surveyor" "Verify workspace structure" 1 16 (SubAgentSuccess "Structure OK") Nothing subTurns Nothing emptySubAgentPermissions
       sess = Session
         { sessionId           = "session_test_24"
         , sessionCreatedAt     = now
@@ -924,7 +936,7 @@ testSessionResumptionAndRestoration = do
   sec <- initSecurity [] []
   cfg <- loadConfig "."
   now <- getCurrentTime
-  let subTask = SubAgentTask 2 "debugger" "Investigate crash" 3 14 (SubAgentSuccess "Found bug") Nothing [] Nothing
+  let subTask = SubAgentTask 2 "debugger" "Investigate crash" 3 14 (SubAgentSuccess "Found bug") Nothing [] Nothing emptySubAgentPermissions
       sess = Session
         { sessionId           = "session_test_25"
         , sessionCreatedAt     = now
@@ -1052,7 +1064,7 @@ testOnDemandMarkdownTraceGeneration = do
             , ToolResultBlock (ToolResult "c1" "1000 instructions" "" Nothing)
             , TextBlock "Hotspot identified."
             ]
-        ] Nothing
+        ] Nothing emptySubAgentPermissions
       sess = Session
         { sessionId           = "session_test_28"
         , sessionCreatedAt     = now
@@ -1176,7 +1188,7 @@ testSubAgentStreamingToolArgs = do
             cb (ChunkToolCallArgs "" "{\"status\":\"SUCCESS\",\"summary\":\"Reviewed README.md\",\"details\":\"All checks passed\"}")
             cb ChunkDone
 
-  res <- subAgentLoop es streamingDriver sId ["read_file*", "submit_report*"] turnsVar attemptedVar repVar 1 5
+  res <- subAgentLoop es streamingDriver sId (SubAgentPermissions (Set.fromList ["read_file*", "submit_report*"]) Set.empty) turnsVar attemptedVar repVar 1 5
   case res of
     Left err -> failTest ("Unexpected subAgentLoop failure: " <> T.unpack err)
     Right rep -> do
@@ -1309,19 +1321,19 @@ testJustInTimeSubAgentPermissions = do
       callOutside = ToolCall "c_out" "read_file" (Aeson.object ["path" .= ("/etc/passwd" :: Text)])
   outHandle <- async $ executeToolDispatch es caller ["read_file*"] callOutside
   promptOut <- atomically $ readTBQueue (uiPromptQueue sec)
-  assert "Prompt indicates outside workspace access" ("outside_workspace: read_file" `T.isInfixOf` promptTool promptOut)
-  atomically $ putTMVar (promptReply promptOut) PermNo
+  assert "Prompt indicates outside workspace access" ("outside_workspace: read_file" `T.isInfixOf` promptProposedGlob promptOut)
+  atomically $ putTMVar (promptReply promptOut) (PermissionResponse Deny Once)
   resOut <- wait outHandle
-  assert "Outside read rejected when denied" ("Permission Denied" `T.isInfixOf` resultStderr resOut)
+  assert "Outside read rejected when denied" ("Blocked by user decision" `T.isInfixOf` resultStderr resOut)
 
   -- 4. External web fetch triggers dynamic JIT prompt
   let callWeb = ToolCall "c_web" "fetch_url" (Aeson.object ["url" .= ("https://api.github.com" :: Text)])
   webHandle <- async $ executeToolDispatch es caller ["fetch_url*"] callWeb
   promptWeb <- atomically $ readTBQueue (uiPromptQueue sec)
   assert "Web fetch triggers dynamic JIT prompt" ("fetch_url" `T.isInfixOf` promptTool promptWeb)
-  atomically $ putTMVar (promptReply promptWeb) PermNo
+  atomically $ putTMVar (promptReply promptWeb) (PermissionResponse Deny Once)
   resWeb <- wait webHandle
-  assert "Web fetch rejected when denied" ("Permission Denied" `T.isInfixOf` resultStderr resWeb)
+  assert "Web fetch rejected when denied" ("Blocked by user decision" `T.isInfixOf` resultStderr resWeb)
 
   -- 5. Destructive mutating command (write_file) triggers dynamic JIT prompt
   let callWrite = ToolCall "c_wr" "write_file" (Aeson.object
@@ -1331,7 +1343,7 @@ testJustInTimeSubAgentPermissions = do
   writeHandle <- async $ executeToolDispatch es caller ["write_file*"] callWrite
   promptWrite <- atomically $ readTBQueue (uiPromptQueue sec)
   assert "Destructive write triggers dynamic JIT prompt" ("write_file" `T.isInfixOf` promptTool promptWrite)
-  atomically $ putTMVar (promptReply promptWrite) PermOnce
+  atomically $ putTMVar (promptReply promptWrite) (PermissionResponse Allow Once)
   resWrite <- wait writeHandle
   assert "Destructive write succeeds when approved" (resultStdout resWrite == "File successfully written: test_out.txt")
   removeFile "test_out.txt"
@@ -1419,8 +1431,8 @@ testContextualCompletersAndMruInvariant = do
 
   -- 4. /sub contextual completion from active subagent map
   let subMap = Map.fromList
-        [ (1, SubAgentTask 1 "reviewer" "Reviewing" 0 5 SubAgentRunning Nothing [] Nothing)
-        , (3, SubAgentTask 3 "tester" "Testing" 0 5 SubAgentRunning Nothing [] Nothing)
+        [ (1, SubAgentTask 1 "reviewer" "Reviewing" 0 5 SubAgentRunning Nothing [] Nothing emptySubAgentPermissions)
+        , (3, SubAgentTask 3 "tester" "Testing" 0 5 SubAgentRunning Nothing [] Nothing emptySubAgentPermissions)
         ]
   mSubComp <- completeInput "." (dummyUI subMap) "/sub "
   assert "/sub completion returns active subagent IDs plus main"
@@ -2130,47 +2142,47 @@ testTieredSecurityModalAndWhitelisting = do
   assert "deriveSecurityGlob: write_file" (deriveSecurityGlob "write_file src/App.hs" == "write_file*")
   assert "deriveSecurityGlob: outside_workspace" (deriveSecurityGlob "outside_workspace: read_file /etc/passwd" == "outside_workspace: read_file*")
 
-  -- 2. Test PermDeny: rejects the call and does not whitelist for subsequent calls
+  -- 2. Test Deny Once: rejects the call and does not whitelist for subsequent calls
   sec <- initSecurityWithRoot tempWs ["git status*"] []
 
   a1 <- async $ checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object []) Nothing
   prompt1 <- atomically $ readTBQueue (uiPromptQueue sec)
   assert "prompt1 proposes rm*" (promptProposedGlob prompt1 == "rm*")
-  resolvePrompt prompt1 PermDeny
+  resolvePrompt prompt1 (PermissionResponse Deny Once)
   res1 <- wait a1
-  assert "PermDeny results in False" (not res1)
+  assert "Deny Once results in DeniedByUser" (case res1 of DeniedByUser Once _ -> True; _ -> False)
 
   -- Verify second invocation still prompts (not silently allowed or denied)
   a2 <- async $ checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object []) Nothing
   prompt2 <- atomically $ readTBQueue (uiPromptQueue sec)
-  resolvePrompt prompt2 PermOnce
+  resolvePrompt prompt2 (PermissionResponse Allow Once)
   res2 <- wait a2
-  assert "PermOnce results in True" res2
+  assert "Allow Once results in Authorized" (res2 == Authorized)
 
-  -- Third invocation must prompt again because PermOnce was only for 1 call
+  -- Third invocation must prompt again because Once was only for 1 call
   a3 <- async $ checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object []) Nothing
   prompt3 <- atomically $ readTBQueue (uiPromptQueue sec)
-  resolvePrompt prompt3 PermSession
+  resolvePrompt prompt3 (PermissionResponse Allow Lambda.Types.Session)
   res3 <- wait a3
-  assert "PermSession results in True" res3
+  assert "Allow Session results in Authorized" (res3 == Authorized)
 
   -- Fourth invocation must now be auto-allowed by session memory without prompting!
   res4 <- checkAuthorization sec MainAgent "rm -rf foo" (Aeson.object []) Nothing
-  assert "Subsequent call auto-allowed by PermSession" res4
+  assert "Subsequent call auto-allowed by Allow Session" (res4 == Authorized)
 
-  -- 3. Test PermAlways: writes to .lambda/config.json and hot-reloads into active memory
-  a5 <- async $ checkAuthorization sec MainAgent "pytest tests/test_api.py" (Aeson.object []) Nothing
+  -- 3. Test Allow Always: writes to .lambda/config.json and hot-reloads into active memory
+  a5 <- async $ checkAuthorization sec MainAgent "cargo build --bin api" (Aeson.object []) Nothing
   prompt5 <- atomically $ readTBQueue (uiPromptQueue sec)
-  assert "prompt5 proposes pytest*" (promptProposedGlob prompt5 == "pytest*")
-  resolvePrompt prompt5 PermAlways
+  assert "prompt5 proposes cargo build*" (promptProposedGlob prompt5 == "cargo build*")
+  resolvePrompt prompt5 (PermissionResponse Allow Always)
   res5 <- wait a5
-  assert "PermAlways results in True" res5
+  assert "Allow Always results in Authorized" (res5 == Authorized)
 
-  -- Verify hot-reloading: pytest tests/test_engine.py must be auto-allowed immediately by the compiled glob!
-  res6 <- checkAuthorization sec MainAgent "pytest tests/test_engine.py" (Aeson.object []) Nothing
-  assert "Subsequent pytest command auto-allowed in-memory via hot-reloaded compiled glob" res6
+  -- Verify hot-reloading: cargo build --bin engine must be auto-allowed immediately!
+  res6 <- checkAuthorization sec MainAgent "cargo build --bin engine" (Aeson.object []) Nothing
+  assert "Subsequent cargo build command auto-allowed in-memory via hot-reloaded rule" (res6 == Authorized)
 
-  -- Verify config file persistence: <tempWs>/.lambda/config.json must contain "pytest*"
+  -- Verify config file persistence: <tempWs>/.lambda/config.json must contain "cargo build*"
   let confPath = tempWs </> ".lambda" </> "config.json"
   confExists <- doesFileExist confPath
   assert ".lambda/config.json was created" confExists
@@ -2179,7 +2191,7 @@ testTieredSecurityModalAndWhitelisting = do
     Just (Aeson.Object o) ->
       case parseMaybe (.:? "always_allow_globs") o of
         Just (Just (globs :: [String])) ->
-          assert "pytest* was persisted to always_allow_globs in config.json" ("pytest*" `elem` globs)
+          assert "cargo build* was persisted to always_allow_globs in config.json" ("cargo build*" `elem` globs)
         _ -> failTest "always_allow_globs not found in config.json"
     _ -> failTest "failed to parse .lambda/config.json"
 
@@ -2685,7 +2697,7 @@ testAcpFullDuplexRpcAndNotifications = do
         , promptCaller       = MainAgent
         , promptTool         = "edit_file src/App.hs"
         , promptArgs         = Aeson.object ["path" .= ("src/App.hs" :: Text)]
-        , promptProposedGlob = "edit_file*"
+        , promptRules        = ["edit_file*"]
         , promptReply        = dummyPermReply
         , promptToolCallId   = Just "call_real_tool_99"
         }
@@ -2949,7 +2961,7 @@ testLazyMcpGatewayAndModeEnforcement = do
   dispatchHandle <- async $ executeToolDispatch es MainAgent [] mutateCall
   prompt <- atomically $ readTBQueue (uiPromptQueue sec)
   assert "Security prompt triggered for destructive tool via call_mcp_tool" (promptTool prompt == "sd_mutate")
-  atomically $ putTMVar (promptReply prompt) PermOnce
+  atomically $ putTMVar (promptReply prompt) (PermissionResponse Allow Once)
   resMutExec <- wait dispatchHandle
   assert "Destructive MCP tool executes via gateway in ExecMode"
     ("memory node updated" `T.isInfixOf` resultStdout resMutExec)
@@ -3162,10 +3174,10 @@ testSubAgentParentTurnAttribution = do
       turn3 = Turn 3 UserRole [TextBlock "Follow-up question"]
       turn4 = Turn 4 AssistantRole [TextBlock "Answering follow-up"]
 
-      sub1 = SubAgentTask 1 "Researcher" "Find facts" 0 5 SubAgentRunning Nothing [] (Just 2)
-      sub2 = SubAgentTask 2 "Coder" "Write code" 0 5 (SubAgentSuccess "Done") Nothing [] (Just 2)
-      sub3 = SubAgentTask 3 "Reviewer" "Review diff" 0 5 SubAgentRunning Nothing [] (Just 4)
-      subUnanchored = SubAgentTask 4 "Worker" "Floating task" 0 5 SubAgentRunning Nothing [] Nothing
+      sub1 = SubAgentTask 1 "Researcher" "Find facts" 0 5 SubAgentRunning Nothing [] (Just 2) emptySubAgentPermissions
+      sub2 = SubAgentTask 2 "Coder" "Write code" 0 5 (SubAgentSuccess "Done") Nothing [] (Just 2) emptySubAgentPermissions
+      sub3 = SubAgentTask 3 "Reviewer" "Review diff" 0 5 SubAgentRunning Nothing [] (Just 4) emptySubAgentPermissions
+      subUnanchored = SubAgentTask 4 "Worker" "Floating task" 0 5 SubAgentRunning Nothing [] Nothing emptySubAgentPermissions
 
       allSubs = [sub1, sub2, sub3, subUnanchored]
       turns = [turn1, turn2, turn3, turn4]
@@ -3908,7 +3920,7 @@ testTelemetryAndHerdrIntegration = do
   putStrLn "  -> OK: LifecycleState derivation, multi-prompt stacking and unstacking verified."
 
   -- 3. Verify Security Prompt Cancellation cleans activePrompts and calls onPromptResolved
-  resolvedRecords <- newIORef ([] :: [(Int, PermissionLevel)])
+  resolvedRecords <- newIORef ([] :: [(Int, PermissionResponse)])
   let testOnResolved pId lvl = modifyIORef' resolvedRecords ((pId, lvl) :)
   secStateCustom <- initSecurity [] []
   let secStateInstrumented = secStateCustom { onPromptResolved = testOnResolved }
@@ -3936,8 +3948,8 @@ testTelemetryAndHerdrIntegration = do
   promptsAfter <- atomically $ readTVar (activePrompts secStateInstrumented)
   assert "activePrompts is drained on cancellation" (Map.null promptsAfter)
   recs <- readIORef resolvedRecords
-  assert "onPromptResolved was triggered with PermDeny on cancellation"
-    (recs == [(pId, PermDeny)])
+  assert "onPromptResolved was triggered with (Deny, Once) on cancellation"
+    (recs == [(pId, PermissionResponse Deny Once)])
   putStrLn "  -> OK: Permission prompt cancellation bracket and activePrompts cleanup verified."
 
   -- 4. Verify Herdr Telemetry Watcher Conflation, Strict Contract & End-to-End EngineRuntime Lifecycle
@@ -4182,13 +4194,14 @@ testUiDrawThemeAndAcpHelpers = do
         , subAgentArtifact = Nothing
         , subAgentTurns = [Turn 10 AssistantRole [TextBlock "Scanning files..."]]
         , subAgentParentTurnId = Just 1
+        , subAgentPermissions = emptySubAgentPermissions
         }
       samplePrompt = PermissionPrompt
         { promptId = 42
         , promptCaller = MainAgent
         , promptTool = "bash"
         , promptArgs = Aeson.object ["command" .= ("echo hello" :: Text)]
-        , promptProposedGlob = "echo*"
+        , promptRules = ["echo*"]
         , promptReply = replyVar
         , promptToolCallId = Just "call_42"
         }
@@ -4299,7 +4312,7 @@ testApplyEngineEventInvariants = do
   rv1 <- newEmptyTMVarIO
   rv2 <- newEmptyTMVarIO
   rv3 <- newEmptyTMVarIO
-  let mkPrompt pid rv = PermissionPrompt pid MainAgent "bash" (Aeson.object []) "echo*" rv Nothing
+  let mkPrompt pid rv = PermissionPrompt pid MainAgent "bash" (Aeson.object []) ["echo*"] rv Nothing
       p1 = mkPrompt 1 rv1
       p2 = mkPrompt 2 rv2
       p3 = mkPrompt 3 rv3
@@ -4314,22 +4327,22 @@ testApplyEngineEventInvariants = do
     (fmap promptId (uiCurrentPrompt s2) == Just 1
      && fmap promptId (toListSeq (uiPendingPrompts s2)) == [2, 3])
 
-  let sRemPending = applyEngineEvent (EvPermissionResolved 2 PermOnce) s2
+  let sRemPending = applyEngineEvent (EvPermissionResolved 2 (PermissionResponse Allow Once)) s2
   assert "EvPermissionResolved on pending removes p2, keeps p1 current"
     (fmap promptId (uiCurrentPrompt sRemPending) == Just 1
      && fmap promptId (toListSeq (uiPendingPrompts sRemPending)) == [3])
 
-  let sUnknown = applyEngineEvent (EvPermissionResolved 999 PermDeny) sRemPending
+  let sUnknown = applyEngineEvent (EvPermissionResolved 999 (PermissionResponse Deny Once)) sRemPending
   assert "EvPermissionResolved unknown ID leaves prompts unchanged"
     (fmap promptId (uiCurrentPrompt sUnknown) == Just 1
      && fmap promptId (toListSeq (uiPendingPrompts sUnknown)) == [3])
 
-  let sPromoted = applyEngineEvent (EvPermissionResolved 1 PermAlways) sUnknown
+  let sPromoted = applyEngineEvent (EvPermissionResolved 1 (PermissionResponse Allow Always)) sUnknown
   assert "EvPermissionResolved on current promotes p3"
     (fmap promptId (uiCurrentPrompt sPromoted) == Just 3
      && Seq.null (uiPendingPrompts sPromoted))
 
-  let sEmpty = applyEngineEvent (EvPermissionResolved 3 PermOnce) sPromoted
+  let sEmpty = applyEngineEvent (EvPermissionResolved 3 (PermissionResponse Allow Once)) sPromoted
   assert "EvPermissionResolved on last prompt sets Nothing"
     (isNothing (uiCurrentPrompt sEmpty) && Seq.null (uiPendingPrompts sEmpty))
 
@@ -4374,7 +4387,7 @@ testSecurityAndSubAgentInvariants = do
 
   secDenyFirst <- initSecurity ["rm*", "bash*"] ["rm -rf /*"]
   denied <- checkAuthorization secDenyFirst MainAgent "rm -rf /*" (Aeson.object []) Nothing
-  assert "Deny-first: command matching both allow and deny returns False" (not denied)
+  assert "Deny-first: command matching both allow and deny returns DeniedByPolicy" (case denied of DeniedByPolicy _ _ -> True; _ -> False)
 
   let tmpWs = "/tmp/lambda_spec_sec_ws"
   removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
@@ -4383,29 +4396,29 @@ testSecurityAndSubAgentInvariants = do
 
   aSess <- async $ checkAuthorization sec MainAgent "echo session_ok" (Aeson.object []) Nothing
   pSess <- atomically $ readTBQueue (uiPromptQueue sec)
-  resolvePrompt pSess PermSession
+  resolvePrompt pSess (PermissionResponse Allow Lambda.Types.Session)
   rSess <- wait aSess
-  assert "PermSession allows first call" rSess
-  rSess2 <- checkAuthorization sec MainAgent "echo session_ok" (Aeson.object []) Nothing
-  assert "PermSession allows subsequent identical call without prompt" rSess2
+  assert "Allow Session allows first call" (rSess == Authorized)
+  rSess2 <- checkAuthorization sec MainAgent "echo session_again" (Aeson.object []) Nothing
+  assert "Allow Session allows subsequent glob-matched call without prompt" (rSess2 == Authorized)
   cfgExistsAfterSess <- doesFileExist (tmpWs </> ".lambda" </> "config.json")
-  assert "PermSession does not persist to .lambda/config.json" (not cfgExistsAfterSess)
+  assert "Allow Session does not persist to .lambda/config.json" (not cfgExistsAfterSess)
 
   aNever <- async $ checkAuthorization sec MainAgent "curl http://example.com" (Aeson.object []) Nothing
   pNever <- atomically $ readTBQueue (uiPromptQueue sec)
-  resolvePrompt pNever PermNever
+  resolvePrompt pNever (PermissionResponse Deny Lambda.Types.Session)
   rNever <- wait aNever
-  assert "PermNever denies first call" (not rNever)
-  rNever2 <- checkAuthorization sec MainAgent "curl http://example.com" (Aeson.object []) Nothing
-  assert "PermNever denies subsequent identical call without prompting" (not rNever2)
+  assert "Deny Session denies first call" (case rNever of DeniedByUser Lambda.Types.Session _ -> True; _ -> False)
+  rNever2 <- checkAuthorization sec MainAgent "curl http://other.com" (Aeson.object []) Nothing
+  assert "Deny Session denies subsequent glob-matched call without prompting" (case rNever2 of DeniedByPolicy Lambda.Types.Session _ -> True; _ -> False)
   emptyQ <- atomically $ isEmptyTBQueue (uiPromptQueue sec)
-  assert "PermNever did not queue second prompt" emptyQ
+  assert "Deny Session did not queue second prompt" emptyQ
 
-  aAlways <- async $ checkAuthorization sec MainAgent "pytest tests/" (Aeson.object []) Nothing
+  aAlways <- async $ checkAuthorization sec MainAgent "cargo build --release" (Aeson.object []) Nothing
   pAlways <- atomically $ readTBQueue (uiPromptQueue sec)
-  resolvePrompt pAlways PermAlways
+  resolvePrompt pAlways (PermissionResponse Allow Always)
   rAlways <- wait aAlways
-  assert "PermAlways allows call" rAlways
+  assert "Allow Always allows call" (rAlways == Authorized)
   cfgExistsAfterAlways <- doesFileExist (tmpWs </> ".lambda" </> "config.json")
   assert "PermAlways creates .lambda/config.json" cfgExistsAfterAlways
   removeDirectoryRecursive tmpWs
@@ -4540,7 +4553,7 @@ testEngineLoopCoreInvariants = do
 
   esRewind <- initEngineStateWithSession baseCfg reg sec (Just sess { sessionTurns = [Turn 1 UserRole [TextBlock "u1"], Turn 2 AssistantRole [TextBlock "a1"]] })
   let esRewind' = esRewind { appSessionDir = tmpSess }
-      runningTask = SubAgentTask 1 "surveyor" "hyp" 1 5 SubAgentRunning Nothing [] (Just 1)
+      runningTask = SubAgentTask 1 "surveyor" "hyp" 1 5 SubAgentRunning Nothing [] (Just 1) emptySubAgentPermissions
   atomically $ writeTVar (appSubAgents esRewind') (Map.singleton 1 runningTask)
   chansRewind <- initEngineChannels (appEventQueue esRewind')
   let noopDriver = simpleModelDriver (\_ _ cb -> cb ChunkDone)
@@ -4594,6 +4607,332 @@ testEngineLoopCoreInvariants = do
 
   removeDirectoryRecursive tmpRoot
   putStrLn "  -> OK: Engine loop core invariants verified."
+
+instance QC.Arbitrary Decision where
+  arbitrary = QC.elements [Allow, Deny]
+
+instance QC.Arbitrary PermissionScope where
+  arbitrary = QC.elements [Once, Lambda.Types.Session, Always]
+
+instance QC.Arbitrary PermissionResponse where
+  arbitrary = PermissionResponse <$> QC.arbitrary <*> QC.arbitrary
+
+instance QC.Arbitrary PolicyRules where
+  arbitrary = PolicyRules
+    <$> (Set.fromList . map T.pack <$> QC.arbitrary)
+    <*> (Set.fromList . map T.pack <$> QC.arbitrary)
+    <*> (Set.fromList . map T.pack <$> QC.arbitrary)
+    <*> (Set.fromList . map T.pack <$> QC.arbitrary)
+
+-- 83. Pure Permission Algebra, Precedence, Shell Pipeline & Glob Spec
+testPermissionAlgebraAndPipelineSpec :: IO ()
+testPermissionAlgebraAndPipelineSpec = do
+  putStrLn "\n[Test 83] Pure Permission Algebra, Precedence & Shell Pipeline Spec"
+
+  assert "matchGlob crosses '/' for git diff*"
+    (matchGlob "git diff*" "git diff src/a/b.hs src/c/d.hs")
+  assert "matchGlob crosses '/' for fetch_url"
+    (matchGlob "fetch_url https://example.com/*" "fetch_url https://example.com/a/b")
+
+  let prop_onceNoop (d :: Decision) (rs :: [String]) (pr :: PolicyRules) =
+        applyDecision (PermissionResponse d Once) (map T.pack rs) pr == pr
+      prop_sessionAllow (rs :: [String]) (pr :: PolicyRules) =
+        let trs = map T.pack rs
+            pr' = applyDecision (PermissionResponse Allow Lambda.Types.Session) trs pr
+        in prSessionAllow pr' == Set.union (prSessionAllow pr) (Set.fromList trs)
+           && prAlwaysAllow pr' == prAlwaysAllow pr
+           && prAlwaysDeny pr' == prAlwaysDeny pr
+           && prSessionDeny pr' == prSessionDeny pr
+      prop_sessionDeny (rs :: [String]) (pr :: PolicyRules) =
+        let trs = map T.pack rs
+            pr' = applyDecision (PermissionResponse Deny Lambda.Types.Session) trs pr
+        in prSessionDeny pr' == Set.union (prSessionDeny pr) (Set.fromList trs)
+           && prAlwaysAllow pr' == prAlwaysAllow pr
+           && prAlwaysDeny pr' == prAlwaysDeny pr
+           && prSessionAllow pr' == prSessionAllow pr
+      prop_alwaysAllow (rs :: [String]) (pr :: PolicyRules) =
+        let trs = map T.pack rs
+            pr' = applyDecision (PermissionResponse Allow Always) trs pr
+        in prAlwaysAllow pr' == Set.union (prAlwaysAllow pr) (Set.fromList trs)
+           && prSessionAllow pr' == prSessionAllow pr
+           && prAlwaysDeny pr' == prAlwaysDeny pr
+           && prSessionDeny pr' == prSessionDeny pr
+      prop_alwaysDeny (rs :: [String]) (pr :: PolicyRules) =
+        let trs = map T.pack rs
+            pr' = applyDecision (PermissionResponse Deny Always) trs pr
+        in prAlwaysDeny pr' == Set.union (prAlwaysDeny pr) (Set.fromList trs)
+           && prSessionAllow pr' == prSessionAllow pr
+           && prAlwaysAllow pr' == prAlwaysAllow pr
+           && prSessionDeny pr' == prSessionDeny pr
+
+  forM_
+    [ ("applyDecision Once is no-op", QC.quickCheckResult (QC.withMaxSuccess 100 prop_onceNoop))
+    , ("applyDecision (Allow, Session)", QC.quickCheckResult (QC.withMaxSuccess 100 prop_sessionAllow))
+    , ("applyDecision (Deny, Session)", QC.quickCheckResult (QC.withMaxSuccess 100 prop_sessionDeny))
+    , ("applyDecision (Allow, Always)", QC.quickCheckResult (QC.withMaxSuccess 100 prop_alwaysAllow))
+    , ("applyDecision (Deny, Always)", QC.quickCheckResult (QC.withMaxSuccess 100 prop_alwaysDeny))
+    ] $ \(label, runQC) -> do
+      res <- runQC
+      case res of
+        QC.Success {} -> assert ("QuickCheck: " <> label) True
+        _             -> failTest ("QuickCheck failed: " <> label)
+
+  let mainExecCtx = CallerGrantContext MainAgent emptySubAgentPermissions ExecMode
+      mainPlanCtx = CallerGrantContext MainAgent emptySubAgentPermissions PlanMode
+      emptyRules  = PolicyRules Set.empty Set.empty Set.empty Set.empty
+
+      rulesAlwaysDenyOverrides = PolicyRules
+        { prAlwaysDeny   = Set.singleton "git status*"
+        , prSessionDeny  = Set.empty
+        , prAlwaysAllow  = Set.singleton "git status*"
+        , prSessionAllow = Set.singleton "git status*"
+        }
+      rulesSessionDenyOverrides = PolicyRules
+        { prAlwaysDeny   = Set.empty
+        , prSessionDeny  = Set.singleton "git status*"
+        , prAlwaysAllow  = Set.singleton "git status*"
+        , prSessionAllow = Set.singleton "git status*"
+        }
+
+  assert "prAlwaysDeny overrides prAlwaysAllow, prSessionAllow, and default safe rules"
+    (evaluateSubject rulesAlwaysDenyOverrides mainExecCtx (SubjBash "git status")
+       == EvalDeny (DeniedByPolicy Always "git status*"))
+  assert "prSessionDeny overrides prAlwaysAllow, prSessionAllow, and default safe rules"
+    (evaluateSubject rulesSessionDenyOverrides mainExecCtx (SubjBash "git status")
+       == EvalDeny (DeniedByPolicy Lambda.Types.Session "git status*"))
+
+  let quotedCmd = "git log --grep=\"a;b|c\""
+  assert "Quoted operators stay 1 segment"
+    (splitShellPipeline quotedCmd == [quotedCmd])
+  assert "Quoted operators are not unsafe shell syntax"
+    (not (hasUnsafeShellSyntax quotedCmd))
+
+  let compoundCmd = "git status && rm -rf build"
+  assert "Compound command splits into 2 segments"
+    (splitShellPipeline compoundCmd == ["git status", "rm -rf build"])
+  assert "Compound command proposes only rm* (not git status*, not EvalAllow)"
+    (case evaluateSubject emptyRules mainExecCtx (SubjBash compoundCmd) of
+       EvalRequirePrompt rs _ -> rs == ["rm*"]
+       _                      -> False)
+
+  let redirCmd = "git diff > /tmp/pwn.sh"
+      substCmd = "echo $(whoami)"
+  assert "Output redirect hasUnsafeShellSyntax == True" (hasUnsafeShellSyntax redirCmd)
+  assert "Command substitution hasUnsafeShellSyntax == True" (hasUnsafeShellSyntax substCmd)
+  assert "Output redirect denied in PlanMode"
+    (case evaluateSubject emptyRules mainPlanCtx (SubjBash redirCmd) of
+       EvalDeny (DeniedByPlanMode _) -> True
+       _                             -> False)
+  assert "Command substitution denied in PlanMode"
+    (case evaluateSubject emptyRules mainPlanCtx (SubjBash substCmd) of
+       EvalDeny (DeniedByPlanMode _) -> True
+       _                             -> False)
+  assert "Output redirect never auto-allowed in ExecMode"
+    (evaluateSubject emptyRules mainExecCtx (SubjBash redirCmd) /= EvalAllow)
+
+  assert "python3 -c does not derive python3 -c*"
+    (deriveSecurityGlob "python3 -c \"import os\"" /= "python3 -c*")
+  assert "bash -c does not derive bash -c*"
+    (deriveSecurityGlob "bash -c \"rm -rf /\"" /= "bash -c*")
+
+  putStrLn "  -> OK: Pure permission algebra, precedence, and shell pipeline invariants verified."
+
+-- 84. Stateful STM, Persistence, Parallel Deduplication, SubAgent & UI/ACP Integration Spec
+testPermissionIntegrationSpec :: IO ()
+testPermissionIntegrationSpec = do
+  putStrLn "\n[Test 84] Stateful STM, Persistence, Deduplication, SubAgent & UI/ACP Spec"
+  let tmpWs = "/tmp/lambda_spec_perm_84"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+  let confPath = tmpWs </> ".lambda" </> "config.json"
+
+  sec <- initSecurityWithRoot tmpWs defaultAllowGlobs []
+
+  forM_
+    [ ("cargo check", PermissionResponse Allow Once)
+    , ("cargo fmt",   PermissionResponse Deny Once)
+    , ("cargo doc",   PermissionResponse Allow Lambda.Types.Session)
+    , ("cargo bench", PermissionResponse Deny Lambda.Types.Session)
+    ] $ \(cmd, resp) -> do
+      a <- async $ checkAuthorization sec MainAgent cmd (Aeson.object []) Nothing
+      p <- atomically $ readTBQueue (uiPromptQueue sec)
+      resolvePrompt p resp
+      void (wait a)
+
+  existsAfterNonPersist <- doesFileExist confPath
+  assert "Once and Session do not create .lambda/config.json" (not existsAfterNonPersist)
+
+  aAllowAlways <- async $ checkAuthorization sec MainAgent "cargo test --lib" (Aeson.object []) Nothing
+  pAllowAlways <- atomically $ readTBQueue (uiPromptQueue sec)
+  resolvePrompt pAllowAlways (PermissionResponse Allow Always)
+  rAllowAlways <- wait aAllowAlways
+  assert "(Allow, Always) returns Authorized" (rAllowAlways == Authorized)
+
+  aDenyAlways <- async $ checkAuthorization sec MainAgent "nc -l 8080" (Aeson.object []) Nothing
+  pDenyAlways <- atomically $ readTBQueue (uiPromptQueue sec)
+  resolvePrompt pDenyAlways (PermissionResponse Deny Always)
+  rDenyAlways <- wait aDenyAlways
+  assert "(Deny, Always) returns DeniedByUser Always"
+    (case rDenyAlways of DeniedByUser Always _ -> True; _ -> False)
+
+  confBytes <- BL.readFile confPath
+  case Aeson.decode confBytes of
+    Just (Aeson.Object o) -> do
+      let mAllow = parseMaybe (.:? "always_allow_globs") o :: Maybe (Maybe [String])
+          mDeny  = parseMaybe (.:? "always_deny_globs") o  :: Maybe (Maybe [String])
+      assert "always_allow_globs contains cargo test*"
+        (case mAllow of Just (Just gs) -> ("cargo test*" :: String) `elem` gs; _ -> False)
+      assert "always_allow_globs does NOT dump defaultAllowGlobs"
+        (case mAllow of Just (Just gs) -> not (("git status*" :: String) `elem` gs); _ -> False)
+      assert "always_deny_globs contains nc*"
+        (case mDeny of Just (Just gs) -> ("nc*" :: String) `elem` gs; _ -> False)
+    _ -> failTest "Failed to parse persisted .lambda/config.json"
+
+  loadedCfg <- loadConfig tmpWs
+  assert "loadConfig includes defaultAllowGlobs (git status*)"
+    ("git status*" `elem` alwaysAllowGlobs loadedCfg)
+  assert "loadConfig includes user always_allow_globs (cargo test*)"
+    ("cargo test*" `elem` alwaysAllowGlobs loadedCfg)
+  assert "loadConfig includes user always_deny_globs (nc*)"
+    ("nc*" `elem` alwaysDenyGlobs loadedCfg)
+
+  let tmpWs2 = "/tmp/lambda_spec_perm_84_override"
+  removeDirectoryRecursive tmpWs2 `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True (tmpWs2 </> ".lambda")
+  BL.writeFile (tmpWs2 </> ".lambda" </> "config.json")
+    (Aeson.encode (Aeson.object ["always_deny_globs" .= (["git status*"] :: [String])]))
+  cfgOverride <- loadConfig tmpWs2
+  secOverride <- initSecurityWithRoot tmpWs2 (alwaysAllowGlobs cfgOverride) (alwaysDenyGlobs cfgOverride)
+  resOverride <- checkAuthorization secOverride MainAgent "git status" (Aeson.object []) Nothing
+  assert "always_deny_globs overrides defaultAllowGlobs"
+    (case resOverride of DeniedByPolicy Always _ -> True; _ -> False)
+  removeDirectoryRecursive tmpWs2
+
+  secDedup <- initSecurityWithRoot tmpWs [] []
+  aPar1 <- async $ checkAuthorization secDedup MainAgent "cargo build --lib" (Aeson.object []) Nothing
+  aPar2 <- async $ checkAuthorization secDedup MainAgent "cargo build --tests" (Aeson.object []) Nothing
+  mParPrompt <- timeout 2000000 $ atomically $ readTBQueue (uiPromptQueue secDedup)
+  case mParPrompt of
+    Nothing -> failTest "Expected 1 prompt for parallel cargo build calls"
+    Just pPar -> do
+      resolvePrompt pPar (PermissionResponse Allow Lambda.Types.Session)
+      (rPar1, rPar2) <- (,) <$> wait aPar1 <*> wait aPar2
+      assert "Parallel call 1 Authorized" (rPar1 == Authorized)
+      assert "Parallel call 2 Authorized" (rPar2 == Authorized)
+      qEmpty <- atomically $ isEmptyTBQueue (uiPromptQueue secDedup)
+      assert "No second prompt queued for deduplicated rule" qEmpty
+
+  cfgSub <- loadConfig tmpWs
+  secSub <- initSecurityWithRoot tmpWs [] []
+  let dummyBash84 = ToolDefinition "bash" "Run bash" (Aeson.object []) Destructive False
+        (\_ _ -> pure (ToolResult "" "ok" "" Nothing)) Universal
+      regSub = registerTool dummyBash84 emptyRegistry
+  esSub <- initEngineState cfgSub regSub secSub
+  atomically $ writeTVar (appMode esSub) ExecMode
+  atomically $ modifyTVar' (policyRules secSub) (applyDecision (PermissionResponse Allow Lambda.Types.Session) ["rm*"])
+
+  let subPerms = SubAgentPermissions (Set.singleton "bash*") (Set.singleton "rm*")
+      denyCall = ToolCall "call_sub_deny" "bash" (Aeson.object ["command" .= ("rm -rf build" :: Text)])
+  resSubDeny <- executeToolDispatchWithPerms esSub (SubAgentId 1 "worker") subPerms denyCall
+  assert "SubAgent sapDeny blocks tool call even when sapAllow has bash* and prSessionAllow has rm*"
+    (T.null (resultStdout resSubDeny) && "Blocked by" `T.isInfixOf` resultStderr resSubDeny)
+
+  let userDenyCall = ToolCall "call_user_deny" "bash" (Aeson.object ["command" .= ("touch /tmp/lambda_no_create" :: Text)])
+  aUserDeny <- async $ executeToolDispatchWithPerms esSub MainAgent emptySubAgentPermissions userDenyCall
+  pUserDeny <- atomically $ readTBQueue (uiPromptQueue secSub)
+  resolvePrompt pUserDeny (PermissionResponse Deny Once)
+  resUserDeny <- wait aUserDeny
+  assert "Dispatcher returns 'Blocked by user decision' in resultStderr when user denies prompt"
+    ("Blocked by user decision" `T.isInfixOf` resultStderr resUserDeny)
+
+  chansUI <- initEngineChannels (appEventQueue esSub)
+  let baseUI = defaultUIState chansUI cfgSub
+      testApp :: App UIState EngineEvent ResourceName
+      testApp = App
+        { appDraw         = drawApp
+        , appChooseCursor = showFirstCursor
+        , appHandleEvent  = handleAppEvent
+        , appStartEvent   = pure ()
+        , appAttrMap      = const $ attrMap V.defAttr []
+        }
+  inChan <- atomically (newTChan :: STM (TChan InternalEvent))
+  let mockIn = Input inChan (pure ()) (pure ()) (const (pure ()))
+  (_, mockOut) <- mockTerminal (80, 24)
+  mockVty <- V.mkVtyFromPair mockIn mockOut
+  bChan <- newBChan 16
+
+  let keyExpectations =
+        [ ('1', PermissionResponse Allow Once)
+        , ('2', PermissionResponse Allow Lambda.Types.Session)
+        , ('3', PermissionResponse Allow Always)
+        , ('4', PermissionResponse Deny Once)
+        , ('5', PermissionResponse Deny Lambda.Types.Session)
+        , ('6', PermissionResponse Deny Always)
+        ]
+  replies <- mapM (\(idx, _) -> do
+    rv <- newEmptyTMVarIO
+    let p = PermissionPrompt idx MainAgent "bash" (Aeson.object []) ["echo*"] rv Nothing
+    writeBChan bChan (EvPermissionRequired p)
+    pure rv) (zip [1..] keyExpectations)
+
+  uiThread <- async $ customMainWithVty mockVty (pure mockVty) (Just bChan) testApp baseUI
+  threadDelay 50000
+  forM_ keyExpectations $ \(ch, _) -> do
+    atomically $ writeTChan inChan (InputEvent (V.EvKey (V.KChar ch) []))
+    threadDelay 20000
+  atomically $ writeTChan inChan (InputEvent (V.EvKey (V.KChar 'd') [V.MCtrl]))
+  void (wait uiThread)
+
+  forM_ (zip keyExpectations replies) $ \((ch, expected), rv) -> do
+    mGot <- atomically $ tryTakeTMVar rv
+    assert ("TUI key '" <> [ch] <> "' resolves prompt to " <> show expected)
+      (mGot == Just expected)
+
+  acpOutQ <- newTQueueIO
+  acpState <- initAcpServerStateWithSink cfgSub (\bytes -> atomically $ writeTQueue acpOutQ bytes)
+  _ <- startAcpSession acpState (Just tmpWs)
+  mAcpEs <- readTVarIO (acpActiveEngine acpState)
+  case mAcpEs of
+    Nothing -> failTest "Expected acpActiveEngine to be initialized"
+    Just acpEs -> do
+      let drainAcp = do
+            mItem <- atomically $ tryReadTQueue acpOutQ
+            case mItem of
+              Just _  -> drainAcp
+              Nothing -> pure ()
+      drainAcp
+
+      acpReplyVar <- newEmptyTMVarIO
+      let acpPrompt = PermissionPrompt 901 MainAgent "bash" (Aeson.object ["command" .= ("rm -rf foo" :: Text)]) ["rm*"] acpReplyVar (Just "call_acp_1")
+      atomically $ writeTQueue (appEventQueue acpEs) (EvPermissionRequired acpPrompt)
+
+      reqBytes <- atomically $ readTQueue acpOutQ
+      let reqTxt = TE.decodeUtf8 (BL.toStrict reqBytes)
+      forM_ (["allow_once", "allow_session", "allow_always", "reject_once", "reject_session", "reject_always"] :: [Text]) $ \optId ->
+        assert ("ACP permission request includes option " <> T.unpack optId)
+          (optId `T.isInfixOf` reqTxt)
+
+      handleAcpResponse acpState (AcpJsonRpcResponse (Aeson.toJSON (1000 :: Int)) (Just (Aeson.object ["optionId" .= ("reject_once" :: Text)])) Nothing)
+      acpDec <- atomically $ takeTMVar acpReplyVar
+      assert "ACP reject_once resolves to PermissionResponse Deny Once"
+        (acpDec == PermissionResponse Deny Once)
+
+      let deniedTurn = Turn 1 ToolRole
+            [ ToolResultBlock (ToolResult "call_acp_denied" "" "Blocked by user decision" Nothing)
+            ]
+      atomically $ writeTQueue (appEventQueue acpEs) (EvTurnUpdated deniedTurn)
+      threadDelay 50000
+      let collectMsgs = do
+            mItem <- atomically $ tryReadTQueue acpOutQ
+            case mItem of
+              Just b  -> (TE.decodeUtf8 (BL.toStrict b) :) <$> collectMsgs
+              Nothing -> pure []
+      updatesTxt <- T.concat <$> collectMsgs
+      assert "ACP denied tool result emits tool_call_update with failed status"
+        ("tool_call_update" `T.isInfixOf` updatesTxt && "\"failed\"" `T.isInfixOf` updatesTxt)
+
+  removeDirectoryRecursive tmpWs
+  putStrLn "  -> OK: Stateful STM, persistence, deduplication, SubAgent, TUI, and ACP specs verified."
 
 instance QC.Arbitrary Role where
   arbitrary = QC.elements [UserRole, AssistantRole, ToolRole, SystemRole]

@@ -30,6 +30,7 @@ import qualified Data.ByteString.Lazy as BL
 import Data.Containers.ListUtils (nubOrd)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -38,7 +39,7 @@ import Text.Read (readMaybe)
 import Lambda.Config (Config(..), SpecialistConfig(..))
 import Lambda.Core.ModelDriver (ModelDriver(..))
 import Lambda.Core.ToolProvider (ToolDefinition(..), ToolRegistry(..), ToolScope(..), toolsToOpenAISchema)
-import Lambda.Engine.Dispatcher (executeToolDispatch)
+import Lambda.Engine.Dispatcher (executeToolDispatchWithPerms)
 import Lambda.Engine.State
 import Lambda.Types
 
@@ -150,6 +151,7 @@ runEphemeralSubAgent engineState@AppEngineState{..} driver SubAgentSpec{..} = do
         Just s  -> specialistPrompt s
         Nothing -> "# Identity: Specialist SubAgent [" <> subAgentRoleName <> "]\nYou are an ephemeral specialist subagent for an isolated task."
       defaultCaps = maybe [] specialistCapabilities mSpecialist
+      defaultDenies = maybe [] specialistDenyGlobs mSpecialist
       defaultBud = maybe 6 specialistBudget mSpecialist
       effectiveBudget = max 1 (if subTurnBudget > 0 then subTurnBudget else defaultBud)
       combinedGlobs = if null subGrantedGlobs then defaultCaps else nubOrd (defaultCaps ++ subGrantedGlobs)
@@ -170,6 +172,9 @@ runEphemeralSubAgent engineState@AppEngineState{..} driver SubAgentSpec{..} = do
         then filter (not . isDestructiveGlob) combinedGlobs
         else combinedGlobs
       grantedWithReport = "submit_report*" : effectiveGrants
+      subPerms = SubAgentPermissions (Set.fromList grantedWithReport) (Set.fromList defaultDenies)
+
+  _ <- updateSubAgentTask engineState sId $ \t -> t { subAgentPermissions = subPerms }
 
   -- Step 2: Isolated ephemeral state with Depth-1 Star Graph enforcement
   reportVar <- newTVarIO Nothing
@@ -203,10 +208,13 @@ runEphemeralSubAgent engineState@AppEngineState{..} driver SubAgentSpec{..} = do
   updateSubAgentTurns engineState sId initTurns
 
   -- Step 3: Run execution loop
-  res <- subAgentLoop subEngineState effectiveDriver sId grantedWithReport subTurnsVar attemptedToolsVar reportVar 1 effectiveBudget
+  res <- subAgentLoop subEngineState effectiveDriver sId subPerms subTurnsVar attemptedToolsVar reportVar 1 effectiveBudget
   case res of
     Right r -> do
-      updateSubAgentStatus engineState sId (SubAgentSuccess (reportStatus r))
+      let finalStatus = if reportStatus r == "BLOCKED"
+            then SubAgentBlocked (reportSummary r)
+            else SubAgentSuccess (reportStatus r)
+      updateSubAgentStatus engineState sId finalStatus
       pure (Right r)
     Left err -> do
       updateSubAgentStatus engineState sId (SubAgentFailed err)
@@ -216,14 +224,14 @@ subAgentLoop
   :: AppEngineState
   -> ModelDriver
   -> Int
-  -> [Text]
+  -> SubAgentPermissions
   -> TVar [Turn]
   -> TVar [Text]
   -> TVar (Maybe SubAgentReport)
   -> Int
   -> Int
   -> IO (Either Text SubAgentReport)
-subAgentLoop engineState@AppEngineState{..} driver sId grants turnsVar attemptedToolsVar reportVar rawCurrentTurn rawBudget
+subAgentLoop engineState@AppEngineState{..} driver sId subPerms turnsVar attemptedToolsVar reportVar rawCurrentTurn rawBudget
   | currentTurn > budget = do
       mReport <- readTVarIO reportVar
       case mReport of
@@ -332,7 +340,7 @@ subAgentLoop engineState@AppEngineState{..} driver sId grants turnsVar attempted
                       mReport <- readTVarIO reportVar
                       case mReport of
                         Just rep -> pure $ Right rep
-                        Nothing  -> subAgentLoop engineState driver sId grants turnsVar attemptedToolsVar reportVar (currentTurn + 1) budget
+                        Nothing  -> subAgentLoop engineState driver sId subPerms turnsVar attemptedToolsVar reportVar (currentTurn + 1) budget
   where
     currentTurn = max 1 rawCurrentTurn
     budget = max 1 rawBudget
@@ -343,7 +351,7 @@ subAgentLoop engineState@AppEngineState{..} driver sId grants turnsVar attempted
         (atomically $ do
           intr <- readTVar appInterrupted
           check intr)
-        (executeToolDispatch engineState caller grants tc)
+        (executeToolDispatchWithPerms engineState caller subPerms tc)
       case res of
         Left () -> pure $ ToolResult (toolCallId tc) "" "Subagent tool execution cancelled by user." Nothing
         Right r -> pure r
@@ -517,14 +525,19 @@ resumeEphemeralSubAgent engineState@AppEngineState{..} driver sId addBudget mNew
                 Just s  -> specialistPrompt s
                 Nothing -> "# Identity: Specialist SubAgent [" <> effectiveRole <> "]\nYou are an ephemeral specialist subagent for an isolated task."
               defaultCaps = maybe [] specialistCapabilities mSpecialist
+              defaultDenies = maybe [] specialistDenyGlobs mSpecialist
+              prevAllow = Set.toList (sapAllow (subAgentPermissions task))
+              prevDeny  = Set.toList (sapDeny (subAgentPermissions task))
               effectiveAddBudget = max 1 (if addBudget > 0 then addBudget else maybe 6 specialistBudget mSpecialist)
               newTotalBudget = max 1 (subAgentBudget task + effectiveAddBudget)
-              combinedGlobs = nubOrd (defaultCaps ++ additionalGrants)
+              combinedGlobs = nubOrd (prevAllow ++ defaultCaps ++ additionalGrants)
+              combinedDenies = nubOrd (prevDeny ++ defaultDenies)
               isDestructiveGlob g = any (`T.isPrefixOf` g) ["bash*", "write_file*", "edit_file*", "replace_lines*"]
               effectiveGrants = if curMode == PlanMode
                 then filter (not . isDestructiveGlob) combinedGlobs
                 else combinedGlobs
-              grantedWithReport = "submit_report*" : effectiveGrants
+              grantedWithReport = nubOrd ("submit_report*" : effectiveGrants)
+              subPerms = SubAgentPermissions (Set.fromList grantedWithReport) (Set.fromList combinedDenies)
 
           let effectiveDriver = case mSpecialist >>= specialistModel of
                 Just rawMod | not (T.null (T.strip rawMod)) ->
@@ -552,6 +565,7 @@ resumeEphemeralSubAgent engineState@AppEngineState{..} driver sId addBudget mNew
             , subAgentBudget = newTotalBudget
             , subAgentStatus = SubAgentRunning
             , subAgentTurns = updatedInitTurns
+            , subAgentPermissions = subPerms
             }
 
           -- Setup execution loop with isolated registry
@@ -566,10 +580,13 @@ resumeEphemeralSubAgent engineState@AppEngineState{..} driver sId addBudget mNew
           let asstCount = length (filter (\t -> turnRole t == AssistantRole) oldTurns)
               startTurn = asstCount + 1
 
-          res <- subAgentLoop subEngineState effectiveDriver sId grantedWithReport subTurnsVar attemptedToolsVar reportVar startTurn newTotalBudget
+          res <- subAgentLoop subEngineState effectiveDriver sId subPerms subTurnsVar attemptedToolsVar reportVar startTurn newTotalBudget
           case res of
             Right r -> do
-              updateSubAgentStatus engineState sId (SubAgentSuccess (reportStatus r))
+              let finalStatus = if reportStatus r == "BLOCKED"
+                    then SubAgentBlocked (reportSummary r)
+                    else SubAgentSuccess (reportStatus r)
+              updateSubAgentStatus engineState sId finalStatus
               pure (Right r)
             Left err -> do
               updateSubAgentStatus engineState sId (SubAgentFailed err)

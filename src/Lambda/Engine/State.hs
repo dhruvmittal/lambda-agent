@@ -93,6 +93,27 @@ initEngineStateWithSession cfg reg sec maybeSess = do
   activeModVar <- newTVarIO (modelName cfg)
   ctxLimitVar  <- newTVarIO (contextWindowLimit cfg)
   activeTask   <- newTVarIO False
+  let secWithStatus = sec
+        { onPromptStatus = \caller isWaiting -> case caller of
+            SubAgentId sId _ -> atomically $ do
+              subs <- readTVar subsVar
+              case Map.lookup sId subs of
+                Just t ->
+                  let newSt
+                        | isWaiting && subAgentStatus t == SubAgentRunning =
+                            Just (SubAgentBlocked "Awaiting user decision")
+                        | not isWaiting && subAgentStatus t == SubAgentBlocked "Awaiting user decision" =
+                            Just SubAgentRunning
+                        | otherwise = Nothing
+                  in case newSt of
+                       Just st' -> do
+                         let t' = t { subAgentStatus = st' }
+                         writeTVar subsVar (Map.insert sId t' subs)
+                         writeTQueue evQueue (EvSubAgentUpdate t')
+                       Nothing -> pure ()
+                Nothing -> pure ()
+            MainAgent -> pure ()
+        }
   pure AppEngineState
     { appConfig       = cfg
     , appActiveModel  = activeModVar
@@ -104,7 +125,7 @@ initEngineStateWithSession cfg reg sec maybeSess = do
     , appSubAgentSeq  = subSeqVar
     , appStateVector  = stVecVar
     , appToolRegistry = regVar
-    , appSecurity     = sec
+    , appSecurity     = secWithStatus
     , appEventQueue   = evQueue
     , appInterrupted  = intrVar
     , appSession      = sessVar
@@ -154,7 +175,7 @@ registerSubAgentTaskWithParent :: AppEngineState -> Text -> Text -> Int -> Maybe
 registerSubAgentTaskWithParent AppEngineState{..} role hypothesis budget mParentTurnId = atomically $ do
   sId <- readTVar appSubAgentSeq
   writeTVar appSubAgentSeq (sId + 1)
-  let task = SubAgentTask sId role hypothesis 0 budget SubAgentRunning Nothing [] mParentTurnId
+  let task = SubAgentTask sId role hypothesis 0 budget SubAgentRunning Nothing [] mParentTurnId emptySubAgentPermissions
   modifyTVar' appSubAgents (Map.insert sId task)
   writeTQueue appEventQueue (EvSubAgentUpdate task)
   pure task

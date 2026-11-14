@@ -11,6 +11,8 @@ import Data.Aeson ((.=), (.:), (.:?), (.!=))
 import qualified Data.ByteString.Lazy as BL
 import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe)
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -30,18 +32,52 @@ data ToolCapability = ReadOnly | Destructive
 instance Aeson.ToJSON ToolCapability
 instance Aeson.FromJSON ToolCapability
 
--- | User-facing permission level for operations
-data PermissionLevel
-  = PermAlways
-  | PermSession
-  | PermOnce
-  | PermDeny
-  | PermNo
-  | PermNever
+-- | User authorization decision
+data Decision = Allow | Deny
   deriving stock (Eq, Show, Ord, Generic)
 
-instance Aeson.ToJSON PermissionLevel
-instance Aeson.FromJSON PermissionLevel
+instance Aeson.ToJSON Decision
+instance Aeson.FromJSON Decision
+
+-- | Lifetime of an authorization decision
+data PermissionScope = Once | Session | Always
+  deriving stock (Eq, Show, Ord, Generic)
+
+instance Aeson.ToJSON PermissionScope
+instance Aeson.FromJSON PermissionScope
+
+-- | Orthogonal authorization response from user or policy
+data PermissionResponse = PermissionResponse
+  { permDecision :: !Decision
+  , permScope    :: !PermissionScope
+  } deriving stock (Eq, Show, Ord, Generic)
+
+instance Aeson.ToJSON PermissionResponse
+instance Aeson.FromJSON PermissionResponse
+
+-- | Rich outcome of an authorization check (eliminates boolean blindness)
+data AuthOutcome
+  = Authorized
+  | DeniedByUser !PermissionScope !Text
+  | DeniedByPolicy !PermissionScope !Text
+  | DeniedByPlanMode !Text
+  | DeniedByCancel
+  deriving stock (Eq, Show, Ord, Generic)
+
+instance Aeson.ToJSON AuthOutcome
+instance Aeson.FromJSON AuthOutcome
+
+-- | Structured capability and deny grants for a subagent
+data SubAgentPermissions = SubAgentPermissions
+  { sapAllow :: !(Set Text)
+  , sapDeny  :: !(Set Text)
+  } deriving stock (Eq, Show, Ord, Generic)
+
+instance Aeson.ToJSON SubAgentPermissions
+instance Aeson.FromJSON SubAgentPermissions
+
+emptySubAgentPermissions :: SubAgentPermissions
+emptySubAgentPermissions = SubAgentPermissions Set.empty Set.empty
 
 -- | Execution caller identity (Primary Orchestrator vs. Ephemeral Worker)
 data CallerContext
@@ -54,14 +90,17 @@ instance Aeson.FromJSON CallerContext
 
 -- | Non-blocking authorization request
 data PermissionPrompt = PermissionPrompt
-  { promptId           :: !Int
-  , promptCaller       :: !CallerContext
-  , promptTool         :: !Text
-  , promptArgs         :: !Aeson.Value
-  , promptProposedGlob :: !Text
-  , promptReply        :: !(TMVar PermissionLevel)
-  , promptToolCallId   :: !(Maybe Text)
+  { promptId         :: !Int
+  , promptCaller     :: !CallerContext
+  , promptTool       :: !Text
+  , promptArgs       :: !Aeson.Value
+  , promptRules      :: ![Text]
+  , promptReply      :: !(TMVar PermissionResponse)
+  , promptToolCallId :: !(Maybe Text)
   }
+
+promptProposedGlob :: PermissionPrompt -> Text
+promptProposedGlob = T.intercalate ", " . promptRules
 
 -- | Folding state for thinking / reasoning blocks
 data BlockVisibility = Visible | Collapsed
@@ -247,10 +286,23 @@ data SubAgentTask = SubAgentTask
   , subAgentArtifact     :: !(Maybe FilePath)
   , subAgentTurns        :: ![Turn]
   , subAgentParentTurnId :: !(Maybe Int)
+  , subAgentPermissions  :: !SubAgentPermissions
   } deriving stock (Eq, Show, Generic)
 
 instance Aeson.ToJSON SubAgentTask
-instance Aeson.FromJSON SubAgentTask
+instance Aeson.FromJSON SubAgentTask where
+  parseJSON = Aeson.withObject "SubAgentTask" $ \o ->
+    SubAgentTask
+      <$> o .: "subAgentId"
+      <*> o .: "subAgentRole"
+      <*> o .: "subAgentHypothesis"
+      <*> o .: "subAgentTurnCount"
+      <*> o .: "subAgentBudget"
+      <*> o .: "subAgentStatus"
+      <*> o .:? "subAgentArtifact"
+      <*> o .:? "subAgentTurns" .!= []
+      <*> o .:? "subAgentParentTurnId"
+      <*> o .:? "subAgentPermissions" .!= emptySubAgentPermissions
 
 -- | Engine to Frontend notification events
 data EngineEvent
@@ -258,7 +310,7 @@ data EngineEvent
   | EvTurnUpdated !Turn
   | EvStreamChunk !StreamChunk
   | EvPermissionRequired !PermissionPrompt
-  | EvPermissionResolved !Int !PermissionLevel
+  | EvPermissionResolved !Int !PermissionResponse
   | EvSubAgentUpdate !SubAgentTask
   | EvWorkingStateUpdate !Text
   | EvSessionSwitched !Text !AgentMode ![Turn] !(Map Int SubAgentTask)

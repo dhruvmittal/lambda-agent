@@ -566,9 +566,12 @@ forwardEngineEvents state channels sId = do
             [ "sessionId" .= sId
             , "toolCall"  .= callVal
             , "options"   .=
-                [ Aeson.object ["optionId" .= ("allow_once" :: Text), "name" .= ("Allow Once" :: Text), "label" .= ("Allow Once" :: Text), "kind" .= ("allow_once" :: Text)]
-                , Aeson.object ["optionId" .= ("allow_always" :: Text), "name" .= ("Always Allow" :: Text), "label" .= ("Always Allow" :: Text), "kind" .= ("allow_always" :: Text)]
-                , Aeson.object ["optionId" .= ("reject_once" :: Text), "name" .= ("Deny" :: Text), "label" .= ("Deny" :: Text), "kind" .= ("reject_once" :: Text)]
+                [ Aeson.object ["optionId" .= ("allow_once" :: Text), "name" .= ("Yes (Once)" :: Text), "label" .= ("Yes (Once)" :: Text), "kind" .= ("allow_once" :: Text)]
+                , Aeson.object ["optionId" .= ("allow_session" :: Text), "name" .= ("Yes (Session)" :: Text), "label" .= ("Yes (Session)" :: Text), "kind" .= ("allow_once" :: Text)]
+                , Aeson.object ["optionId" .= ("allow_always" :: Text), "name" .= ("Yes (Always)" :: Text), "label" .= ("Yes (Always)" :: Text), "kind" .= ("allow_always" :: Text)]
+                , Aeson.object ["optionId" .= ("reject_once" :: Text), "name" .= ("No (Once)" :: Text), "label" .= ("No (Once)" :: Text), "kind" .= ("reject_once" :: Text)]
+                , Aeson.object ["optionId" .= ("reject_session" :: Text), "name" .= ("Never (Session)" :: Text), "label" .= ("Never (Session)" :: Text), "kind" .= ("reject_once" :: Text)]
+                , Aeson.object ["optionId" .= ("reject_always" :: Text), "name" .= ("Never (Always)" :: Text), "label" .= ("Never (Always)" :: Text), "kind" .= ("reject_always" :: Text)]
                 ]
             ]
       _ <- forkIO $ do
@@ -590,13 +593,16 @@ forwardEngineEvents state channels sId = do
                         Left _ -> Nothing
                   _ -> Nothing
             case outcome of
-              Just "allow_always" -> resolvePrompt prompt PermAlways
-              Just "allow_once"   -> resolvePrompt prompt PermOnce
-              Just "allow"        -> resolvePrompt prompt PermOnce
-              _                   -> resolvePrompt prompt PermDeny
+              Just "allow_always"   -> resolvePrompt prompt (PermissionResponse Allow Always)
+              Just "allow_session"  -> resolvePrompt prompt (PermissionResponse Allow Lambda.Types.Session)
+              Just "allow_once"     -> resolvePrompt prompt (PermissionResponse Allow Once)
+              Just "allow"          -> resolvePrompt prompt (PermissionResponse Allow Once)
+              Just "reject_always"  -> resolvePrompt prompt (PermissionResponse Deny Always)
+              Just "reject_session" -> resolvePrompt prompt (PermissionResponse Deny Lambda.Types.Session)
+              _                     -> resolvePrompt prompt (PermissionResponse Deny Once)
           Left _ ->
             -- Fail-closed on error or cancellation
-            resolvePrompt prompt PermDeny
+            resolvePrompt prompt (PermissionResponse Deny Once)
       forwardEngineEvents state channels sId
 
     EvTurnUpdated (Turn _ AssistantRole blks) -> do
@@ -618,7 +624,10 @@ forwardEngineEvents state channels sId = do
       mapM_ (\case
         ToolResultBlock tr -> do
           atomically $ writeTVar (acpActiveSubAgentCallId state) Nothing
-          sendSessionUpdate state sId (AcpToolCallUpdate (resultCallIdRef tr) "completed" (Just (resultStdout tr)))
+          let isErr = T.null (resultStdout tr) && not (T.null (resultStderr tr))
+              stStr = if isErr then "failed" else "completed"
+              outTxt = if isErr then resultStderr tr else resultStdout tr
+          sendSessionUpdate state sId (AcpToolCallUpdate (resultCallIdRef tr) stStr (Just outTxt))
         _ -> pure ()
         ) blks
       mEng <- readTVarIO (acpActiveEngine state)

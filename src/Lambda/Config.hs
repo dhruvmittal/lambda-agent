@@ -27,13 +27,19 @@ module Lambda.Config
   , parseMarkdownAgent
   , loadMarkdownAgentsFromDir
   , loadAllMarkdownAgents
+  , defaultAllowGlobs
+  , defaultDenyGlobs
+  , persistSecurityRule
   , persistAllowGlob
+  , persistDenyGlob
   , persistTheme
   ) where
 
 import Control.Applicative ((<|>))
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (catch, IOException)
 import Control.Monad (forM)
+import Lambda.Types (Decision(..))
 import Data.Char (isSpace)
 import Data.Containers.ListUtils (nubOrd)
 import Data.List (foldl', isPrefixOf)
@@ -56,6 +62,7 @@ import GHC.Generics (Generic)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getHomeDirectory, listDirectory)
 import System.Environment (lookupEnv)
 import System.FilePath (dropExtension, takeExtension, (</>))
+import System.IO.Unsafe (unsafePerformIO)
 import Text.Read (readMaybe)
 
 data McpServerConfig = McpServerConfig
@@ -284,6 +291,11 @@ defaultAllowGlobs =
   , "ls*"
   , "pwd*"
   , "cat *"
+  , "perf *"
+  , "valgrind *"
+  , "cabal test*"
+  , "ctest*"
+  , "pytest*"
   , "read_file*"
   , "list_directory*"
   , "spawn_specialist_subagent*"
@@ -645,8 +657,8 @@ loadConfig wsRoot = do
               , apiKey             = pick "api_key" (apiKey baseCfgWithLocalMd)
               , modelName          = pick "model_name" (modelName baseCfgWithLocalMd)
               , customHeaders      = pickMap "custom_headers" (customHeaders baseCfgWithLocalMd)
-              , alwaysAllowGlobs   = pick "always_allow_globs" (alwaysAllowGlobs baseCfgWithLocalMd)
-              , alwaysDenyGlobs    = pick "always_deny_globs" (alwaysDenyGlobs baseCfgWithLocalMd)
+              , alwaysAllowGlobs   = nubOrd (alwaysAllowGlobs baseCfgWithLocalMd ++ pick "always_allow_globs" [])
+              , alwaysDenyGlobs    = nubOrd (alwaysDenyGlobs baseCfgWithLocalMd ++ pick "always_deny_globs" [])
               , maxTurnBudget      = pick "max_turn_budget" (maxTurnBudget baseCfgWithLocalMd)
               , contextWindowLimit = pick "context_limit" (contextWindowLimit baseCfgWithLocalMd)
               , mcpServers         = pickMap "mcp_servers" (mcpServers baseCfgWithLocalMd)
@@ -935,11 +947,18 @@ curatedModels =
   , "qwen/qwen-2.5-coder-32b-instruct"
   ]
 
--- | Surgically append an approved glob pattern to always_allow_globs in <wsRoot>/.lambda/config.json
-persistAllowGlob :: FilePath -> String -> IO (Either Text ())
-persistAllowGlob wsRoot newGlob = do
+{-# NOINLINE configWriteLock #-}
+configWriteLock :: MVar ()
+configWriteLock = unsafePerformIO (newMVar ())
+
+-- | Surgically append approved/denied glob patterns to <wsRoot>/.lambda/config.json
+persistSecurityRule :: FilePath -> Decision -> [String] -> IO (Either Text ())
+persistSecurityRule wsRoot decision newGlobs = withMVar configWriteLock $ \() -> do
   let dirPath  = wsRoot </> ".lambda"
       confPath = dirPath </> "config.json"
+      cfgKey   = case decision of
+        Allow -> "always_allow_globs"
+        Deny  -> "always_deny_globs"
   createDirectoryIfMissing True dirPath
   exists <- doesFileExist confPath
   baseObj <- if exists
@@ -950,19 +969,28 @@ persistAllowGlob wsRoot newGlob = do
         _                     -> KM.empty
     else pure KM.empty
 
-  let currentGlobs = case KM.lookup (Key.fromString "always_allow_globs") baseObj of
+  let currentGlobs = case KM.lookup (Key.fromString cfgKey) baseObj of
         Just (Aeson.Array arr) ->
           [ T.unpack s | Aeson.String s <- V.toList arr ]
-        _ -> defaultAllowGlobs
+        _ -> []
+      toAdd = filter (`notElem` currentGlobs) (nubOrd newGlobs)
 
-  if newGlob `elem` currentGlobs
+  if null toAdd
     then pure (Right ())
     else do
-      let updatedGlobs = currentGlobs ++ [newGlob]
-          newObj = KM.insert (Key.fromString "always_allow_globs") (Aeson.toJSON updatedGlobs) baseObj
+      let updatedGlobs = currentGlobs ++ toAdd
+          newObj = KM.insert (Key.fromString cfgKey) (Aeson.toJSON updatedGlobs) baseObj
           encoded = Aeson.encode newObj
       BL.writeFile confPath encoded
       pure (Right ())
+
+-- | Surgically append an approved glob pattern to always_allow_globs in <wsRoot>/.lambda/config.json
+persistAllowGlob :: FilePath -> String -> IO (Either Text ())
+persistAllowGlob wsRoot newGlob = persistSecurityRule wsRoot Allow [newGlob]
+
+-- | Surgically append a denied glob pattern to always_deny_globs in <wsRoot>/.lambda/config.json
+persistDenyGlob :: FilePath -> String -> IO (Either Text ())
+persistDenyGlob wsRoot newGlob = persistSecurityRule wsRoot Deny [newGlob]
 
 -- | Surgically persist the active theme name to <wsRoot>/.lambda/config.json
 persistTheme :: FilePath -> Text -> IO (Either Text ())

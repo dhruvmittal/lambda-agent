@@ -114,30 +114,37 @@ sessionChooserOverlay _ = emptyWidget
 
 modalOverlay :: UIState -> Widget ResourceName
 modalOverlay UIState{ uiCurrentPrompt = Just p } =
-  C.centerLayer $
-    withBorderStyle BS.unicodeBold $
-      B.borderWithLabel (str " Security Gate: Authorization Required ") $
-        hLimit 72 $ vLimit 14 $
-          padAll 1 $
-            vBox
-              [ padBottom (Pad 1) $ str "An operation requires user confirmation:"
-              , str $ "Caller:  " <> show (promptCaller p)
-              , str $ "Tool:    " <> T.unpack (promptTool p)
-              , padBottom (Pad 1) $ txtWrap ("Args:    " <> T.pack (take 60 (show (promptArgs p))))
-              , if not (T.null (promptProposedGlob p))
-                  then padBottom (Pad 1) $ hBox [withAttr (attrName "hudKey") (str "Pattern: "), str (T.unpack (promptProposedGlob p))]
-                  else emptyWidget
-              , C.hCenter $
-                  hBox
-                    [ clickable ButtonAlways  $ B.border (str " [1] Always (Config) ")
-                    , str " "
-                    , clickable ButtonSession $ B.border (str " [2] Session ")
-                    , str " "
-                    , clickable ButtonOnce    $ B.border (str " [3] Once ")
-                    , str " "
-                    , clickable ButtonDeny    $ B.border (str " [4] Deny ")
-                    ]
-              ]
+  let rulesTxt = promptProposedGlob p
+  in C.centerLayer $
+       withBorderStyle BS.unicodeBold $
+         B.borderWithLabel (str " Security Gate: Authorization Required ") $
+           hLimit 74 $ vLimit 16 $
+             padAll 1 $
+               vBox
+                 [ padBottom (Pad 1) $ str "An operation requires user confirmation:"
+                 , str $ "Caller:  " <> show (promptCaller p)
+                 , str $ "Tool:    " <> T.unpack (promptTool p)
+                 , padBottom (Pad 1) $ txtWrap ("Args:    " <> T.pack (take 60 (show (promptArgs p))))
+                 , if not (T.null rulesTxt)
+                     then padBottom (Pad 1) $ hBox [withAttr (attrName "hudKey") (str "Rules:   "), txtWrap rulesTxt]
+                     else emptyWidget
+                 , C.hCenter $
+                     hBox
+                       [ clickable ButtonAllowOnce    $ B.border (str " [1] Yes (Once) ")
+                       , str " "
+                       , clickable ButtonAllowSession $ B.border (str " [2] Yes (Session) ")
+                       , str " "
+                       , clickable ButtonAllowAlways  $ B.border (str " [3] Yes (Always) ")
+                       ]
+                 , C.hCenter $
+                     hBox
+                       [ clickable ButtonDenyOnce     $ B.border (str " [4] No (Once) ")
+                       , str " "
+                       , clickable ButtonDenySession  $ B.border (str " [5] Never (Session) ")
+                       , str " "
+                       , clickable ButtonDenyAlways   $ B.border (str " [6] Never (Always) ")
+                       ]
+                 ]
 modalOverlay _ = emptyWidget
 
 hudOverlay :: UIState -> Widget ResourceName
@@ -246,8 +253,11 @@ mainLayout UIState{..} =
       mElapsed = if isWaiting && uiElapsedSeconds > 0
                    then Just (formatElapsed uiElapsedSeconds)
                    else Nothing
+      headerStateText = case uiCurrentPrompt of
+        Just p  -> "GOAL: " <> wsGoal (parseWorkingState uiWorkingState) <> "\nBLOCKED_ON: Awaiting user decision (" <> promptTool p <> ")"
+        Nothing -> uiWorkingState
   in vBox
-    [ headerBarWithElapsed uiWorkingState uiSelectedSubAgent mElapsed
+    [ headerBarWithElapsed headerStateText uiSelectedSubAgent mElapsed
     , renderMainPane uiSelectedSubAgent uiTurns uiSubAgents uiCompletion uiMode uiModelName uiContextLimit uiConfig uiEditor isWaiting uiSpinnerStep mElapsed
     ]
 

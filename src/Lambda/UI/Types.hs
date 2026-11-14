@@ -23,12 +23,12 @@ data ResourceName
   | SubAgentView
   | SubAgentItem !Int
   | EditorInput
-  | ButtonAlways
-  | ButtonSession
-  | ButtonOnce
-  | ButtonDeny
-  | ButtonNo
-  | ButtonNever
+  | ButtonAllowOnce
+  | ButtonAllowSession
+  | ButtonAllowAlways
+  | ButtonDenyOnce
+  | ButtonDenySession
+  | ButtonDenyAlways
   | HudOverlay
   | HudScroll
   | CompletionPopup

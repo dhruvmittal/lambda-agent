@@ -201,7 +201,7 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 'z') [V.MCtrl])) = do
 handleAppEvent (VtyEvent (V.EvKey V.KEsc [])) = do
   st <- get
   case uiCurrentPrompt st of
-    Just _  -> resolveActiveModal PermDeny
+    Just _  -> resolveActiveModal (PermissionResponse Deny Once)
     Nothing -> case uiSessionChooser st of
       Just _ -> put st { uiSessionChooser = Nothing }
       Nothing -> case uiCompletion st of
@@ -385,17 +385,19 @@ handleAppEvent (VtyEvent (V.EvKey (V.KChar 's') [V.MCtrl])) = do
       metas <- liftIO $ listMeaningfulSessions ".lambda/sessions"
       put st { uiSessionChooser = Just (SessionChooserState metas 0 "") }
 
--- Keystrokes 1-4: resolve permission modal if open, quick-switch session if chooser open, else editor
+-- Keystrokes 1-6: resolve permission modal if open, quick-switch session if chooser open, else editor
 handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar c) []))
-  | c `elem` ['1', '2', '3', '4'] = do
+  | c `elem` ['1', '2', '3', '4', '5', '6'] = do
       st <- get
       case uiCurrentPrompt st of
         Just _ ->
           case c of
-            '1' -> resolveActiveModal PermAlways
-            '2' -> resolveActiveModal PermSession
-            '3' -> resolveActiveModal PermOnce
-            '4' -> resolveActiveModal PermDeny
+            '1' -> resolveActiveModal (PermissionResponse Allow Once)
+            '2' -> resolveActiveModal (PermissionResponse Allow Session)
+            '3' -> resolveActiveModal (PermissionResponse Allow Always)
+            '4' -> resolveActiveModal (PermissionResponse Deny Once)
+            '5' -> resolveActiveModal (PermissionResponse Deny Session)
+            '6' -> resolveActiveModal (PermissionResponse Deny Always)
             _   -> pure ()
         Nothing -> case uiSessionChooser st of
           Just sc -> do
@@ -410,9 +412,9 @@ handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar c) []))
             zoom uiEditorLens (E.handleEditorEvent (VtyEvent ev))
             modify $ \s -> if isJust (uiCompletion s) then s { uiCompletion = Nothing } else s
 
--- Keystrokes 5-9: quick-switch session if chooser open, else editor
+-- Keystrokes 7-9: quick-switch session if chooser open, else editor
 handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar c) []))
-  | c `elem` ['5', '6', '7', '8', '9'] = do
+  | c `elem` ['7', '8', '9'] = do
       st <- get
       case uiSessionChooser st of
         Just sc -> do
@@ -431,7 +433,7 @@ handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar c) []))
 handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar 'q') [])) = do
   st <- get
   case uiCurrentPrompt st of
-    Just _  -> resolveActiveModal PermDeny
+    Just _  -> resolveActiveModal (PermissionResponse Deny Once)
     Nothing -> case uiSessionChooser st of
       Just _ -> put st { uiSessionChooser = Nothing }
       Nothing -> do
@@ -453,12 +455,12 @@ handleAppEvent (VtyEvent ev@(V.EvKey (V.KChar c) []))
           modify $ \s -> if isJust (uiCompletion s) then s { uiCompletion = Nothing } else s
 
 -- Mouse clicks on modal buttons (if mouse events are enabled/passed)
-handleAppEvent (MouseDown ButtonAlways  V.BLeft _ _) = resolveActiveModal PermAlways
-handleAppEvent (MouseDown ButtonSession V.BLeft _ _) = resolveActiveModal PermSession
-handleAppEvent (MouseDown ButtonOnce    V.BLeft _ _) = resolveActiveModal PermOnce
-handleAppEvent (MouseDown ButtonDeny    V.BLeft _ _) = resolveActiveModal PermDeny
-handleAppEvent (MouseDown ButtonNo      V.BLeft _ _) = resolveActiveModal PermDeny
-handleAppEvent (MouseDown ButtonNever   V.BLeft _ _) = resolveActiveModal PermNever
+handleAppEvent (MouseDown ButtonAllowOnce    V.BLeft _ _) = resolveActiveModal (PermissionResponse Allow Once)
+handleAppEvent (MouseDown ButtonAllowSession V.BLeft _ _) = resolveActiveModal (PermissionResponse Allow Session)
+handleAppEvent (MouseDown ButtonAllowAlways  V.BLeft _ _) = resolveActiveModal (PermissionResponse Allow Always)
+handleAppEvent (MouseDown ButtonDenyOnce     V.BLeft _ _) = resolveActiveModal (PermissionResponse Deny Once)
+handleAppEvent (MouseDown ButtonDenySession  V.BLeft _ _) = resolveActiveModal (PermissionResponse Deny Session)
+handleAppEvent (MouseDown ButtonDenyAlways   V.BLeft _ _) = resolveActiveModal (PermissionResponse Deny Always)
 
 -- Mouse click on session item in session chooser modal
 handleAppEvent (MouseDown (SessionItem idx) V.BLeft _ _) = do
@@ -1060,12 +1062,12 @@ copyToClipboardOSC52 rawTxt = do
   TIO.hPutStr stdout osc52
   hFlush stdout
 
-resolveActiveModal :: PermissionLevel -> EventM ResourceName UIState ()
-resolveActiveModal level = do
+resolveActiveModal :: PermissionResponse -> EventM ResourceName UIState ()
+resolveActiveModal resp = do
   st <- get
   case uiCurrentPrompt st of
     Just p -> do
-      liftIO $ resolvePrompt p level
+      liftIO $ resolvePrompt p resp
       -- Pop next pending prompt from queue if any
       case uiPendingPrompts st of
         nextP :<| rest -> put st { uiCurrentPrompt = Just nextP, uiPendingPrompts = rest }
