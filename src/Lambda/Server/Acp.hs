@@ -23,7 +23,7 @@ import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch, try, finally)
-import Control.Monad (unless, when)
+import Control.Monad (unless)
 import Data.Foldable (for_, traverse_)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?))
@@ -84,7 +84,6 @@ data AcpServerState = AcpServerState
   , acpClientCaps         :: !(TVar (Maybe Aeson.Object))
   , acpNextRpcId          :: !(TVar Int)
   , acpPendingClientRpc   :: !(TVar (Map Int (TMVar (Either Aeson.Value Aeson.Value))))
-  , acpActiveSubAgentCallId :: !(TVar (Maybe Text))
   , acpForwarderThread    :: !(TVar (Maybe ThreadId))
   }
 
@@ -110,7 +109,6 @@ initAcpServerStateWithSink cfg sink = do
   capsVar   <- newTVarIO Nothing
   rpcIdVar  <- newTVarIO 1000
   rpcMapVar <- newTVarIO Map.empty
-  subCallIdVar <- newTVarIO Nothing
   fwdThreadVar <- newTVarIO Nothing
   -- Asynchronously discover models from endpoint if configured
   _ <- forkIO $ do
@@ -131,7 +129,6 @@ initAcpServerStateWithSink cfg sink = do
     , acpClientCaps         = capsVar
     , acpNextRpcId          = rpcIdVar
     , acpPendingClientRpc   = rpcMapVar
-    , acpActiveSubAgentCallId = subCallIdVar
     , acpForwarderThread    = fwdThreadVar
     }
 
@@ -607,9 +604,7 @@ forwardEngineEvents state channels sId = do
 
     EvTurnUpdated (Turn _ AssistantRole blks) -> do
       mapM_ (\case
-        ToolCallBlock tc -> do
-          when (toolCallName tc `elem` ["spawn_specialist_subagent", "resume_subagent"]) $
-            atomically $ writeTVar (acpActiveSubAgentCallId state) (Just (toolCallId tc))
+        ToolCallBlock tc ->
           sendSessionUpdate state sId
             (AcpToolCall (toolCallId tc)
                          (formatToolCallTitle tc)
@@ -623,7 +618,6 @@ forwardEngineEvents state channels sId = do
     EvTurnUpdated (Turn _ ToolRole blks) -> do
       mapM_ (\case
         ToolResultBlock tr -> do
-          atomically $ writeTVar (acpActiveSubAgentCallId state) Nothing
           let isErr = T.null (resultStdout tr) && not (T.null (resultStderr tr))
               stStr = if isErr then "failed" else "completed"
               outTxt = if isErr then resultStderr tr else resultStdout tr
@@ -665,8 +659,7 @@ forwardEngineEvents state channels sId = do
       forwardEngineEvents state channels sId
 
     EvSubAgentUpdate task -> do
-      mCallId <- readTVarIO (acpActiveSubAgentCallId state)
-      case mCallId of
+      case subAgentParentCallId task of
         Just callId -> do
           let statusText = "[" <> subAgentRole task <> "] "
                 <> (case subAgentStatus task of

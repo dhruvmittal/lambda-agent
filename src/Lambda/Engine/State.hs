@@ -9,6 +9,7 @@ module Lambda.Engine.State
   , updateTurnBlocks
   , registerSubAgentTask
   , registerSubAgentTaskWithParent
+  , registerSubAgentTaskFull
   , updateSubAgentStatus
   , updateSubAgentTurns
   , updateSubAgentTask
@@ -20,6 +21,7 @@ module Lambda.Engine.State
   , readTelemetrySnapshot
   ) where
 
+import Control.Concurrent.Async (Async, cancel)
 import Control.Concurrent.STM
 import Control.Monad (unless)
 import Data.Map.Strict (Map)
@@ -50,6 +52,7 @@ data AppEngineState = AppEngineState
   , appTurnCounter  :: !(TVar Int)
   , appSubAgents    :: !(TVar (Map Int SubAgentTask))
   , appSubAgentSeq  :: !(TVar Int)
+  , appSubAgentAsyncs :: !(TVar (Map Int (Async ())))
   , appStateVector  :: !(TVar Text)
   , appToolRegistry :: !(TVar ToolRegistry)
   , appSecurity     :: !SecurityState
@@ -93,16 +96,23 @@ initEngineStateWithSession cfg reg sec maybeSess = do
   activeModVar <- newTVarIO (modelName cfg)
   ctxLimitVar  <- newTVarIO (contextWindowLimit cfg)
   activeTask   <- newTVarIO False
+  subAsyncsVar <- newTVarIO Map.empty
+  promptCountsVar <- newTVarIO (Map.empty :: Map Int Int)
   let secWithStatus = sec
         { onPromptStatus = \caller isWaiting -> case caller of
             SubAgentId sId _ -> atomically $ do
+              counts <- readTVar promptCountsVar
+              let prevCnt = Map.findWithDefault 0 sId counts
+                  nextCnt = if isWaiting then prevCnt + 1 else max 0 (prevCnt - 1)
+                  counts' = if nextCnt == 0 then Map.delete sId counts else Map.insert sId nextCnt counts
+              writeTVar promptCountsVar counts'
               subs <- readTVar subsVar
               case Map.lookup sId subs of
                 Just t ->
                   let newSt
-                        | isWaiting && subAgentStatus t == SubAgentRunning =
+                        | isWaiting && nextCnt > 0 && subAgentStatus t == SubAgentRunning =
                             Just (SubAgentBlocked "Awaiting user decision")
-                        | not isWaiting && subAgentStatus t == SubAgentBlocked "Awaiting user decision" =
+                        | not isWaiting && nextCnt == 0 && subAgentStatus t == SubAgentBlocked "Awaiting user decision" =
                             Just SubAgentRunning
                         | otherwise = Nothing
                   in case newSt of
@@ -123,6 +133,7 @@ initEngineStateWithSession cfg reg sec maybeSess = do
     , appTurnCounter  = tCountVar
     , appSubAgents    = subsVar
     , appSubAgentSeq  = subSeqVar
+    , appSubAgentAsyncs = subAsyncsVar
     , appStateVector  = stVecVar
     , appToolRegistry = regVar
     , appSecurity     = secWithStatus
@@ -172,10 +183,14 @@ registerSubAgentTask state role hypothesis budget =
   registerSubAgentTaskWithParent state role hypothesis budget Nothing
 
 registerSubAgentTaskWithParent :: AppEngineState -> Text -> Text -> Int -> Maybe Int -> IO SubAgentTask
-registerSubAgentTaskWithParent AppEngineState{..} role hypothesis budget mParentTurnId = atomically $ do
+registerSubAgentTaskWithParent state role hypothesis budget mParentTurnId =
+  registerSubAgentTaskFull state role hypothesis budget mParentTurnId Nothing
+
+registerSubAgentTaskFull :: AppEngineState -> Text -> Text -> Int -> Maybe Int -> Maybe Text -> IO SubAgentTask
+registerSubAgentTaskFull AppEngineState{..} role hypothesis budget mParentTurnId mParentCallId = atomically $ do
   sId <- readTVar appSubAgentSeq
   writeTVar appSubAgentSeq (sId + 1)
-  let task = SubAgentTask sId role hypothesis 0 budget SubAgentRunning Nothing [] mParentTurnId emptySubAgentPermissions
+  let task = SubAgentTask sId role hypothesis 0 budget SubAgentRunning Nothing [] mParentTurnId emptySubAgentPermissions mParentCallId
   modifyTVar' appSubAgents (Map.insert sId task)
   writeTQueue appEventQueue (EvSubAgentUpdate task)
   pure task
@@ -250,8 +265,14 @@ persistCurrentSession state@AppEngineState{..} = do
   unless isUntouched $
     saveSession appSessionDir (maxSavedSessions appConfig) snap
 
+cancelAndClearSubAgents :: AppEngineState -> IO ()
+cancelAndClearSubAgents AppEngineState{..} = do
+  asyncs <- atomically $ swapTVar appSubAgentAsyncs Map.empty
+  mapM_ cancel (Map.elems asyncs)
+
 resetEngineSession :: AppEngineState -> IO Session
 resetEngineSession state@AppEngineState{..} = do
+  cancelAndClearSubAgents state
   persistCurrentSession state
   freshSess <- newSession
   atomically $ do
@@ -269,6 +290,7 @@ resetEngineSession state@AppEngineState{..} = do
 
 restoreEngineSession :: AppEngineState -> Session -> IO ()
 restoreEngineSession state@AppEngineState{..} s = do
+  cancelAndClearSubAgents state
   persistCurrentSession state
   atomically $ do
     writeTVar appSession s

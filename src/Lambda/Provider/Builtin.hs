@@ -80,7 +80,7 @@ callMcpToolDefinition = ToolDefinition
       ]
   , toolCapability = ReadOnly
   , toolIsMcp = False
-  , toolExecute = \_ _ -> pure (ToolResult "" "" "call_mcp_tool dispatched via engine" Nothing)
+  , toolExecute = \_ _ _ -> pure (ToolResult "" "" "call_mcp_tool dispatched via engine" Nothing)
   , toolScope = Universal
   }
 
@@ -106,7 +106,7 @@ bashTool wsRoot artDir = ToolDefinition
   , toolCapability = Destructive
   , toolIsMcp = False
   , toolScope = Universal
-  , toolExecute = \_caller args -> do
+  , toolExecute = \_caller _mCallId args -> do
       case parseEither (Aeson.withObject "bash" $ \o -> (,) <$> o .: "command" <*> (o .:? "timeout_seconds")) args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
         Right (cmd, mTimeout) -> do
@@ -236,7 +236,7 @@ listDirectoryTool wsRoot = ToolDefinition
   , toolCapability = ReadOnly
   , toolIsMcp = False
   , toolScope = Universal
-  , toolExecute = \_caller args -> do
+  , toolExecute = \_caller _mCallId args -> do
       let parseArgs = Aeson.withObject "list_directory" $ \o -> do
             p <- o .:? "path" .!= "."
             pure p
@@ -281,7 +281,7 @@ readFileTool wsRoot = ToolDefinition
   , toolCapability = ReadOnly
   , toolIsMcp = False
   , toolScope = Universal
-  , toolExecute = \caller args -> do
+  , toolExecute = \caller _mCallId args -> do
       let parseArgs = Aeson.withObject "read_file" $ \o -> do
             p <- o .: "path"
             s <- o .:? "start_line"
@@ -337,7 +337,7 @@ writeFileTool wsRoot = ToolDefinition
   , toolCapability = Destructive
   , toolIsMcp = False
   , toolScope = Universal
-  , toolExecute = \_caller args -> do
+  , toolExecute = \_caller _mCallId args -> do
       let parseArgs = Aeson.withObject "write_file" $ \o -> do
             p <- o .: "path"
             c <- o .: "content"
@@ -377,7 +377,7 @@ editFileTool wsRoot = ToolDefinition
   , toolCapability = Destructive
   , toolIsMcp = False
   , toolScope = Universal
-  , toolExecute = \_caller args -> do
+  , toolExecute = \_caller _mCallId args -> do
       let parseArgs = Aeson.withObject "edit_file" $ \o -> do
             p <- o .: "path"
             t <- o .: "target"
@@ -471,7 +471,7 @@ fetchUrlToolWithManager mMgr artDir = ToolDefinition
   , toolCapability = ReadOnly
   , toolIsMcp = False
   , toolScope = Universal
-  , toolExecute = \_caller args -> do
+  , toolExecute = \_caller _mCallId args -> do
       case parseEither (Aeson.withObject "fetch_url" (.: "url")) args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
         Right rawUrl

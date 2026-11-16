@@ -77,7 +77,7 @@ data SecurityState = SecurityState
   , uiPromptQueue         :: !(TBQueue PermissionPrompt)
   , promptCounter         :: !(TVar Int)
   , activePrompts         :: !(TVar (Map Int Text))
-  , pendingWaiters        :: !(TVar (Map Int ([Text], TMVar PermissionResponse)))
+  , pendingWaiters        :: !(TVar (Map Int ([Text], TMVar PermissionResponse, Int, Bool)))
   , onPromptResolved      :: !(Int -> PermissionResponse -> IO ())
   , onPromptStatus        :: !(CallerContext -> Bool -> IO ())
   }
@@ -387,50 +387,73 @@ checkAuthorizationSubject sec@SecurityState{..} ctx@CallerGrantContext{..} subj 
     promptUserForSubject =
       bracket acquirePrompt releasePrompt usePrompt
       where
-        acquirePrompt = atomically $ do
-          curRules <- readTVar policyRules
-          case evaluateSubject curRules ctx subj of
-            EvalAllow    -> pure (Left Authorized)
-            EvalDeny out -> pure (Left out)
-            EvalRequirePrompt reqRules disp -> do
-              allWaiters <- readTVar pendingWaiters
-              let findMatching [] = Nothing
-                  findMatching ((wId, (wRules, wVar)):rest)
-                    | not (null reqRules) && all (`elem` wRules) reqRules = Just (wId, wVar)
-                    | otherwise = findMatching rest
-              case findMatching (Map.toList allWaiters) of
-                Just (wId, wVar) ->
-                  pure (Right (wId, reqRules, disp, wVar, False))
-                Nothing -> do
-                  rId <- readTVar promptCounter
-                  writeTVar promptCounter (rId + 1)
-                  reply <- newEmptyTMVar
-                  let req = PermissionPrompt rId cgcCaller toolLabel payload reqRules reply mToolCallId
-                  writeTBQueue uiPromptQueue req
-                  modifyTVar' activePrompts (Map.insert rId disp)
-                  modifyTVar' pendingWaiters (Map.insert rId (reqRules, reply))
-                  pure (Right (rId, reqRules, disp, reply, True))
+        acquirePrompt = do
+          res <- atomically $ do
+            curRules <- readTVar policyRules
+            case evaluateSubject curRules ctx subj of
+              EvalAllow    -> pure (Left Authorized)
+              EvalDeny out -> pure (Left out)
+              EvalRequirePrompt reqRules disp -> do
+                allWaiters <- readTVar pendingWaiters
+                let findMatching [] = Nothing
+                    findMatching ((wId, (wRules, wVar, wCnt, wApplied)):rest)
+                      | not (null reqRules) && all (`elem` wRules) reqRules = Just (wId, wRules, wVar, wCnt, wApplied)
+                      | otherwise = findMatching rest
+                case findMatching (Map.toList allWaiters) of
+                  Just (wId, wRules, wVar, wCnt, wApplied) -> do
+                    writeTVar pendingWaiters (Map.insert wId (wRules, wVar, wCnt + 1, wApplied) allWaiters)
+                    pure (Right (wId, reqRules, disp, wVar))
+                  Nothing -> do
+                    rId <- readTVar promptCounter
+                    writeTVar promptCounter (rId + 1)
+                    reply <- newEmptyTMVar
+                    let req = PermissionPrompt rId cgcCaller toolLabel payload reqRules reply mToolCallId
+                    writeTBQueue uiPromptQueue req
+                    modifyTVar' activePrompts (Map.insert rId disp)
+                    modifyTVar' pendingWaiters (Map.insert rId (reqRules, reply, 1, False))
+                    pure (Right (rId, reqRules, disp, reply))
+          case res of
+            Right _ -> onPromptStatus cgcCaller True
+            Left _  -> pure ()
+          pure res
 
         releasePrompt (Left _) = pure ()
-        releasePrompt (Right (rId, _, _, replyVar, isOwner))
-          | not isOwner = onPromptStatus cgcCaller False
-          | otherwise = do
-              wasResolved <- atomically $ do
-                modifyTVar' activePrompts (Map.delete rId)
-                modifyTVar' pendingWaiters (Map.delete rId)
-                empty <- isEmptyTMVar replyVar
-                when empty $ void $ tryPutTMVar replyVar (PermissionResponse Deny Once)
-                pure (not empty)
-              onPromptStatus cgcCaller False
-              unless wasResolved $
-                onPromptResolved rId (PermissionResponse Deny Once)
+        releasePrompt (Right (rId, _, _, replyVar)) = do
+          mAutoDenied <- atomically $ do
+            allW <- readTVar pendingWaiters
+            case Map.lookup rId allW of
+              Nothing -> pure Nothing
+              Just (wRules, wVar, wCnt, wApplied)
+                | wCnt > 1 -> do
+                    writeTVar pendingWaiters (Map.insert rId (wRules, wVar, wCnt - 1, wApplied) allW)
+                    pure Nothing
+                | otherwise -> do
+                    writeTVar pendingWaiters (Map.delete rId allW)
+                    modifyTVar' activePrompts (Map.delete rId)
+                    empty <- isEmptyTMVar replyVar
+                    if empty
+                      then do
+                        void $ tryPutTMVar replyVar (PermissionResponse Deny Once)
+                        pure (Just True)
+                      else pure (Just False)
+          onPromptStatus cgcCaller False
+          case mAutoDenied of
+            Just True -> onPromptResolved rId (PermissionResponse Deny Once)
+            _         -> pure ()
 
         usePrompt (Left out) = pure out
-        usePrompt (Right (rId, reqRules, disp, replyVar, isOwner)) = do
-          onPromptStatus cgcCaller True
+        usePrompt (Right (rId, reqRules, disp, replyVar)) = do
           choice <- atomically $ readTMVar replyVar
 
-          when isOwner $ do
+          becameHandler <- atomically $ do
+            allW <- readTVar pendingWaiters
+            case Map.lookup rId allW of
+              Just (wRules, wVar, wCnt, False) -> do
+                writeTVar pendingWaiters (Map.insert rId (wRules, wVar, wCnt, True) allW)
+                pure True
+              _ -> pure False
+
+          when becameHandler $ do
             case permScope choice of
               Always -> do
                 _ <- persistSecurityRule securityWorkspaceRoot (permDecision choice) (map T.unpack reqRules)
@@ -444,7 +467,7 @@ checkAuthorizationSubject sec@SecurityState{..} ctx@CallerGrantContext{..} subj 
                 else do
                   updatedRules <- readTVar policyRules
                   allWaiters <- readTVar pendingWaiters
-                  let checkWaiter (wId, (wRules, wVar)) =
+                  let checkWaiter (wId, (wRules, wVar, _, _)) =
                         if wId /= rId && all (`elem` reqRules) wRules
                           then Just (wId, wVar)
                           else case evaluateSubject updatedRules ctx (SubjBash (T.intercalate " && " wRules)) of

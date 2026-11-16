@@ -548,7 +548,7 @@ parseMarkdownAgent rawContent =
                      , specialistPrompt       = effectivePrompt
                      , specialistBudget       = fmBudget finalSt
                      , specialistCapabilities = effectiveCaps
-                     , specialistDenyGlobs    = nubOrd (fmCmdDenyGlobs finalSt)
+                     , specialistDenyGlobs    = nubOrd (fmCmdDenyGlobs finalSt ++ fmDenyGlobs finalSt)
                      , specialistModel        = fmModel finalSt
                      }
 

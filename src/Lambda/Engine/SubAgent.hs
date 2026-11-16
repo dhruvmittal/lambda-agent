@@ -1,5 +1,7 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Lambda.Engine.SubAgent
   ( SubAgentSpec(..)
@@ -7,22 +9,27 @@ module Lambda.Engine.SubAgent
   , SubAgentResult
   , SubAgentRegistry(..)
   , runEphemeralSubAgent
+  , runEphemeralSubAgentWithCallId
   , resumeEphemeralSubAgent
+  , resumeEphemeralSubAgentWithCallId
   , spawnSpecialistSubAgentTool
   , resumeSpecialistSubAgentTool
   , formatSpecialistCatalog
+  , formatSpecialistReportXml
   , submitReportTool
   , filterSubAgentRegistry
   , subAgentLoop
+  , compactSubAgentTurns
   , accumulateStreamChunks
   , appendArgs
   , finalizeToolArgs
   ) where
 
 import Control.Applicative ((<|>))
-import Control.Concurrent.Async (mapConcurrently, race)
+import Control.Concurrent.Async (AsyncCancelled, mapConcurrently, waitCatch, withAsync)
 import Control.Concurrent.STM
-import Control.Monad (unless)
+import Control.Exception (SomeException, bracket, catch, displayException, fromException, throwIO)
+import Control.Monad (unless, void, when)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?), (.!=))
 import Data.Aeson.Types (parseEither)
@@ -36,10 +43,12 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Text.Read (readMaybe)
 
-import Lambda.Config (Config(..), SpecialistConfig(..))
+import Lambda.Config (Config(..), SpecialistConfig(..), lookupModelContextLimitWithConfig)
 import Lambda.Core.ModelDriver (ModelDriver(..))
 import Lambda.Core.ToolProvider (ToolDefinition(..), ToolRegistry(..), ToolScope(..), toolsToOpenAISchema)
+import Lambda.Engine.Compactor (compactHistory, estimateTotalTokens)
 import Lambda.Engine.Dispatcher (executeToolDispatchWithPerms)
+import Lambda.Engine.Security (matchGlob)
 import Lambda.Engine.State
 import Lambda.Types
 
@@ -90,7 +99,7 @@ submitReportTool reportVar = ToolDefinition
   , toolCapability = ReadOnly
   , toolIsMcp = False
   , toolScope = Universal
-  , toolExecute = \_caller args -> do
+  , toolExecute = \_caller _mCallId args -> do
       case parseEither parseReport args of
         Left err -> pure $ ToolResult "" "" ("Invalid submit_report arguments: " <> T.pack err) Nothing
         Right r -> do
@@ -125,6 +134,69 @@ filterSubAgentRegistry repTool (ToolRegistry m) =
       withReport = Map.insert (toolName repTool) repTool withoutSubControl
   in ToolRegistry withReport
 
+-- | Remove tools whose name is explicitly denied by subagent deny globs (never removes submit_report)
+filterRegistryByDeny :: Set.Set Text -> ToolRegistry -> ToolRegistry
+filterRegistryByDeny denies (ToolRegistry m)
+  | Set.null denies = ToolRegistry m
+  | otherwise = ToolRegistry $ Map.filter (\t ->
+      toolName t == "submit_report"
+      || not (any (\g -> matchGlob g (toolName t)) (Set.toList denies))) m
+
+-- | Shared lifecycle wrapper for running or resuming a subagent with per-subagent cancellation and artifact capture
+executeSubAgentSession
+  :: AppEngineState
+  -> ModelDriver
+  -> Int
+  -> SubAgentPermissions
+  -> TVar [Turn]
+  -> Int
+  -> Int
+  -> IO (Either Text SubAgentReport)
+executeSubAgentSession engineState@AppEngineState{..} driver sId subPerms subTurnsVar startTurn budget = do
+  reportVar <- newTVarIO Nothing
+  attemptedToolsVar <- newTVarIO ([] :: [Text])
+  baseReg <- readTVarIO appToolRegistry
+  let subReg = filterRegistryByDeny (sapDeny subPerms) (filterSubAgentRegistry (submitReportTool reportVar) baseReg)
+  subRegVar <- newTVarIO subReg
+  let subEngineState = engineState { appToolRegistry = subRegVar }
+
+  res <- withAsync
+    (subAgentLoop subEngineState driver sId subPerms subTurnsVar attemptedToolsVar reportVar startTurn budget)
+    (\subAsync ->
+      let subHandle = void subAsync
+      in bracket
+        (atomically $ modifyTVar' appSubAgentAsyncs (Map.insert sId subHandle))
+        (\_ -> atomically $ modifyTVar' appSubAgentAsyncs (Map.update (\v -> if v == subHandle then Nothing else Just v) sId))
+        (\_ -> do
+          r <- waitCatch subAsync
+          case r of
+            Right out -> pure out
+            Left ex -> case fromException ex :: Maybe AsyncCancelled of
+              Just _ -> pure (Left "Cancelled by user")
+              Nothing -> throwIO ex))
+    `catch` \(e :: SomeException) -> do
+      let st = case fromException e of
+            Just (_ :: AsyncCancelled) -> SubAgentBlocked "Cancelled by user"
+            Nothing                    -> SubAgentFailed (T.pack (displayException e))
+      updateSubAgentStatus engineState sId st
+      throwIO e
+  case res of
+    Right r -> do
+      let finalStatus = if reportStatus r == "BLOCKED"
+            then SubAgentBlocked (reportSummary r)
+            else SubAgentSuccess (reportStatus r)
+      _ <- updateSubAgentTask engineState sId $ \t -> t
+        { subAgentStatus   = finalStatus
+        , subAgentArtifact = fmap T.unpack (reportArtifact r) <|> subAgentArtifact t
+        }
+      pure (Right r)
+    Left err -> do
+      let finalStatus = if err == "Cancelled by user" || err == "Subagent execution cancelled by user."
+            then SubAgentBlocked "Cancelled by user"
+            else SubAgentFailed err
+      updateSubAgentStatus engineState sId finalStatus
+      pure (Left err)
+
 -- | Formats the configured specialist catalog into a compact, high-signal string for tool schemas
 formatSpecialistCatalog :: Map.Map Text SpecialistConfig -> Text
 formatSpecialistCatalog specs =
@@ -133,58 +205,88 @@ formatSpecialistCatalog specs =
     | (name, sc) <- Map.toAscList specs
     ]
 
+-- | Escapes XML special characters for safe embedding in specialist report tags
+escapeXml :: Text -> Text
+escapeXml = T.concatMap $ \case
+  '&'  -> "&amp;"
+  '<'  -> "&lt;"
+  '>'  -> "&gt;"
+  '"'  -> "&quot;"
+  '\'' -> "&apos;"
+  c    -> T.singleton c
+
+-- | Formats a SubAgentReport into a canonical <specialist_report> XML block
+formatSpecialistReportXml :: Maybe Int -> Text -> SubAgentReport -> Text
+formatSpecialistReportXml mSubId role SubAgentReport{..} =
+  let idAttr       = maybe "" (\i -> " id=\"" <> T.pack (show i) <> "\"") mSubId
+      artifactAttr = maybe "" (\a -> " artifact=\"" <> escapeXml a <> "\"") reportArtifact
+  in T.unlines
+    [ "<specialist_report" <> idAttr <> " role=\"" <> escapeXml role <> "\" status=\"" <> escapeXml reportStatus <> "\"" <> artifactAttr <> ">"
+    , "  <summary>" <> escapeXml reportSummary <> "</summary>"
+    , "  <details>" <> escapeXml reportDetails <> "</details>"
+    , "</specialist_report>"
+    ]
+
+-- | Shared specialist persona, budget, driver, and permission setup for spawn and resume
+resolveSpecialistSetup
+  :: Config
+  -> AgentMode
+  -> ModelDriver
+  -> Text
+  -> [Text]
+  -> [Text]
+  -> [Text]
+  -> (Text, Int, ModelDriver, SubAgentPermissions)
+resolveSpecialistSetup cfg curMode driver role extraPrevAllow extraPrevDeny extraGrants =
+  let mSpecialist = Map.lookup (T.toLower role) (specialists cfg)
+      specPrompt = case mSpecialist of
+        Just s  -> specialistPrompt s
+        Nothing -> "# Identity: Specialist SubAgent [" <> role <> "]\nYou are an ephemeral specialist subagent for an isolated task."
+      defaultCaps   = maybe [] specialistCapabilities mSpecialist
+      defaultDenies = maybe [] specialistDenyGlobs mSpecialist
+      defaultBud    = maybe 6 specialistBudget mSpecialist
+      combinedGlobs = nubOrd (extraPrevAllow ++ defaultCaps ++ extraGrants)
+      combinedDenies = nubOrd (extraPrevDeny ++ defaultDenies)
+      isDestructiveGlob g = any (`T.isPrefixOf` g) ["bash*", "write_file*", "edit_file*", "replace_lines*"]
+      effectiveGrants = if curMode == PlanMode
+        then filter (not . isDestructiveGlob) combinedGlobs
+        else combinedGlobs
+      grantedWithReport = nubOrd ("submit_report*" : effectiveGrants)
+      subPerms = SubAgentPermissions (Set.fromList grantedWithReport) (Set.fromList combinedDenies)
+      effectiveDriver = case mSpecialist >>= specialistModel of
+        Just rawMod | not (T.null (T.strip rawMod)) -> driverWithModel driver (T.strip rawMod)
+        _ -> driver
+  in (specPrompt, defaultBud, effectiveDriver, subPerms)
+
 -- | Spawns and executes an ephemeral specialist subagent with isolated STM context and bounded budget
 runEphemeralSubAgent
   :: AppEngineState
   -> ModelDriver
   -> SubAgentSpec
   -> IO (Either Text SubAgentReport)
-runEphemeralSubAgent engineState@AppEngineState{..} driver SubAgentSpec{..} = do
+runEphemeralSubAgent engineState driver spec =
+  runEphemeralSubAgentWithCallId engineState driver Nothing spec
+
+runEphemeralSubAgentWithCallId
+  :: AppEngineState
+  -> ModelDriver
+  -> Maybe Text
+  -> SubAgentSpec
+  -> IO (Either Text SubAgentReport)
+runEphemeralSubAgentWithCallId engineState@AppEngineState{..} driver mParentCallId SubAgentSpec{..} = do
   turns <- readTVarIO appTurns
   let parentTurnId = if null turns then Nothing else Just (turnId (last turns))
-
   curMode <- readTVarIO appMode
 
-  -- Look up specialist persona in configuration
-  let mSpecialist = Map.lookup (T.toLower subAgentRoleName) (specialists appConfig)
-      specPrompt = case mSpecialist of
-        Just s  -> specialistPrompt s
-        Nothing -> "# Identity: Specialist SubAgent [" <> subAgentRoleName <> "]\nYou are an ephemeral specialist subagent for an isolated task."
-      defaultCaps = maybe [] specialistCapabilities mSpecialist
-      defaultDenies = maybe [] specialistDenyGlobs mSpecialist
-      defaultBud = maybe 6 specialistBudget mSpecialist
+  let (specPrompt, defaultBud, effectiveDriver, subPerms) =
+        resolveSpecialistSetup appConfig curMode driver subAgentRoleName [] [] subGrantedGlobs
       effectiveBudget = max 1 (if subTurnBudget > 0 then subTurnBudget else defaultBud)
-      combinedGlobs = if null subGrantedGlobs then defaultCaps else nubOrd (defaultCaps ++ subGrantedGlobs)
 
-  task <- registerSubAgentTaskWithParent engineState subAgentRoleName subTaskDescription effectiveBudget parentTurnId
+  task <- registerSubAgentTaskFull engineState subAgentRoleName subTaskDescription effectiveBudget parentTurnId mParentCallId
   let sId = subAgentId task
-
-  -- Resolve optional per-specialist model override cleanly through driver interface
-  let effectiveDriver = case mSpecialist >>= specialistModel of
-        Just rawMod | not (T.null (T.strip rawMod)) ->
-          driverWithModel driver (T.strip rawMod)
-        _ -> driver
-
-  -- Step 1: Capability bounds
-  -- In PlanMode, filter out any destructive grants so subagent is strictly read-only
-  let isDestructiveGlob g = any (`T.isPrefixOf` g) ["bash*", "write_file*", "edit_file*", "replace_lines*"]
-      effectiveGrants = if curMode == PlanMode
-        then filter (not . isDestructiveGlob) combinedGlobs
-        else combinedGlobs
-      grantedWithReport = "submit_report*" : effectiveGrants
-      subPerms = SubAgentPermissions (Set.fromList grantedWithReport) (Set.fromList defaultDenies)
-
   _ <- updateSubAgentTask engineState sId $ \t -> t { subAgentPermissions = subPerms }
 
   -- Step 2: Isolated ephemeral state with Depth-1 Star Graph enforcement
-  reportVar <- newTVarIO Nothing
-  attemptedToolsVar <- newTVarIO ([] :: [Text])
-
-  baseReg <- readTVarIO appToolRegistry
-  let subReg = filterSubAgentRegistry (submitReportTool reportVar) baseReg
-  subRegVar <- newTVarIO subReg
-  let subEngineState = engineState { appToolRegistry = subRegVar }
-
   let singleTurnNotice =
         if effectiveBudget == 1
           then "\n\n[CRITICAL NOTICE: SINGLE-TURN BUDGET (1/1). You have exactly ONE turn. You MUST synthesize your answer and call `submit_report` on this turn.]"
@@ -207,18 +309,30 @@ runEphemeralSubAgent engineState@AppEngineState{..} driver SubAgentSpec{..} = do
   subTurnsVar <- newTVarIO initTurns
   updateSubAgentTurns engineState sId initTurns
 
-  -- Step 3: Run execution loop
-  res <- subAgentLoop subEngineState effectiveDriver sId subPerms subTurnsVar attemptedToolsVar reportVar 1 effectiveBudget
-  case res of
-    Right r -> do
-      let finalStatus = if reportStatus r == "BLOCKED"
-            then SubAgentBlocked (reportSummary r)
-            else SubAgentSuccess (reportStatus r)
-      updateSubAgentStatus engineState sId finalStatus
-      pure (Right r)
-    Left err -> do
-      updateSubAgentStatus engineState sId (SubAgentFailed err)
-      pure (Left err)
+  -- Step 3: Run execution loop with per-subagent cancellation and artifact capture
+  executeSubAgentSession engineState effectiveDriver sId subPerms subTurnsVar 1 effectiveBudget
+
+-- | Compacts subagent conversation history when total tokens exceed 85% of the model context limit,
+-- preserving the leading specialist SystemRole prompt turn and tool-call pairing.
+compactSubAgentTurns :: Int -> [Turn] -> [Turn]
+compactSubAgentTurns targetLimit turns =
+  let triggerLimit = max 64 ((targetLimit * 85) `div` 100)
+  in if estimateTotalTokens turns <= triggerLimit
+       then turns
+       else case turns of
+         (sysTurn@(Turn _ SystemRole _) : rest) ->
+           let sysTokens = estimateTotalTokens [sysTurn]
+               availBudget = max 64 (triggerLimit - sysTokens)
+               compacted4 = compactHistory availBudget 4 rest
+               compacted = if estimateTotalTokens compacted4 > availBudget
+                 then compactHistory availBudget 2 rest
+                 else compacted4
+           in sysTurn : compacted
+         _ ->
+           let compacted4 = compactHistory triggerLimit 4 turns
+           in if estimateTotalTokens compacted4 > triggerLimit
+                then compactHistory triggerLimit 2 turns
+                else compacted4
 
 subAgentLoop
   :: AppEngineState
@@ -254,34 +368,62 @@ subAgentLoop engineState@AppEngineState{..} driver sId subPerms turnsVar attempt
                 }
           pure $ Right failRep
   | otherwise = do
-      turns <- readTVarIO turnsVar
+      rawTurns <- readTVarIO turnsVar
+      subsMap <- readTVarIO appSubAgents
+      defaultLimit <- readTVarIO appContextLimit
+      let subLimit = case Map.lookup sId subsMap >>= \t -> Map.lookup (T.toLower (subAgentRole t)) (specialists appConfig) >>= specialistModel of
+            Just rawMod | not (T.null (T.strip rawMod)) -> lookupModelContextLimitWithConfig appConfig (T.strip rawMod)
+            _ -> defaultLimit
+          turns = compactSubAgentTurns subLimit rawTurns
+      when (turns /= rawTurns) $ do
+        atomically $ writeTVar turnsVar turns
+        updateSubAgentTurns engineState sId turns
+
       reg <- readTVarIO appToolRegistry
       mode <- readTVarIO appMode
       let toolSchemas = toolsToOpenAISchema mode reg
 
-      let onSubProgress _ _ = pure ()
+      let nextAsstId = if null turns then 1 else maximum (map turnId turns) + 1
+          inFlightTurn = Turn nextAsstId AssistantRole [TextBlock "Thinking..."]
+      asstTurns0 <- atomically $ do
+        modifyTVar' turnsVar (\ts -> ts ++ [inFlightTurn])
+        readTVar turnsVar
+      updateSubAgentTurns engineState sId asstTurns0
+
+      let updateInFlight blocks = do
+            updated <- atomically $ do
+              ts <- readTVar turnsVar
+              let ts' = map (\t -> if turnId t == nextAsstId then t { turnBlocks = blocks } else t) ts
+              writeTVar turnsVar ts'
+              pure ts'
+            updateSubAgentTurns engineState sId updated
+
+          onSubProgress t th = do
+            let blks = [ ThinkingBlock currentTurn th Visible | not (T.null th) ]
+                    ++ [ TextBlock t | not (T.null t) ]
+            unless (null blks) $ updateInFlight blks
           onSubChunk _ = pure ()
 
+      localIntrVar <- newTVarIO False
       (fullText, fullThinking, toolCalls, wasInterrupted, mDriverErr) <-
-        accumulateStreamChunks appInterrupted driver turns toolSchemas onSubProgress onSubChunk
+        accumulateStreamChunks localIntrVar driver turns toolSchemas onSubProgress onSubChunk
 
       case mDriverErr of
         Just err -> pure $ Left ("Model Driver Error: " <> err)
         Nothing
-          | wasInterrupted -> pure $ Left "Subagent execution cancelled by user."
+          | wasInterrupted -> do
+              let intBlocks =
+                    [ ThinkingBlock currentTurn fullThinking Visible | not (T.null fullThinking) ]
+                    ++ [ TextBlock (fullText <> (if T.null fullText then "" else "\n") <> "⚠️ [Subagent cancelled by user]") ]
+              updateInFlight intBlocks
+              pure $ Left "Subagent execution cancelled by user."
           | otherwise -> do
               let assistantBlocks =
                     [ ThinkingBlock currentTurn fullThinking Visible | not (T.null fullThinking) ]
                     ++ [ TextBlock fullText | not (T.null fullText) ]
                     ++ map ToolCallBlock toolCalls
 
-              turnsNow <- readTVarIO turnsVar
-              let nextAsstId = if null turnsNow then 1 else maximum (map turnId turnsNow) + 1
-                  newAssistantTurn = Turn nextAsstId AssistantRole assistantBlocks
-              asstTurns <- atomically $ do
-                modifyTVar' turnsVar (\ts -> ts ++ [newAssistantTurn])
-                readTVar turnsVar
-              updateSubAgentTurns engineState sId asstTurns
+              updateInFlight assistantBlocks
 
               if null toolCalls
                 then do
@@ -314,8 +456,13 @@ subAgentLoop engineState@AppEngineState{..} driver sId subPerms turnsVar attempt
                         in toolCallName tc <> argSummary
                   atomically $ modifyTVar' attemptedToolsVar (\prev -> map formatCall toolCalls ++ prev)
 
-                  -- Execute tool calls concurrently in subagent context with interrupt checking
-                  rawToolResults <- mapConcurrently (runSingleSubTool (SubAgentId sId subTaskDescription)) toolCalls
+                  subsNow <- readTVarIO appSubAgents
+                  let callerDesc = case Map.lookup sId subsNow of
+                        Just task -> "[" <> subAgentRole task <> "] " <> subAgentHypothesis task
+                        Nothing   -> "SubAgent #" <> T.pack (show sId)
+
+                  -- Execute tool calls concurrently in subagent context
+                  rawToolResults <- mapConcurrently (executeToolDispatchWithPerms engineState (SubAgentId sId callerDesc) subPerms) toolCalls
                   mReportNow <- readTVarIO reportVar
                   let finalTurnNotice =
                         if (currentTurn == budget - 1 || budget == 1) && mReportNow == Nothing && not (null rawToolResults)
@@ -333,28 +480,13 @@ subAgentLoop engineState@AppEngineState{..} driver sId subPerms turnsVar attempt
                     readTVar turnsVar
                   updateSubAgentTurns engineState sId toolTurns
 
-                  stillActive <- not <$> readTVarIO appInterrupted
-                  if not stillActive
-                    then pure $ Left "Subagent execution cancelled by user."
-                    else do
-                      mReport <- readTVarIO reportVar
-                      case mReport of
-                        Just rep -> pure $ Right rep
-                        Nothing  -> subAgentLoop engineState driver sId subPerms turnsVar attemptedToolsVar reportVar (currentTurn + 1) budget
+                  mReport <- readTVarIO reportVar
+                  case mReport of
+                    Just rep -> pure $ Right rep
+                    Nothing  -> subAgentLoop engineState driver sId subPerms turnsVar attemptedToolsVar reportVar (currentTurn + 1) budget
   where
     currentTurn = max 1 rawCurrentTurn
     budget = max 1 rawBudget
-    subTaskDescription = "SubAgent #" <> T.pack (show sId)
-
-    runSingleSubTool caller tc = do
-      res <- race
-        (atomically $ do
-          intr <- readTVar appInterrupted
-          check intr)
-        (executeToolDispatchWithPerms engineState caller subPerms tc)
-      case res of
-        Left () -> pure $ ToolResult (toolCallId tc) "" "Subagent tool execution cancelled by user." Nothing
-        Right r -> pure r
 
 -- | Shared low-level stream chunk accumulator for orchestrator and subagents
 accumulateStreamChunks
@@ -468,24 +600,18 @@ spawnSpecialistSubAgentTool engineState driver =
     , toolCapability = ReadOnly
     , toolIsMcp = False
     , toolScope = RootOnly
-    , toolExecute = \_caller args -> do
+    , toolExecute = \_caller mCallId args -> do
         case parseEither parseSpecialistArgs args of
           Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
           Right (role, task, mBudget, mGrants) -> do
-            let budget = maybe 0 id mBudget
-                grants = maybe [] id mGrants
+            let budget = fromMaybe 0 mBudget
+                grants = fromMaybe [] mGrants
                 spec = SubAgentSpec role task budget grants
-            res <- runEphemeralSubAgent engineState driver spec
+            res <- runEphemeralSubAgentWithCallId engineState driver mCallId spec
             case res of
               Left err -> pure $ ToolResult "" "" ("Specialist subagent failed: " <> err) Nothing
-              Right SubAgentReport{..} -> do
-                let artifactAttr = maybe "" (\a -> " artifact=\"" <> a <> "\"") reportArtifact
-                    summary = T.unlines
-                      [ "<specialist_report role=\"" <> role <> "\" status=\"" <> reportStatus <> "\"" <> artifactAttr <> ">"
-                      , "  <summary>" <> reportSummary <> "</summary>"
-                      , "  <details>" <> reportDetails <> "</details>"
-                      , "</specialist_report>"
-                      ]
+              Right rep@SubAgentReport{..} -> do
+                let summary = formatSpecialistReportXml Nothing role rep
                 pure $ ToolResult "" summary "" (fmap T.unpack reportArtifact)
     }
   where
@@ -506,91 +632,71 @@ resumeEphemeralSubAgent
   -> Maybe Text        -- ^ mGuidance
   -> [Text]            -- ^ additionalGrants
   -> IO (Either Text SubAgentReport)
-resumeEphemeralSubAgent engineState@AppEngineState{..} driver sId addBudget mNewRole mGuidance additionalGrants = do
-  subs <- readTVarIO appSubAgents
-  case Map.lookup sId subs of
-    Nothing -> pure $ Left $ "SubAgent #" <> T.pack (show sId) <> " not found."
-    Just task
-      | subAgentStatus task == SubAgentRunning ->
-          pure $ Left $ "SubAgent #" <> T.pack (show sId) <> " is already running."
-      | otherwise -> do
-          curMode <- readTVarIO appMode
-          let currentRole = subAgentRole task
-              effectiveRole = case mNewRole of
-                Just r | not (T.null (T.strip r)) -> T.strip r
-                _ -> currentRole
-              isSpecialized = effectiveRole /= currentRole
-              mSpecialist = Map.lookup (T.toLower effectiveRole) (specialists appConfig)
-              specPrompt = case mSpecialist of
-                Just s  -> specialistPrompt s
-                Nothing -> "# Identity: Specialist SubAgent [" <> effectiveRole <> "]\nYou are an ephemeral specialist subagent for an isolated task."
-              defaultCaps = maybe [] specialistCapabilities mSpecialist
-              defaultDenies = maybe [] specialistDenyGlobs mSpecialist
-              prevAllow = Set.toList (sapAllow (subAgentPermissions task))
-              prevDeny  = Set.toList (sapDeny (subAgentPermissions task))
-              effectiveAddBudget = max 1 (if addBudget > 0 then addBudget else maybe 6 specialistBudget mSpecialist)
-              newTotalBudget = max 1 (subAgentBudget task + effectiveAddBudget)
-              combinedGlobs = nubOrd (prevAllow ++ defaultCaps ++ additionalGrants)
-              combinedDenies = nubOrd (prevDeny ++ defaultDenies)
-              isDestructiveGlob g = any (`T.isPrefixOf` g) ["bash*", "write_file*", "edit_file*", "replace_lines*"]
-              effectiveGrants = if curMode == PlanMode
-                then filter (not . isDestructiveGlob) combinedGlobs
-                else combinedGlobs
-              grantedWithReport = nubOrd ("submit_report*" : effectiveGrants)
-              subPerms = SubAgentPermissions (Set.fromList grantedWithReport) (Set.fromList combinedDenies)
+resumeEphemeralSubAgent engineState driver sId addBudget mNewRole mGuidance additionalGrants =
+  resumeEphemeralSubAgentWithCallId engineState driver Nothing sId addBudget mNewRole mGuidance additionalGrants
 
-          let effectiveDriver = case mSpecialist >>= specialistModel of
-                Just rawMod | not (T.null (T.strip rawMod)) ->
-                  driverWithModel driver (T.strip rawMod)
-                _ -> driver
-
-          -- Prepare continuation prompt
-          let continuationLines =
-                [ "## Task Resumed"
-                , "Your turn budget has been extended by " <> T.pack (show effectiveAddBudget) <> " turns (total budget: " <> T.pack (show newTotalBudget) <> " turns)."
-                ]
-                ++ [ "## Role Specialization: " <> effectiveRole | isSpecialized ]
-                ++ [ specPrompt | isSpecialized ]
-                ++ [ "## Additional Guidance:\n" <> g | Just g <- [mGuidance], not (T.null (T.strip g)) ]
-                ++ [ "Continue your investigation and execute `submit_report` when your task is complete." ]
-              continuationText = T.unlines continuationLines
-              oldTurns = subAgentTurns task
-              nextTurnId = if null oldTurns then 1 else maximum (map turnId oldTurns) + 1
-              continuationTurn = Turn nextTurnId UserRole [TextBlock continuationText]
-              updatedInitTurns = oldTurns ++ [continuationTurn]
-
-          -- Update task in state vector
-          _ <- updateSubAgentTask engineState sId $ \t -> t
-            { subAgentRole = effectiveRole
-            , subAgentBudget = newTotalBudget
-            , subAgentStatus = SubAgentRunning
-            , subAgentTurns = updatedInitTurns
-            , subAgentPermissions = subPerms
-            }
-
-          -- Setup execution loop with isolated registry
-          reportVar <- newTVarIO Nothing
-          attemptedToolsVar <- newTVarIO ([] :: [Text])
-          baseReg <- readTVarIO appToolRegistry
-          let subReg = filterSubAgentRegistry (submitReportTool reportVar) baseReg
-          subRegVar <- newTVarIO subReg
-          let subEngineState = engineState { appToolRegistry = subRegVar }
-          subTurnsVar <- newTVarIO updatedInitTurns
-
-          let asstCount = length (filter (\t -> turnRole t == AssistantRole) oldTurns)
-              startTurn = asstCount + 1
-
-          res <- subAgentLoop subEngineState effectiveDriver sId subPerms subTurnsVar attemptedToolsVar reportVar startTurn newTotalBudget
-          case res of
-            Right r -> do
-              let finalStatus = if reportStatus r == "BLOCKED"
-                    then SubAgentBlocked (reportSummary r)
-                    else SubAgentSuccess (reportStatus r)
-              updateSubAgentStatus engineState sId finalStatus
-              pure (Right r)
-            Left err -> do
-              updateSubAgentStatus engineState sId (SubAgentFailed err)
-              pure (Left err)
+resumeEphemeralSubAgentWithCallId
+  :: AppEngineState
+  -> ModelDriver
+  -> Maybe Text        -- ^ mParentCallId
+  -> Int               -- ^ sId
+  -> Int               -- ^ additionalBudget
+  -> Maybe Text        -- ^ mNewRole
+  -> Maybe Text        -- ^ mGuidance
+  -> [Text]            -- ^ additionalGrants
+  -> IO (Either Text SubAgentReport)
+resumeEphemeralSubAgentWithCallId engineState@AppEngineState{..} driver mParentCallId sId addBudget mNewRole mGuidance additionalGrants = do
+  prep <- atomically $ do
+    subs <- readTVar appSubAgents
+    case Map.lookup sId subs of
+      Nothing -> pure $ Left $ "SubAgent #" <> T.pack (show sId) <> " not found."
+      Just task
+        | subAgentStatus task == SubAgentRunning ->
+            pure $ Left $ "SubAgent #" <> T.pack (show sId) <> " is already running."
+        | otherwise -> do
+            curMode <- readTVar appMode
+            let currentRole = subAgentRole task
+                effectiveRole = case mNewRole of
+                  Just r | not (T.null (T.strip r)) -> T.strip r
+                  _ -> currentRole
+                isSpecialized = effectiveRole /= currentRole
+                prevAllow = Set.toList (sapAllow (subAgentPermissions task))
+                prevDeny  = Set.toList (sapDeny (subAgentPermissions task))
+                (specPrompt, defaultBud, effectiveDriver, subPerms) =
+                  resolveSpecialistSetup appConfig curMode driver effectiveRole prevAllow prevDeny additionalGrants
+                effectiveAddBudget = max 1 (if addBudget > 0 then addBudget else defaultBud)
+                newTotalBudget = max 1 (subAgentBudget task + effectiveAddBudget)
+                continuationLines =
+                  [ "## Task Resumed"
+                  , "Your turn budget has been extended by " <> T.pack (show effectiveAddBudget) <> " turns (total budget: " <> T.pack (show newTotalBudget) <> " turns)."
+                  ]
+                  ++ [ "## Role Specialization: " <> effectiveRole | isSpecialized ]
+                  ++ [ specPrompt | isSpecialized ]
+                  ++ [ "## Additional Guidance:\n" <> g | Just g <- [mGuidance], not (T.null (T.strip g)) ]
+                  ++ [ "Continue your investigation and execute `submit_report` when your task is complete." ]
+                continuationText = T.unlines continuationLines
+                oldTurns = subAgentTurns task
+                nextTurnId = if null oldTurns then 1 else maximum (map turnId oldTurns) + 1
+                continuationTurn = Turn nextTurnId UserRole [TextBlock continuationText]
+                updatedInitTurns = oldTurns ++ [continuationTurn]
+                asstCount = length (filter (\t -> turnRole t == AssistantRole) oldTurns)
+                startTurn = asstCount + 1
+                updatedTask = task
+                  { subAgentRole = effectiveRole
+                  , subAgentBudget = newTotalBudget
+                  , subAgentStatus = SubAgentRunning
+                  , subAgentTurns = updatedInitTurns
+                  , subAgentPermissions = subPerms
+                  , subAgentParentCallId = mParentCallId
+                  }
+            writeTVar appSubAgents (Map.insert sId updatedTask subs)
+            writeTQueue appEventQueue (EvSubAgentUpdate updatedTask)
+            pure $ Right (effectiveDriver, subPerms, updatedInitTurns, startTurn, newTotalBudget)
+  case prep of
+    Left err -> pure (Left err)
+    Right (effectiveDriver, subPerms, updatedInitTurns, startTurn, newTotalBudget) -> do
+      subTurnsVar <- newTVarIO updatedInitTurns
+      executeSubAgentSession engineState effectiveDriver sId subPerms subTurnsVar startTurn newTotalBudget
 
 -- | Tool to resume or specialize an existing subagent
 resumeSpecialistSubAgentTool :: AppEngineState -> ModelDriver -> ToolDefinition
@@ -629,24 +735,19 @@ resumeSpecialistSubAgentTool engineState driver =
     , toolCapability = ReadOnly
     , toolIsMcp = False
     , toolScope = RootOnly
-    , toolExecute = \_caller args -> do
+    , toolExecute = \_caller mCallId args -> do
         case parseEither parseResumeArgs args of
           Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
           Right (sId, mBudget, mGuidance, mRole, mGrants) -> do
-            let budget = maybe 0 id mBudget
-                grants = maybe [] id mGrants
-            res <- resumeEphemeralSubAgent engineState driver sId budget mRole mGuidance grants
+            let budget = fromMaybe 0 mBudget
+                grants = fromMaybe [] mGrants
+            res <- resumeEphemeralSubAgentWithCallId engineState driver mCallId sId budget mRole mGuidance grants
             case res of
               Left err -> pure $ ToolResult "" "" ("Failed to resume subagent #" <> T.pack (show sId) <> ": " <> err) Nothing
-              Right SubAgentReport{..} -> do
-                let artifactAttr = maybe "" (\a -> " artifact=\"" <> a <> "\"") reportArtifact
-                    effectiveRole = maybe "specialist" id mRole
-                    summary = T.unlines
-                      [ "<specialist_report role=\"" <> effectiveRole <> "\" status=\"" <> reportStatus <> "\"" <> artifactAttr <> ">"
-                      , "  <summary>" <> reportSummary <> "</summary>"
-                      , "  <details>" <> reportDetails <> "</details>"
-                      , "</specialist_report>"
-                      ]
+              Right rep@SubAgentReport{..} -> do
+                subsAfter <- readTVarIO (appSubAgents engineState)
+                let actualRole = maybe (fromMaybe "specialist" mRole) subAgentRole (Map.lookup sId subsAfter)
+                    summary = formatSpecialistReportXml Nothing actualRole rep
                 pure $ ToolResult "" summary "" (fmap T.unpack reportArtifact)
     }
   where

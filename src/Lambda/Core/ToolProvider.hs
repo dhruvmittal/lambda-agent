@@ -34,7 +34,7 @@ data ToolDefinition = ToolDefinition
   , toolParameters  :: !Aeson.Value
   , toolCapability  :: !ToolCapability
   , toolIsMcp       :: !Bool
-  , toolExecute     :: !(CallerContext -> Aeson.Value -> IO ToolResult)
+  , toolExecute     :: !(CallerContext -> Maybe Text -> Aeson.Value -> IO ToolResult)
   , toolScope       :: !ToolScope
   }
 

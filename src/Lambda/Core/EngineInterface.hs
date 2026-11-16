@@ -1,6 +1,7 @@
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Lambda.Core.EngineInterface
   ( EngineChannels(..)
@@ -12,11 +13,12 @@ module Lambda.Core.EngineInterface
   , runAgentTurnLoop
   ) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.Async (Async, async, cancel, mapConcurrently, race)
+import Control.Concurrent (forkIO, myThreadId, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.Async (Async, async, asyncThreadId, asyncWithUnmask, cancel, mapConcurrently, race)
 import Control.Concurrent.STM
-import Control.Exception (try, SomeException, finally)
+import Control.Exception (try, catch, SomeException, displayException, finally)
 import Control.Monad (forever, when, unless)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 
@@ -31,7 +33,7 @@ import Lambda.Engine.Dispatcher (executeToolDispatch)
 import Lambda.Engine.Security (SecurityState(..), initSecurityWithRoot)
 import Lambda.Engine.Session (exportSessionTrace, loadSession, forkSession, deriveTitle, Session(..))
 import Lambda.Engine.State
-import Lambda.Engine.SubAgent (spawnSpecialistSubAgentTool, resumeSpecialistSubAgentTool, resumeEphemeralSubAgent, accumulateStreamChunks)
+import Lambda.Engine.SubAgent (formatSpecialistReportXml, spawnSpecialistSubAgentTool, resumeSpecialistSubAgentTool, resumeEphemeralSubAgent, accumulateStreamChunks)
 import Lambda.Provider.Builtin (builtinToolsWithManager)
 import Lambda.Provider.Mcp (McpClient, startAndLoadMcpServers, stopMcpClient)
 import Lambda.Driver.OpenAI (openAiDynamicDriver)
@@ -105,7 +107,8 @@ startEngineRuntime cfg maybeSess mOverrideDriver = do
   telemetryHdl <- startTelemetryWatcher engineStateWithSec
 
   activeTaskVar <- newTVarIO Nothing
-  workerAsync <- async $ engineWorkerLoop engineStateWithSec driver channels activeTaskVar
+  resumedAsyncsVar <- newTVarIO Map.empty
+  workerAsync <- async $ runEngineWorker engineStateWithSec driver channels activeTaskVar resumedAsyncsVar
   promptAsync <- async $ forever $ do
     prompt <- atomically $ readTBQueue (uiPromptQueue (appSecurity engineStateWithSec))
     emitEngineEvent engineStateWithSec (EvPermissionRequired prompt)
@@ -131,35 +134,56 @@ stopEngineRuntime EngineRuntime{..} = do
 startEngineLoop :: AppEngineState -> ModelDriver -> EngineChannels -> IO ()
 startEngineLoop state driver channels = do
   activeTaskVar <- newTVarIO Nothing
-  _ <- forkIO $ engineWorkerLoop state driver channels activeTaskVar
+  resumedAsyncsVar <- newTVarIO Map.empty
+  _ <- forkIO $ runEngineWorker state driver channels activeTaskVar resumedAsyncsVar
   _ <- forkIO $ forever $ do
     prompt <- atomically $ readTBQueue (uiPromptQueue (appSecurity state))
     emitEngineEvent state (EvPermissionRequired prompt)
   pure ()
 
-engineWorkerLoop :: AppEngineState -> ModelDriver -> EngineChannels -> TVar (Maybe (Async ())) -> IO ()
-engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{..} activeTaskVar = do
+drainActiveWorkers :: AppEngineState -> TVar (Maybe (Async ())) -> TVar (Map.Map Int (Async ())) -> IO ()
+drainActiveWorkers AppEngineState{..} activeTaskVar resumedAsyncsVar = do
+  atomically $ writeTVar appInterrupted True
+  mTask <- atomically $ swapTVar activeTaskVar Nothing
+  resumed <- atomically $ swapTVar resumedAsyncsVar Map.empty
+  subAsyncs <- atomically $ swapTVar appSubAgentAsyncs Map.empty
+  mapM_ cancel (Map.elems subAsyncs)
+  mapM_ cancel mTask
+  mapM_ cancel (Map.elems resumed)
+  atomically $ writeTVar appInterrupted False
+
+runEngineWorker :: AppEngineState -> ModelDriver -> EngineChannels -> TVar (Maybe (Async ())) -> TVar (Map.Map Int (Async ())) -> IO ()
+runEngineWorker engineState driver channels activeTaskVar resumedAsyncsVar =
+  engineWorkerLoop engineState driver channels activeTaskVar resumedAsyncsVar `finally`
+    drainActiveWorkers engineState activeTaskVar resumedAsyncsVar
+
+engineWorkerLoop :: AppEngineState -> ModelDriver -> EngineChannels -> TVar (Maybe (Async ())) -> TVar (Map.Map Int (Async ())) -> IO ()
+engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{..} activeTaskVar resumedAsyncsVar = do
+  let loop = engineWorkerLoop engineState driver channels activeTaskVar resumedAsyncsVar
   cmd <- atomically $ readTBQueue cmdQueue
   case cmd of
-    CmdQuit -> do
-      mTask <- readTVarIO activeTaskVar
-      case mTask of
-        Just t  -> cancel t
-        Nothing -> pure ()
+    CmdQuit -> pure ()
     CmdInterrupt -> do
-      atomically $ do
+      (subAsyncs, mTask, resumed) <- atomically $ do
         writeTVar appInterrupted True
         subs <- readTVar appSubAgents
-        let updatedSubs = Map.map (\t -> if subAgentStatus t == SubAgentRunning then t { subAgentStatus = SubAgentBlocked "Cancelled by user" } else t) subs
+        let (changed, updatedSubs) = Map.mapAccumWithKey (\acc _k t ->
+              if subAgentStatus t == SubAgentRunning
+                then let t' = t { subAgentStatus = SubAgentBlocked "Cancelled by user" } in (t' : acc, t')
+                else (acc, t)) [] subs
         writeTVar appSubAgents updatedSubs
-      mTask <- readTVarIO activeTaskVar
-      case mTask of
-        Just t  -> cancel t
-        Nothing -> pure ()
-      engineWorkerLoop engineState driver channels activeTaskVar
+        mapM_ (writeTQueue appEventQueue . EvSubAgentUpdate) (reverse changed)
+        sAs <- readTVar appSubAgentAsyncs
+        mT <- readTVar activeTaskVar
+        rAs <- readTVar resumedAsyncsVar
+        pure (sAs, mT, rAs)
+      mapM_ cancel (Map.elems subAsyncs)
+      mapM_ cancel mTask
+      mapM_ cancel (Map.elems resumed)
+      loop
     CmdSetMode newMode -> do
       atomically $ writeTVar appMode newMode
-      engineWorkerLoop engineState driver channels activeTaskVar
+      loop
     CmdSetModel rawModel -> do
       let targetModel = resolveModelWithConfig appConfig rawModel
           targetLimit = lookupModelContextLimitWithConfig appConfig targetModel
@@ -177,17 +201,54 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       persistCurrentSession engineState
       emitEngineEvent engineState (EvModelSwitched targetModel targetLimit)
       _ <- addTurn engineState SystemRole [TextBlock ("Switched active model to " <> targetModel <> " (context limit: " <> T.pack (show targetLimit) <> " tokens)")]
-      engineWorkerLoop engineState driver channels activeTaskVar
+      loop
     CmdCancelSubAgent sId -> do
-      updateSubAgentStatus engineState sId (SubAgentBlocked "Cancelled by user")
-      engineWorkerLoop engineState driver channels activeTaskVar
+      (mSubAsync, mResumedAsync) <- atomically $ do
+        sAs <- readTVar appSubAgentAsyncs
+        rAs <- readTVar resumedAsyncsVar
+        subs <- readTVar appSubAgents
+        case Map.lookup sId subs of
+          Just t | subAgentStatus t == SubAgentRunning -> do
+            let t' = t { subAgentStatus = SubAgentBlocked "Cancelled by user" }
+            writeTVar appSubAgents (Map.insert sId t' subs)
+            writeTQueue appEventQueue (EvSubAgentUpdate t')
+          _ -> pure ()
+        pure (Map.lookup sId sAs, Map.lookup sId rAs)
+      mapM_ cancel mSubAsync
+      mapM_ cancel mResumedAsync
+      loop
     CmdResumeSubAgent sId extraBud mGuidance mRole -> do
-      _ <- async $ do
-        res <- resumeEphemeralSubAgent engineState driver sId extraBud mRole mGuidance []
-        case res of
-          Left err -> emitEngineEvent engineState (EvError err)
-          Right _  -> pure ()
-      engineWorkerLoop engineState driver channels activeTaskVar
+      gate <- newEmptyMVar
+      a <- asyncWithUnmask $ \unmask ->
+        (do
+          takeMVar gate
+          unmask $ do
+            res <- resumeEphemeralSubAgent engineState driver sId extraBud mRole mGuidance []
+            case res of
+              Left err -> emitEngineEvent engineState (EvError err)
+              Right r -> do
+                subs <- readTVarIO appSubAgents
+                let roleName = maybe (fromMaybe "specialist" mRole) subAgentRole (Map.lookup sId subs)
+                    reportXml = formatSpecialistReportXml (Just sId) roleName r
+                _ <- addTurn engineState SystemRole [TextBlock reportXml]
+                pure ()
+        ) `catch` (\(e :: SomeException) ->
+          emitEngineEvent engineState (EvError ("Subagent resume failed: " <> T.pack (displayException e))))
+          `finally` do
+            tid <- myThreadId
+            atomically (modifyTVar' resumedAsyncsVar (Map.update (\v -> if asyncThreadId v == tid then Nothing else Just v) sId))
+      alreadyRunning <- atomically $ do
+        m <- readTVar resumedAsyncsVar
+        if Map.member sId m
+          then pure True
+          else do
+            writeTVar resumedAsyncsVar (Map.insert sId a m)
+            pure False
+      putMVar gate ()
+      when alreadyRunning $ do
+        cancel a
+        emitEngineEvent engineState (EvError ("SubAgent #" <> T.pack (show sId) <> " is already resuming."))
+      loop
     CmdSetGoal newGoal -> do
       atomically $ do
         curVec <- readTVar appStateVector
@@ -203,7 +264,7 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
         writeTQueue appEventQueue (EvWorkingStateUpdate updatedVec)
       persistCurrentSession engineState
       _ <- addTurn engineState SystemRole [TextBlock ("Goal set to: " <> newGoal)]
-      engineWorkerLoop engineState driver channels activeTaskVar
+      loop
     CmdCompactHistory -> do
       -- Real context compaction trigger
       atomically $ do
@@ -212,20 +273,22 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
         writeTVar appTurns compacted
       persistCurrentSession engineState
       updateBlockedOn engineState "Context compaction completed"
-      engineWorkerLoop engineState driver channels activeTaskVar
+      loop
     CmdSystemMessage msg -> do
       _ <- addTurn engineState SystemRole [TextBlock msg]
-      engineWorkerLoop engineState driver channels activeTaskVar
+      loop
     CmdClearHistory -> do
+      drainActiveWorkers engineState activeTaskVar resumedAsyncsVar
       atomically $ do
         writeTVar appTurns []
         writeTVar appTurnCounter 1
       _ <- addTurn engineState SystemRole [TextBlock "Conversation history cleared."]
       persistCurrentSession engineState
-      engineWorkerLoop engineState driver channels activeTaskVar
+      loop
     CmdNewSession -> do
+      drainActiveWorkers engineState activeTaskVar resumedAsyncsVar
       _ <- resetEngineSession engineState
-      engineWorkerLoop engineState driver channels activeTaskVar
+      loop
     CmdRewindTurns n -> do
       mRewound <- atomically $ do
         ts <- readTVar appTurns
@@ -246,28 +309,30 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
         Just _ -> do
           persistCurrentSession engineState
           updateBlockedOn engineState ("Rewound " <> T.pack (show n) <> " turn(s)")
-      engineWorkerLoop engineState driver channels activeTaskVar
+      loop
     CmdForkSession mTitle -> do
+      drainActiveWorkers engineState activeTaskVar resumedAsyncsVar
       currSess <- snapshotSession engineState
       childSess <- forkSession appSessionDir currSess mTitle
       restoreEngineSession engineState childSess
       persistCurrentSession engineState
       emitEngineEvent engineState (EvSessionSwitched (sessionId childSess) (sessionMode childSess) (sessionTurns childSess) (sessionSubAgents childSess))
       updateBlockedOn engineState ("Forked into " <> sessionId childSess)
-      engineWorkerLoop engineState driver channels activeTaskVar
+      loop
     CmdSwitchSession sid -> do
       loadRes <- loadSession appSessionDir sid
       case loadRes of
         Left err ->
           emitEngineEvent engineState (EvError $ "Failed to switch session: " <> err)
-        Right sess ->
+        Right sess -> do
+          drainActiveWorkers engineState activeTaskVar resumedAsyncsVar
           restoreEngineSession engineState sess
-      engineWorkerLoop engineState driver channels activeTaskVar
+      loop
     CmdExportTrace -> do
       snap <- snapshotSession engineState
       path <- exportSessionTrace appSessionDir snap
       _ <- addTurn engineState SystemRole [TextBlock $ "Debug execution trace exported to: " <> T.pack path]
-      engineWorkerLoop engineState driver channels activeTaskVar
+      loop
     CmdUserPrompt promptText -> do
       -- If prior turn task is still active, cancel it before running new prompt
       mPrev <- readTVarIO activeTaskVar
@@ -335,7 +400,7 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
         emitEngineEvent engineState EvDone
 
       atomically $ writeTVar activeTaskVar (Just turnTask)
-      engineWorkerLoop engineState driver channels activeTaskVar
+      loop
   where
     cleanupTurn = atomically $ do
       writeTVar activeTaskVar Nothing

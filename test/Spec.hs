@@ -4,9 +4,9 @@ module Main where
 
 import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay, forkIO)
-import Control.Concurrent.Async (mapConcurrently, race, async, wait, poll, cancel)
+import Control.Concurrent.Async (mapConcurrently, race, async, wait, waitCatch, poll, cancel)
 import Control.Concurrent.STM
-import Control.Exception (catch, IOException)
+import Control.Exception (catch, finally, throwIO, IOException, ErrorCall(..))
 import Control.Monad (forM_, unless, void)
 import Data.Bits ((.|.))
 import System.Posix.Files (setFileMode, ownerReadMode, ownerWriteMode, ownerExecuteMode)
@@ -69,6 +69,7 @@ import Lambda.Engine.State
   , initEngineStateWithSession
   , addTurn
   , registerSubAgentTask
+  , updateSubAgentStatus
   , updateSubAgentTurns
   , resetEngineSession
   , restoreEngineSession
@@ -94,7 +95,7 @@ import Lambda.Engine.Telemetry
   , sanitizeHerdrMessage
   , formatOscTitle
   )
-import Lambda.Engine.SubAgent (submitReportTool, filterSubAgentRegistry, subAgentLoop, runEphemeralSubAgent, resumeEphemeralSubAgent, spawnSpecialistSubAgentTool, resumeSpecialistSubAgentTool, formatSpecialistCatalog, SubAgentSpec(..), SubAgentReport(..))
+import Lambda.Engine.SubAgent (submitReportTool, filterSubAgentRegistry, subAgentLoop, compactSubAgentTurns, runEphemeralSubAgent, resumeEphemeralSubAgent, spawnSpecialistSubAgentTool, resumeSpecialistSubAgentTool, formatSpecialistCatalog, SubAgentSpec(..), SubAgentReport(..))
 import qualified Data.Map.Strict as Map
 import Brick.BChan (newBChan, writeBChan)
 import Brick.AttrMap (attrName, attrMap)
@@ -230,6 +231,19 @@ main = do
   testEngineLoopCoreInvariants
   testPermissionAlgebraAndPipelineSpec
   testPermissionIntegrationSpec
+  testLiveSubagentStreamingAndParentIsolation
+  testPerSubagentCancellationAndInterruptSafety
+  testTuiResumeAfterInterruptAndBudget
+  testStructuredBlockedReportAndDenyGlobs
+  testParallelPromptStatusCounting
+  testAcpParallelSubagentToolCallIdRouting
+  testResumeEdgeCasesAndInterrupt
+  testOpenCodeWildcardAndBashDenyEndToEnd
+  testAcpSameRoleParallelAndResumeRouting
+  testOmittedReportAndExceptionClassification
+  testPromptStatusAsyncCancelAndCoalesced
+  testEngineLifecycleAndDuplicateResume
+  testSubAgentBoundedContextCompaction
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -342,8 +356,8 @@ testSecurityGlobMatching = do
 testModeFiltering :: IO ()
 testModeFiltering = do
   putStrLn "\n[Test 5] Dual-Gate Mode Safety (/plan vs /exec)"
-  let readTool = ToolDefinition "read_file" "Read file" (Aeson.object []) ReadOnly False (\_ _ -> pure (ToolResult "" "" "" Nothing)) Universal
-      destTool = ToolDefinition "write_file" "Write file" (Aeson.object []) Destructive False (\_ _ -> pure (ToolResult "" "" "" Nothing)) Universal
+  let readTool = ToolDefinition "read_file" "Read file" (Aeson.object []) ReadOnly False (\_ _ _ -> pure (ToolResult "" "" "" Nothing)) Universal
+      destTool = ToolDefinition "write_file" "Write file" (Aeson.object []) Destructive False (\_ _ _ -> pure (ToolResult "" "" "" Nothing)) Universal
       reg = registerTools [readTool, destTool] emptyRegistry
 
   let planSchemas = toolsToOpenAISchema PlanMode reg
@@ -409,14 +423,14 @@ testDirectoryTools :: IO ()
 testDirectoryTools = do
   putStrLn "\n[Test 7] Directory Tools & Fallback Handling"
   let listTool = listDirectoryTool "."
-  resList <- toolExecute listTool MainAgent (Aeson.object ["path" Aeson..= ("src" :: Text)])
+  resList <- toolExecute listTool MainAgent Nothing (Aeson.object ["path" Aeson..= ("src" :: Text)])
   assert "list_directory finds Lambda folder" ("Lambda" `T.isInfixOf` resultStdout resList)
 
   let readTool = readFileTool "."
-  resReadDir <- toolExecute readTool MainAgent (Aeson.object ["path" Aeson..= ("src" :: Text)])
+  resReadDir <- toolExecute readTool MainAgent Nothing (Aeson.object ["path" Aeson..= ("src" :: Text)])
   assert "read_file on directory lists contents gracefully" ("Specified path is a directory" `T.isInfixOf` resultStdout resReadDir)
 
-  resReadFileUri <- toolExecute readTool MainAgent (Aeson.object ["path" Aeson..= ("file://src" :: Text)])
+  resReadFileUri <- toolExecute readTool MainAgent Nothing (Aeson.object ["path" Aeson..= ("file://src" :: Text)])
   assert "read_file handles file:// URI prefix" ("Specified path is a directory" `T.isInfixOf` resultStdout resReadFileUri)
   putStrLn "  -> OK: Directory listing and directory fallback in read_file work correctly."
 
@@ -466,11 +480,11 @@ testFetchUrlTool = do
   assert "Tool capability is ReadOnly" (toolCapability tool == ReadOnly)
   assert "Tool description mentions HTML" ("HTML" `T.isInfixOf` toolDescription tool)
 
-  resFile <- toolExecute tool MainAgent (Aeson.object ["url" Aeson..= ("file:///workspace/README.md" :: Text)])
+  resFile <- toolExecute tool MainAgent Nothing (Aeson.object ["url" Aeson..= ("file:///workspace/README.md" :: Text)])
   assert "fetch_url rejects file:// with helpful steering message"
     ("read_file" `T.isInfixOf` resultStderr resFile)
 
-  resNonHttp <- toolExecute tool MainAgent (Aeson.object ["url" Aeson..= ("src/Main.hs" :: Text)])
+  resNonHttp <- toolExecute tool MainAgent Nothing (Aeson.object ["url" Aeson..= ("src/Main.hs" :: Text)])
   assert "fetch_url rejects non-http URLs with helpful steering message"
     ("read_file" `T.isInfixOf` resultStderr resNonHttp)
 
@@ -532,6 +546,7 @@ testSubAgentViewportInvariant = do
         , subAgentTurns = []
         , subAgentParentTurnId = Nothing
         , subAgentPermissions = emptySubAgentPermissions
+        , subAgentParentCallId = Nothing
         }
       sampleMap = Map.singleton 1 sampleTask
       widget = renderSubAgents sampleMap
@@ -550,11 +565,11 @@ testPlanModeSubAgentAndContextGuard = do
 
   let readTool = readFileTool "."
   -- MainAgent direct read of large file (> 250 lines) should be intercepted by Context Mass Guard
-  resMainLarge <- toolExecute readTool MainAgent (Aeson.object ["path" Aeson..= T.pack largeFilePath])
+  resMainLarge <- toolExecute readTool MainAgent Nothing (Aeson.object ["path" Aeson..= T.pack largeFilePath])
   assert "Context Mass Guard blocks main agent direct large read" ("Context Mass Guard" `T.isInfixOf` resultStderr resMainLarge)
 
   -- MainAgent targeted slice (<= 250 lines) should succeed
-  resMainSlice <- toolExecute readTool MainAgent (Aeson.object
+  resMainSlice <- toolExecute readTool MainAgent Nothing (Aeson.object
     [ "path" Aeson..= T.pack largeFilePath
     , "start_line" Aeson..= (1 :: Int)
     , "line_count" Aeson..= (50 :: Int)
@@ -563,7 +578,7 @@ testPlanModeSubAgentAndContextGuard = do
   assert "Main agent sliced read returned 50 lines" (length (T.lines (resultStdout resMainSlice)) == 50)
 
   -- Subagent direct read of large file should succeed without restriction (isolated context)
-  resSubLarge <- toolExecute readTool (SubAgentId 1 "Survey task") (Aeson.object ["path" Aeson..= T.pack largeFilePath])
+  resSubLarge <- toolExecute readTool (SubAgentId 1 "Survey task") Nothing (Aeson.object ["path" Aeson..= T.pack largeFilePath])
   assert "Subagent direct large read succeeds without guard" (resultStderr resSubLarge == "")
   assert "Subagent received all 300 lines" (length (T.lines (resultStdout resSubLarge)) == 300)
 
@@ -724,7 +739,7 @@ testSubmitReportToolEgress = do
         , "details" .= ("Cache miss rate: 42.8% on L1d" :: Text)
         , "artifact_path" .= (".lambda/artifacts/cache_profile.txt" :: Text)
         ]
-  res <- toolExecute def MainAgent reportArgs
+  res <- toolExecute def MainAgent Nothing reportArgs
   assert "toolExecute succeeds without error" (T.null (resultStderr res))
   assert "toolExecute returns artifact path" (resultArtifactPath res == Just ".lambda/artifacts/cache_profile.txt")
 
@@ -774,7 +789,7 @@ testDepth1StarGraphSchemaExclusion :: IO ()
 testDepth1StarGraphSchemaExclusion = do
   putStrLn "\n[Test 21] Depth-1 Star Graph Invariant"
   repVar <- newTVarIO Nothing
-  let dummyTool name = ToolDefinition name "desc" (Aeson.object []) ReadOnly False (\_ _ -> pure (ToolResult "" "" "" Nothing)) (if "spawn_" `T.isPrefixOf` name || "resume_" `T.isPrefixOf` name then RootOnly else Universal)
+  let dummyTool name = ToolDefinition name "desc" (Aeson.object []) ReadOnly False (\_ _ _ -> pure (ToolResult "" "" "" Nothing)) (if "spawn_" `T.isPrefixOf` name || "resume_" `T.isPrefixOf` name then RootOnly else Universal)
       baseReg = registerTools
         [ dummyTool "spawn_specialist_subagent"
         , dummyTool "spawn_diagnostic_subagent"
@@ -838,7 +853,7 @@ testDynamicPermissionEscalation = do
   sec <- initSecurity [] []
   cfg <- loadConfig "."
   let dummyBashTool = ToolDefinition "bash" "Run bash" (Aeson.object []) Destructive False
-        (\_ _ -> pure (ToolResult "call_1" "Command executed successfully" "" Nothing)) Universal
+        (\_ _ _ -> pure (ToolResult "call_1" "Command executed successfully" "" Nothing)) Universal
       reg = registerTool dummyBashTool emptyRegistry
   es <- initEngineState cfg reg sec
 
@@ -898,7 +913,7 @@ testSessionSerialization = do
         [ Turn 1 UserRole [TextBlock "Explore files"]
         , Turn 2 AssistantRole [TextBlock "Files explored successfully"]
         ]
-      subTask = SubAgentTask 1 "surveyor" "Verify workspace structure" 1 16 (SubAgentSuccess "Structure OK") Nothing subTurns Nothing emptySubAgentPermissions
+      subTask = SubAgentTask 1 "surveyor" "Verify workspace structure" 1 16 (SubAgentSuccess "Structure OK") Nothing subTurns Nothing emptySubAgentPermissions Nothing
       sess = Session
         { sessionId           = "session_test_24"
         , sessionCreatedAt     = now
@@ -936,7 +951,7 @@ testSessionResumptionAndRestoration = do
   sec <- initSecurity [] []
   cfg <- loadConfig "."
   now <- getCurrentTime
-  let subTask = SubAgentTask 2 "debugger" "Investigate crash" 3 14 (SubAgentSuccess "Found bug") Nothing [] Nothing emptySubAgentPermissions
+  let subTask = SubAgentTask 2 "debugger" "Investigate crash" 3 14 (SubAgentSuccess "Found bug") Nothing [] Nothing emptySubAgentPermissions Nothing
       sess = Session
         { sessionId           = "session_test_25"
         , sessionCreatedAt     = now
@@ -1064,7 +1079,7 @@ testOnDemandMarkdownTraceGeneration = do
             , ToolResultBlock (ToolResult "c1" "1000 instructions" "" Nothing)
             , TextBlock "Hotspot identified."
             ]
-        ] Nothing emptySubAgentPermissions
+        ] Nothing emptySubAgentPermissions Nothing
       sess = Session
         { sessionId           = "session_test_28"
         , sessionCreatedAt     = now
@@ -1431,8 +1446,8 @@ testContextualCompletersAndMruInvariant = do
 
   -- 4. /sub contextual completion from active subagent map
   let subMap = Map.fromList
-        [ (1, SubAgentTask 1 "reviewer" "Reviewing" 0 5 SubAgentRunning Nothing [] Nothing emptySubAgentPermissions)
-        , (3, SubAgentTask 3 "tester" "Testing" 0 5 SubAgentRunning Nothing [] Nothing emptySubAgentPermissions)
+        [ (1, SubAgentTask 1 "reviewer" "Reviewing" 0 5 SubAgentRunning Nothing [] Nothing emptySubAgentPermissions Nothing)
+        , (3, SubAgentTask 3 "tester" "Testing" 0 5 SubAgentRunning Nothing [] Nothing emptySubAgentPermissions Nothing)
         ]
   mSubComp <- completeInput "." (dummyUI subMap) "/sub "
   assert "/sub completion returns active subagent IDs plus main"
@@ -1697,7 +1712,7 @@ testStructuredDiffAndWhitespaceEditing = do
         , "replacement" .= ("function start() {\n    logger.info(\"ready\")\n    return true;\n}" :: Text)
         ]
 
-  res <- toolExecute editTool MainAgent args
+  res <- toolExecute editTool MainAgent Nothing args
   assert "Tool result indicates whitespace-tolerant success"
     ("Successfully edited file (whitespace-tolerant): service.py" `T.isInfixOf` resultStdout res)
   assert "Tool result stdout includes colorable diff block"
@@ -2293,11 +2308,11 @@ testBashConfigurableTimeoutAndProcessGroup = do
   putStrLn "\n[Test 50] Bash Configurable Timeout & Process Group"
   let tool = bashTool "." "/tmp"
   -- 1. Fast execution with explicit timeout
-  resFast <- toolExecute tool MainAgent (Aeson.object [ "command" .= ("echo 'fast execution'" :: Text), "timeout_seconds" .= (10 :: Int) ])
+  resFast <- toolExecute tool MainAgent Nothing (Aeson.object [ "command" .= ("echo 'fast execution'" :: Text), "timeout_seconds" .= (10 :: Int) ])
   assert "Fast command succeeds with custom timeout" ("fast execution" `T.isInfixOf` resultStdout resFast)
 
   -- 2. Bounded timeout aborts long-running command cleanly
-  resTimeout <- toolExecute tool MainAgent (Aeson.object [ "command" .= ("sleep 10" :: Text), "timeout_seconds" .= (5 :: Int) ])
+  resTimeout <- toolExecute tool MainAgent Nothing (Aeson.object [ "command" .= ("sleep 10" :: Text), "timeout_seconds" .= (5 :: Int) ])
   let errOut = resultStderr resTimeout
       stdOut = resultStdout resTimeout
   unless ("Command timed out after 5 seconds." `T.isInfixOf` errOut) $
@@ -2907,7 +2922,7 @@ testLazyMcpGatewayAndModeEnforcement = do
         , toolCapability  = ReadOnly
         , toolIsMcp       = True
         , toolScope       = Universal
-        , toolExecute     = \_ _ -> pure (ToolResult "call_read" "symbols: [foo, bar]" "" Nothing)
+        , toolExecute     = \_ _ _ -> pure (ToolResult "call_read" "symbols: [foo, bar]" "" Nothing)
         }
       mutateMcpTool = ToolDefinition
         { toolName        = "sd_mutate"
@@ -2916,7 +2931,7 @@ testLazyMcpGatewayAndModeEnforcement = do
         , toolCapability  = Destructive
         , toolIsMcp       = True
         , toolScope       = Universal
-        , toolExecute     = \_ _ -> pure (ToolResult "call_mut" "memory node updated" "" Nothing)
+        , toolExecute     = \_ _ _ -> pure (ToolResult "call_mut" "memory node updated" "" Nothing)
         }
       baseReg = registerTools [readMcpTool, mutateMcpTool, callMcpToolDefinition] emptyRegistry
   es <- initEngineState cfg baseReg sec
@@ -3174,10 +3189,10 @@ testSubAgentParentTurnAttribution = do
       turn3 = Turn 3 UserRole [TextBlock "Follow-up question"]
       turn4 = Turn 4 AssistantRole [TextBlock "Answering follow-up"]
 
-      sub1 = SubAgentTask 1 "Researcher" "Find facts" 0 5 SubAgentRunning Nothing [] (Just 2) emptySubAgentPermissions
-      sub2 = SubAgentTask 2 "Coder" "Write code" 0 5 (SubAgentSuccess "Done") Nothing [] (Just 2) emptySubAgentPermissions
-      sub3 = SubAgentTask 3 "Reviewer" "Review diff" 0 5 SubAgentRunning Nothing [] (Just 4) emptySubAgentPermissions
-      subUnanchored = SubAgentTask 4 "Worker" "Floating task" 0 5 SubAgentRunning Nothing [] Nothing emptySubAgentPermissions
+      sub1 = SubAgentTask 1 "Researcher" "Find facts" 0 5 SubAgentRunning Nothing [] (Just 2) emptySubAgentPermissions Nothing
+      sub2 = SubAgentTask 2 "Coder" "Write code" 0 5 (SubAgentSuccess "Done") Nothing [] (Just 2) emptySubAgentPermissions Nothing
+      sub3 = SubAgentTask 3 "Reviewer" "Review diff" 0 5 SubAgentRunning Nothing [] (Just 4) emptySubAgentPermissions Nothing
+      subUnanchored = SubAgentTask 4 "Worker" "Floating task" 0 5 SubAgentRunning Nothing [] Nothing emptySubAgentPermissions Nothing
 
       allSubs = [sub1, sub2, sub3, subUnanchored]
       turns = [turn1, turn2, turn3, turn4]
@@ -3228,7 +3243,7 @@ testSubprocessGroupTerminationEscalation = do
         ]
 
   startT <- getCurrentTime
-  res <- toolExecute bash MainAgent args
+  res <- toolExecute bash MainAgent Nothing args
   endT <- getCurrentTime
   let elapsed = diffUTCTime endT startT
 
@@ -3358,7 +3373,7 @@ testLongRunningUnboundedAndCancellation = do
         [ "command" .= ("echo 'unbounded task completed'" :: Text)
         , "timeout_seconds" .= (0 :: Int)
         ]
-  resUnbounded <- toolExecute bash MainAgent unboundedArgs
+  resUnbounded <- toolExecute bash MainAgent Nothing unboundedArgs
   assert "Unbounded task runs without timeout error" ("unbounded task completed" `T.isInfixOf` resultStdout resUnbounded)
   assert "Small task does not produce artifact" (resultArtifactPath resUnbounded == Nothing)
 
@@ -3368,7 +3383,7 @@ testLongRunningUnboundedAndCancellation = do
         [ "command" .= (largeCmd :: Text)
         , "timeout_seconds" .= (10 :: Int)
         ]
-  resLarge <- toolExecute bash MainAgent largeArgs
+  resLarge <- toolExecute bash MainAgent Nothing largeArgs
   assert "Large task generates artifact file on disk" (resultArtifactPath resLarge /= Nothing)
   assert "Large task generates artifact_pointer" ("<artifact_pointer" `T.isInfixOf` resultStdout resLarge)
   case resultArtifactPath resLarge of
@@ -4195,6 +4210,7 @@ testUiDrawThemeAndAcpHelpers = do
         , subAgentTurns = [Turn 10 AssistantRole [TextBlock "Scanning files..."]]
         , subAgentParentTurnId = Just 1
         , subAgentPermissions = emptySubAgentPermissions
+        , subAgentParentCallId = Nothing
         }
       samplePrompt = PermissionPrompt
         { promptId = 42
@@ -4424,7 +4440,7 @@ testSecurityAndSubAgentInvariants = do
   removeDirectoryRecursive tmpWs
 
   reportVar <- newTVarIO Nothing
-  let mkDummyTool nm cap sc = ToolDefinition nm ("desc " <> nm) (Aeson.object []) cap False (\_ _ -> pure (ToolResult "" "" "" Nothing)) sc
+  let mkDummyTool nm cap sc = ToolDefinition nm ("desc " <> nm) (Aeson.object []) cap False (\_ _ _ -> pure (ToolResult "" "" "" Nothing)) sc
       reportDef = submitReportTool reportVar
       sampleReg = registerTools
         [ mkDummyTool "read_file" ReadOnly Universal
@@ -4524,7 +4540,7 @@ testDeterministicMcpStdioMock = do
 
   case mReadTool of
     (rt:_) -> do
-      res <- toolExecute rt MainAgent (Aeson.object ["key" .= ("k1" :: Text)])
+      res <- toolExecute rt MainAgent Nothing (Aeson.object ["key" .= ("k1" :: Text)])
       assert "MCP tools/call returned mock-ok" ("mock-ok" `T.isInfixOf` resultStdout res)
     [] -> failTest "read_mock_item missing"
 
@@ -4548,12 +4564,12 @@ testEngineLoopCoreInvariants = do
         }
   sec <- initSecurityWithRoot tmpRoot [] []
   sess <- newSession
-  let dummyTool = ToolDefinition "dummy_ro" "Dummy read" (Aeson.object []) ReadOnly False (\_ _ -> pure (ToolResult "" "ok" "" Nothing)) Universal
+  let dummyTool = ToolDefinition "dummy_ro" "Dummy read" (Aeson.object []) ReadOnly False (\_ _ _ -> pure (ToolResult "" "ok" "" Nothing)) Universal
       reg = registerTool dummyTool emptyRegistry
 
   esRewind <- initEngineStateWithSession baseCfg reg sec (Just sess { sessionTurns = [Turn 1 UserRole [TextBlock "u1"], Turn 2 AssistantRole [TextBlock "a1"]] })
   let esRewind' = esRewind { appSessionDir = tmpSess }
-      runningTask = SubAgentTask 1 "surveyor" "hyp" 1 5 SubAgentRunning Nothing [] (Just 1) emptySubAgentPermissions
+      runningTask = SubAgentTask 1 "surveyor" "hyp" 1 5 SubAgentRunning Nothing [] (Just 1) emptySubAgentPermissions Nothing
   atomically $ writeTVar (appSubAgents esRewind') (Map.singleton 1 runningTask)
   chansRewind <- initEngineChannels (appEventQueue esRewind')
   let noopDriver = simpleModelDriver (\_ _ cb -> cb ChunkDone)
@@ -4825,7 +4841,7 @@ testPermissionIntegrationSpec = do
   cfgSub <- loadConfig tmpWs
   secSub <- initSecurityWithRoot tmpWs [] []
   let dummyBash84 = ToolDefinition "bash" "Run bash" (Aeson.object []) Destructive False
-        (\_ _ -> pure (ToolResult "" "ok" "" Nothing)) Universal
+        (\_ _ _ -> pure (ToolResult "" "ok" "" Nothing)) Universal
       regSub = registerTool dummyBash84 emptyRegistry
   esSub <- initEngineState cfgSub regSub secSub
   atomically $ writeTVar (appMode esSub) ExecMode
@@ -4958,3 +4974,1023 @@ failTest :: String -> IO ()
 failTest msg = do
   putStrLn $ "  [FAIL] " <> msg
   exitFailure
+
+
+-- 85. Live Subagent Streaming (subAgentTurns) & Parent Stream Isolation
+testLiveSubagentStreamingAndParentIsolation :: IO ()
+testLiveSubagentStreamingAndParentIsolation = do
+  putStrLn "\n[Test 85] Live Subagent Streaming (subAgentTurns) & Parent Stream Isolation"
+  let tmpWs = "/tmp/lambda_spec_85"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+
+  sec <- initSecurityWithRoot tmpWs [] []
+  let cfg = defaultConfig { apiBaseUrl = "", mcpServers = Map.empty, workspaceRoot = tmpWs }
+  repVar <- newTVarIO Nothing
+  let reg = registerTools [readFileTool tmpWs, submitReportTool repVar] emptyRegistry
+  es <- initEngineState cfg reg sec
+  _ <- drainQueue (appEventQueue es)
+
+  task <- registerSubAgentTask es "researcher" "Inspect streaming" 3
+  let sId = subAgentId task
+  turnsVar <- newTVarIO [Turn 1 UserRole [TextBlock "Start"]]
+  attemptedVar <- newTVarIO []
+
+  midStreamTurnOkVar <- newTVarIO False
+  midStreamEvsVar <- newTVarIO ([] :: [EngineEvent])
+  driverTurnVar <- newTVarIO (0 :: Int)
+
+  let driver = simpleModelDriver $ \_ _ cb -> do
+        t <- atomically $ do
+          c <- readTVar driverTurnVar
+          writeTVar driverTurnVar (c + 1)
+          pure c
+        if t == 0
+          then do
+            cb (ChunkThinking "Thinking mid-stream...")
+            cb (ChunkText "Partial answer...")
+            cb (ChunkToolCallStart "call_s_85" "read_file")
+            cb (ChunkToolCallArgs "call_s_85" "{\"path\":\"README.md\"}")
+            -- Inspect subAgentTurns and appEventQueue BEFORE ChunkDone
+            subs <- readTVarIO (appSubAgents es)
+            let hasInFlightAssistant = case Map.lookup sId subs of
+                  Nothing -> False
+                  Just st -> any (\tr -> turnRole tr == AssistantRole
+                                      && any (\b -> case b of
+                                               TextBlock txt -> "Partial answer" `T.isInfixOf` txt
+                                               ThinkingBlock _ txt _ -> "Thinking mid-stream" `T.isInfixOf` txt
+                                               _ -> False) (turnBlocks tr))
+                                 (subAgentTurns st)
+            atomically $ writeTVar midStreamTurnOkVar hasInFlightAssistant
+            evs <- drainQueue (appEventQueue es)
+            atomically $ writeTVar midStreamEvsVar evs
+            cb ChunkDone
+          else do
+            cb (ChunkToolCallStart "call_rep_85" "submit_report")
+            cb (ChunkToolCallArgs "call_rep_85" "{\"status\":\"SUCCESS\",\"summary\":\"Streamed OK\",\"details\":\"Done\"}")
+            cb ChunkDone
+
+  res <- subAgentLoop es driver sId (SubAgentPermissions (Set.fromList ["read_file*", "submit_report*"]) Set.empty) turnsVar attemptedVar repVar 1 3
+  case res of
+    Left err -> failTest ("Unexpected subAgentLoop failure: " <> T.unpack err)
+    Right rep -> assert "Report status is SUCCESS" (reportStatus rep == "SUCCESS")
+
+  midTurnOk <- readTVarIO midStreamTurnOkVar
+  midEvs <- readTVarIO midStreamEvsVar
+  postEvs <- drainQueue (appEventQueue es)
+  let allEvs = midEvs <> postEvs
+
+  assert "In-flight AssistantRole turn is written to subAgentTurns before ChunkDone" midTurnOk
+  assert "EvSubAgentUpdate is emitted during streaming before ChunkDone"
+    (any (\ev -> case ev of EvSubAgentUpdate st -> subAgentId st == sId; _ -> False) midEvs)
+  assert "Subagent streaming does NOT emit EvStreamChunk to parent appEventQueue"
+    (not (any (\ev -> case ev of EvStreamChunk _ -> True; _ -> False) allEvs))
+
+  removeDirectoryRecursive tmpWs
+  putStrLn "  -> OK: Live subagent streaming updates subAgentTurns and isolates parent EvStreamChunk."
+
+-- 86. Per-Subagent Cancellation & Async Interrupt Safety
+testPerSubagentCancellationAndInterruptSafety :: IO ()
+testPerSubagentCancellationAndInterruptSafety = do
+  putStrLn "\n[Test 86] Per-Subagent Cancellation (CmdCancelSubAgent) & CmdInterrupt Async Safety"
+  let tmpWs = "/tmp/lambda_spec_86"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+
+  -- Part A: CmdCancelSubAgent cancels only the targeted subagent without cancelling sibling
+  let cfg = defaultConfig { apiBaseUrl = "", mcpServers = Map.empty, workspaceRoot = tmpWs }
+  sess1 <- newSession
+
+  startedCountVar <- newTVarIO (0 :: Int)
+  let slowSiblingDriver = simpleModelDriver $ \_ _ cb -> do
+        atomically $ modifyTVar' startedCountVar (+ 1)
+        threadDelay 5000000
+        cb (ChunkText "Late finish")
+        cb ChunkDone
+
+  rt1 <- startEngineRuntime cfg (Just sess1) (Just slowSiblingDriver)
+  let es1 = erEngineState rt1
+      chans1 = erChannels rt1
+  aSub1 <- async $ runEphemeralSubAgent es1 slowSiblingDriver (SubAgentSpec "researcher" "Task 1" 2 [])
+  aSub2 <- async $ runEphemeralSubAgent es1 slowSiblingDriver (SubAgentSpec "coder" "Task 2" 2 [])
+
+  mReady <- timeout 2000000 $ atomically $ do
+    cnt <- readTVar startedCountVar
+    subs <- readTVar (appSubAgents es1)
+    check (cnt == 2 && Map.size subs == 2)
+    pure (Map.elems subs)
+  (sId1, sId2) <- case mReady of
+    Just ts | [t1] <- filter ((== "researcher") . subAgentRole) ts
+            , [t2] <- filter ((== "coder") . subAgentRole) ts
+      -> pure (subAgentId t1, subAgentId t2)
+    _ -> failTest "Timed out waiting for both sibling subagents to start" >> exitFailure
+
+  atomically $ writeTBQueue (cmdQueue chans1) (CmdCancelSubAgent sId1)
+  mDone1 <- timeout 2000000 (wait aSub1)
+  assert "Targeted subagent stopped promptly on CmdCancelSubAgent" (isJust mDone1)
+
+  subsAfterCancel <- readTVarIO (appSubAgents es1)
+  assert "Cancelled subagent has SubAgentBlocked \"Cancelled by user\""
+    (fmap subAgentStatus (Map.lookup sId1 subsAfterCancel) == Just (SubAgentBlocked "Cancelled by user"))
+  assert "Sibling running subagent remains SubAgentRunning"
+    (fmap subAgentStatus (Map.lookup sId2 subsAfterCancel) == Just SubAgentRunning)
+
+  cancel aSub2
+  _ <- timeout 2000000 (waitCatch aSub2)
+  cancelsLeft1 <- readTVarIO (appSubAgentAsyncs es1)
+  assert "appSubAgentAsyncs is empty after cancellation cleanup" (Map.null cancelsLeft1)
+  stopEngineRuntime rt1
+
+  -- Part B: CmdInterrupt cancels active task & preserves SubAgentBlocked "Cancelled by user" on AsyncCancelled
+  sess2 <- newSession
+  es2Var <- newEmptyTMVarIO
+  subStartedVar <- newTVarIO False
+  unwoundVar <- newEmptyTMVarIO
+  let blockingSubDriver = simpleModelDriver $ \_ _ cb -> do
+        atomically $ writeTVar subStartedVar True
+        threadDelay 5000000
+        cb ChunkDone
+      parentSpawningDriver = simpleModelDriver $ \_ _ cb -> do
+        es2' <- atomically $ readTMVar es2Var
+        void (runEphemeralSubAgent es2' blockingSubDriver (SubAgentSpec "researcher" "Nested task" 2 []))
+          `finally` atomically (void $ tryPutTMVar unwoundVar ())
+        cb ChunkDone
+
+  rt2 <- startEngineRuntime cfg (Just sess2) (Just parentSpawningDriver)
+  let es2 = erEngineState rt2
+      chans2 = erChannels rt2
+  atomically $ putTMVar es2Var es2
+  atomically $ writeTBQueue (cmdQueue chans2) (CmdUserPrompt "Run nested subagent")
+
+  mSubStarted <- timeout 2000000 $ atomically $ do
+    s <- readTVar subStartedVar
+    subs <- readTVar (appSubAgents es2)
+    check (s && not (Map.null subs))
+  assert "Nested subagent started inside active task" (isJust mSubStarted)
+
+  atomically $ writeTBQueue (cmdQueue chans2) CmdInterrupt
+  mTaskCleared <- timeout 2000000 $ atomically $ do
+    t <- readTVar (appActiveTask es2)
+    _ <- readTMVar unwoundVar
+    check (not t)
+  assert "CmdInterrupt cancelled active task and unwound nested subagent" (isJust mTaskCleared)
+
+  subsAfterInt <- readTVarIO (appSubAgents es2)
+  assert "CmdInterrupt preserves SubAgentBlocked \"Cancelled by user\" after AsyncCancelled unwind"
+    (all (\st -> subAgentStatus st == SubAgentBlocked "Cancelled by user") (Map.elems subsAfterInt))
+  cancelsLeft2 <- readTVarIO (appSubAgentAsyncs es2)
+  assert "appSubAgentAsyncs is empty after CmdInterrupt unwind" (Map.null cancelsLeft2)
+
+  stopEngineRuntime rt2
+  removeDirectoryRecursive tmpWs
+  putStrLn "  -> OK: Per-subagent cancellation and CmdInterrupt async unwind safety verified."
+
+-- 87. TUI /resume (CmdResumeSubAgent) after CmdInterrupt and Budget Exhaustion
+testTuiResumeAfterInterruptAndBudget :: IO ()
+testTuiResumeAfterInterruptAndBudget = do
+  putStrLn "\n[Test 87] TUI /resume (CmdResumeSubAgent) after CmdInterrupt & Budget Exhaustion"
+  let tmpWs = "/tmp/lambda_spec_87"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+
+  let cfg = defaultConfig { apiBaseUrl = "", mcpServers = Map.empty, workspaceRoot = tmpWs }
+  sess <- newSession
+
+  turnStepVar <- newTVarIO (0 :: Int)
+  let resumeDriver = simpleModelDriver $ \_ _ cb -> do
+        step <- atomically $ do
+          s <- readTVar turnStepVar
+          writeTVar turnStepVar (s + 1)
+          pure s
+        if step == 0
+          then do
+            -- Emit a tool call so budget=1 is exhausted without natural text-only completion
+            cb (ChunkToolCallStart "call_rf_87" "read_file")
+            cb (ChunkToolCallArgs "call_rf_87" "{\"path\":\"README.md\"}")
+            cb ChunkDone
+          else do
+            cb (ChunkToolCallStart "call_rep_87" "submit_report")
+            cb (ChunkToolCallArgs "call_rep_87" "{\"status\":\"SUCCESS\",\"summary\":\"Resumed and completed\",\"details\":\"Verified fix\"}")
+            cb ChunkDone
+
+  rt <- startEngineRuntime cfg (Just sess) (Just resumeDriver)
+  let es = erEngineState rt
+      chans = erChannels rt
+
+  _ <- runEphemeralSubAgent es resumeDriver (SubAgentSpec "surveyor" "Find bug" 1 [])
+  subsInitial <- readTVarIO (appSubAgents es)
+  let [taskInit] = Map.elems subsInitial
+      sId = subAgentId taskInit
+  assert "Budget exhaustion without submit_report yields SubAgentSuccess \"INCONCLUSIVE\""
+    (subAgentStatus taskInit == SubAgentSuccess "INCONCLUSIVE")
+
+  -- Simulate stale appInterrupted == True from a prior CmdInterrupt while no activeTaskVar is running
+  atomically $ writeTVar (appInterrupted es) True
+
+  atomically $ writeTBQueue (cmdQueue chans) (CmdResumeSubAgent sId 2 (Just "Finish up") (Just "debugger"))
+
+  mDone <- timeout 2000000 $ atomically $ do
+    subs <- readTVar (appSubAgents es)
+    turns <- readTVar (appTurns es)
+    let hasReportTurn = any (\tr -> turnRole tr == SystemRole
+                                && any (\b -> case b of
+                                         TextBlock txt -> "<specialist_report" `T.isInfixOf` txt
+                                         _ -> False) (turnBlocks tr)) turns
+    check (fmap subAgentStatus (Map.lookup sId subs) == Just (SubAgentSuccess "SUCCESS") && hasReportTurn)
+    pure (subs, turns)
+
+  case mDone of
+    Nothing -> failTest "CmdResumeSubAgent did not complete and append specialist_report turn within 2s"
+    Just (subsAfter, turnsAfter) -> do
+      let Just taskAfter = Map.lookup sId subsAfter
+      assert "Resumed subagent updated role to debugger" (subAgentRole taskAfter == "debugger")
+      let expectedPrefix = "<specialist_report id=\"" <> T.pack (show sId) <> "\" role=\"debugger\""
+          reportTurns = [ txt
+                        | Turn _ SystemRole blocks <- turnsAfter
+                        , TextBlock txt <- blocks
+                        , "<specialist_report" `T.isInfixOf` txt
+                        ]
+      assert "SystemRole turn contains <specialist_report> with actual subAgentRole and summary"
+        (any (\txt -> expectedPrefix `T.isInfixOf` txt
+                   && "Resumed and completed" `T.isInfixOf` txt
+                   && "</specialist_report>" `T.isInfixOf` txt) reportTurns)
+
+  stopEngineRuntime rt
+  removeDirectoryRecursive tmpWs
+  putStrLn "  -> OK: CmdResumeSubAgent resumes across stale appInterrupted and budget exhaustion."
+
+-- 88. Structured BLOCKED Report & OpenCode tools:false / specialistDenyGlobs (sapDeny)
+testStructuredBlockedReportAndDenyGlobs :: IO ()
+testStructuredBlockedReportAndDenyGlobs = do
+  putStrLn "\n[Test 88] Structured BLOCKED Report & specialistDenyGlobs (sapDeny) Enforcement"
+  let tmpWs = "/tmp/lambda_spec_88"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+
+  -- Part A: Structured reportStatus == "BLOCKED" and reportArtifact
+  secA <- initSecurityWithRoot tmpWs [] []
+  let cfgA = defaultConfig { apiBaseUrl = "", mcpServers = Map.empty, workspaceRoot = tmpWs }
+  esA <- initEngineState cfgA emptyRegistry secA
+
+  let blockedDriver = simpleModelDriver $ \_ _ cb -> do
+        cb (ChunkToolCallStart "call_blk_88" "submit_report")
+        cb (ChunkToolCallArgs "call_blk_88" "{\"status\":\"BLOCKED\",\"summary\":\"Missing API key\",\"details\":\"Need token\",\"artifact_path\":\"path/to/artifact.md\"}")
+        cb ChunkDone
+
+  resBlk <- runEphemeralSubAgent esA blockedDriver (SubAgentSpec "researcher" "Check API" 2 ["submit_report*"])
+  case resBlk of
+    Left err -> failTest ("Unexpected BLOCKED subagent error: " <> T.unpack err)
+    Right rep -> do
+      assert "reportStatus is BLOCKED" (reportStatus rep == "BLOCKED")
+      assert "reportArtifact is path/to/artifact.md" (reportArtifact rep == Just "path/to/artifact.md")
+
+  subsA <- readTVarIO (appSubAgents esA)
+  let [taskA] = Map.elems subsA
+  assert "subAgentStatus is SubAgentBlocked <summary>" (subAgentStatus taskA == SubAgentBlocked "Missing API key")
+  assert "subAgentArtifact is Just \"path/to/artifact.md\"" (subAgentArtifact taskA == Just "path/to/artifact.md")
+
+  -- Part B: OpenCode tools: write: false -> specialistDenyGlobs -> schema exclusion & dispatch denial
+  let mdDeniedWrite = T.unlines
+        [ "---"
+        , "description: Read-only reviewer"
+        , "tools:"
+        , "  write: false"
+        , "---"
+        , "Review code only."
+        ]
+  scBase <- case parseMarkdownAgent mdDeniedWrite of
+    Nothing -> failTest "Expected parseMarkdownAgent to parse tools: write: false" >> exitFailure
+    Just sc -> do
+      assert "specialistDenyGlobs populated with write_file* or write*"
+        (any (\g -> g == "write_file*" || g == "write*") (specialistDenyGlobs sc))
+      pure sc
+
+  let cfgB = cfgA { specialists = Map.insert "ro-reviewer" scBase (specialists cfgA) }
+      dummyWrite = ToolDefinition "write_file" "Write file" (Aeson.object []) Destructive False
+        (\_ _ _ -> pure (ToolResult "" "wrote" "" Nothing)) Universal
+      regB = registerTools [readFileTool tmpWs, dummyWrite] emptyRegistry
+  secB <- initSecurityWithRoot tmpWs [] []
+  esB <- initEngineState cfgB regB secB
+  atomically $ writeTVar (appMode esB) ExecMode
+
+  capturedSchemasVar <- newTVarIO ([] :: [Aeson.Value])
+  turnBVar <- newTVarIO (0 :: Int)
+  let denyTestDriver = simpleModelDriver $ \_ schemas cb -> do
+        t <- atomically $ do
+          c <- readTVar turnBVar
+          writeTVar turnBVar (c + 1)
+          pure c
+        if t == 0
+          then do
+            atomically $ writeTVar capturedSchemasVar schemas
+            cb (ChunkToolCallStart "call_w_deny_88" "write_file")
+            cb (ChunkToolCallArgs "call_w_deny_88" "{\"path\":\"blocked.txt\",\"content\":\"nope\"}")
+            cb ChunkDone
+          else do
+            cb (ChunkToolCallStart "call_rep_b_88" "submit_report")
+            cb (ChunkToolCallArgs "call_rep_b_88" "{\"status\":\"SUCCESS\",\"summary\":\"Done\",\"details\":\"Write was denied\"}")
+            cb ChunkDone
+
+  resB <- runEphemeralSubAgent esB denyTestDriver (SubAgentSpec "ro-reviewer" "Review" 3 [])
+  case resB of
+    Left err -> failTest ("Unexpected Part B subagent error: " <> T.unpack err)
+    Right rep -> assert "Part B completed" (reportStatus rep == "SUCCESS")
+
+  schemasSeen <- readTVarIO capturedSchemasVar
+  assert "write_file is excluded from [ToolSchema] passed to streamCompletion"
+    (not ("write_file" `T.isInfixOf` T.pack (show schemasSeen)))
+
+  subsB <- readTVarIO (appSubAgents esB)
+  let [taskB] = Map.elems subsB
+      deniedResults =
+        [ tr
+        | Turn _ ToolRole blocks <- subAgentTurns taskB
+        , ToolResultBlock tr <- blocks
+        , resultCallIdRef tr == "call_w_deny_88"
+        ]
+  assert "write_file dispatch is blocked (not found in filtered registry or Blocked/Denied)"
+    (any (\tr -> "Tool not found in registry" `T.isInfixOf` resultStderr tr
+              || "Blocked" `T.isInfixOf` resultStderr tr
+              || "Denied" `T.isInfixOf` resultStderr tr) deniedResults)
+  directDenyRes <- executeToolDispatchWithPerms esB (SubAgentId 99 "ro-reviewer")
+    (SubAgentPermissions (Set.singleton "write_file*") (Set.singleton "write_file*"))
+    (ToolCall "call_direct_deny_88" "write_file" (Aeson.object ["path" .= ("blocked.txt" :: Text), "content" .= ("nope" :: Text)]))
+  assert "Direct dispatch with sapDeny denies write_file with Blocked/Denied in resultStderr"
+    ("Blocked" `T.isInfixOf` resultStderr directDenyRes || "Denied" `T.isInfixOf` resultStderr directDenyRes)
+
+  removeDirectoryRecursive tmpWs
+  putStrLn "  -> OK: Structured BLOCKED report, artifact, and specialistDenyGlobs enforcement verified."
+
+-- 89. Parallel Prompt Status Counting (onPromptStatus)
+testParallelPromptStatusCounting :: IO ()
+testParallelPromptStatusCounting = do
+  putStrLn "\n[Test 89] Parallel Prompt Status Counting (onPromptStatus)"
+  let tmpWs = "/tmp/lambda_spec_89"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+
+  sec <- initSecurityWithRoot tmpWs [] []
+  let cfg = defaultConfig { apiBaseUrl = "", mcpServers = Map.empty, workspaceRoot = tmpWs }
+  sess <- newSession
+  es <- initEngineStateWithSession cfg emptyRegistry sec (Just sess)
+
+  task <- registerSubAgentTask es "worker" "Run parallel tools" 5
+  let sId = subAgentId task
+      caller = SubAgentId sId "worker"
+
+  a1 <- async $ checkAuthorization (appSecurity es) caller "cargo build" (Aeson.object []) (Just "call_build")
+  a2 <- async $ checkAuthorization (appSecurity es) caller "cargo test" (Aeson.object []) (Just "call_test")
+
+  p1 <- atomically $ readTBQueue (uiPromptQueue (appSecurity es))
+  p2 <- atomically $ readTBQueue (uiPromptQueue (appSecurity es))
+  let (pBuild, pTest) = if promptToolCallId p1 == Just "call_build" then (p1, p2) else (p2, p1)
+
+  subsBoth <- readTVarIO (appSubAgents es)
+  assert "Two active prompts mark subagent SubAgentBlocked \"Awaiting user decision\""
+    (fmap subAgentStatus (Map.lookup sId subsBoth) == Just (SubAgentBlocked "Awaiting user decision"))
+
+  resolvePrompt pBuild (PermissionResponse Allow Once)
+  void (wait a1)
+  subsOne <- readTVarIO (appSubAgents es)
+  assert "Resolving first prompt keeps subagent SubAgentBlocked \"Awaiting user decision\""
+    (fmap subAgentStatus (Map.lookup sId subsOne) == Just (SubAgentBlocked "Awaiting user decision"))
+
+  resolvePrompt pTest (PermissionResponse Allow Once)
+  void (wait a2)
+  subsNone <- readTVarIO (appSubAgents es)
+  assert "Resolving second prompt transitions subagent back to SubAgentRunning"
+    (fmap subAgentStatus (Map.lookup sId subsNone) == Just SubAgentRunning)
+
+  removeDirectoryRecursive tmpWs
+  putStrLn "  -> OK: Parallel prompt reference counting for SubAgentId status verified."
+
+-- 90. ACP Parallel Subagent toolCallId Routing
+testAcpParallelSubagentToolCallIdRouting :: IO ()
+testAcpParallelSubagentToolCallIdRouting = do
+  putStrLn "\n[Test 90] ACP Parallel Subagent toolCallId Routing"
+  let tmpWs = "/tmp/lambda_spec_90"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+
+  let cfg = defaultConfig { apiBaseUrl = "", mcpServers = Map.empty, workspaceRoot = tmpWs }
+  acpOutQ <- newTQueueIO
+  acpState <- initAcpServerStateWithSink cfg (\bytes -> atomically $ writeTQueue acpOutQ bytes)
+  _ <- startAcpSession acpState (Just tmpWs)
+
+  mAcpEs <- readTVarIO (acpActiveEngine acpState)
+  acpEs <- case mAcpEs of
+    Nothing -> failTest "Expected acpActiveEngine to be initialized" >> exitFailure
+    Just es -> pure es
+
+  _ <- drainQueue acpOutQ
+
+  let awaitAcpMsgs :: Int -> IO [Text]
+      awaitAcpMsgs n = do
+        mRes <- timeout 2000000 $ mapM (\_ -> TE.decodeUtf8 . BL.toStrict <$> atomically (readTQueue acpOutQ)) [1..n]
+        case mRes of
+          Just xs -> pure xs
+          Nothing -> failTest ("Timed out waiting for " <> show n <> " ACP messages") >> exitFailure
+
+  let spawnTurn = Turn 1 AssistantRole
+        [ ToolCallBlock (ToolCall "call_sub_1" "spawn_specialist_subagent"
+            (Aeson.object ["role" .= ("researcher" :: Text), "task" .= ("Task A" :: Text)]))
+        , ToolCallBlock (ToolCall "call_sub_2" "spawn_specialist_subagent"
+            (Aeson.object ["role" .= ("coder" :: Text), "task" .= ("Task B" :: Text)]))
+        ]
+  atomically $ writeTQueue (appEventQueue acpEs) (EvTurnUpdated spawnTurn)
+  _ <- awaitAcpMsgs 2
+
+  let subTask1 = SubAgentTask 1 "researcher" "Task A" 1 5 SubAgentRunning Nothing
+        [Turn 1 AssistantRole [TextBlock "Researching A"]] (Just 1) emptySubAgentPermissions (Just "call_sub_1")
+  atomically $ writeTQueue (appEventQueue acpEs) (EvSubAgentUpdate subTask1)
+  msgs1 <- T.concat <$> awaitAcpMsgs 1
+  assert "EvSubAgentUpdate for researcher/Task A routes to toolCallId call_sub_1"
+    ("tool_call_update" `T.isInfixOf` msgs1 && "\"toolCallId\":\"call_sub_1\"" `T.isInfixOf` msgs1)
+
+  let subTask2 = SubAgentTask 2 "coder" "Task B" 1 5 SubAgentRunning Nothing
+        [Turn 1 AssistantRole [TextBlock "Coding B"]] (Just 1) emptySubAgentPermissions (Just "call_sub_2")
+  atomically $ writeTQueue (appEventQueue acpEs) (EvSubAgentUpdate subTask2)
+  msgs2 <- T.concat <$> awaitAcpMsgs 1
+  assert "EvSubAgentUpdate for coder/Task B routes to toolCallId call_sub_2"
+    ("tool_call_update" `T.isInfixOf` msgs2 && "\"toolCallId\":\"call_sub_2\"" `T.isInfixOf` msgs2)
+
+  -- Completing call_sub_1 must NOT clear call_sub_2
+  let resultTurn1 = Turn 2 ToolRole [ToolResultBlock (ToolResult "call_sub_1" "Done A" "" Nothing)]
+  atomically $ writeTQueue (appEventQueue acpEs) (EvTurnUpdated resultTurn1)
+  -- ToolRole EvTurnUpdated emits both AcpToolCallUpdate and broadcastUsageUpdate
+  _ <- awaitAcpMsgs 2
+
+  let subTask2Next = subTask2
+        { subAgentTurnCount = 2
+        , subAgentTurns = [Turn 1 AssistantRole [TextBlock "Coding B"], Turn 2 AssistantRole [TextBlock "Still coding B"]]
+        }
+  atomically $ writeTQueue (appEventQueue acpEs) (EvSubAgentUpdate subTask2Next)
+  msgs2Next <- T.concat <$> awaitAcpMsgs 1
+  assert "Completing call_sub_1 preserves routing for coder/Task B to call_sub_2"
+    ("tool_call_update" `T.isInfixOf` msgs2Next && "\"toolCallId\":\"call_sub_2\"" `T.isInfixOf` msgs2Next)
+
+  removeDirectoryRecursive tmpWs
+  putStrLn "  -> OK: ACP parallel subagent toolCallId routing verified."
+
+
+-- 91. CmdResumeSubAgent Edge Cases: Not Found, Already Running, Budget=0 Fallback, & CmdInterrupt
+testResumeEdgeCasesAndInterrupt :: IO ()
+testResumeEdgeCasesAndInterrupt = do
+  putStrLn "\n[Test 91] CmdResumeSubAgent Edge Cases & CmdInterrupt Cancellation"
+  let tmpWs = "/tmp/lambda_spec_91"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+
+  let cfg = defaultConfig { apiBaseUrl = "", mcpServers = Map.empty, workspaceRoot = tmpWs }
+  sess <- newSession
+  startedVar <- newEmptyTMVarIO
+  unblockedVar <- newEmptyTMVarIO
+
+  let gateDriver = simpleModelDriver $ \_ _ cb -> do
+        atomically $ void $ tryPutTMVar startedVar ()
+        atomically $ readTMVar unblockedVar
+        cb (ChunkText "Done")
+        cb ChunkDone
+
+  rt <- startEngineRuntime cfg (Just sess) (Just gateDriver)
+  let es = erEngineState rt
+      chans = erChannels rt
+
+  -- 1. Non-existent sId
+  _ <- drainQueue (appEventQueue es)
+  atomically $ writeTBQueue (cmdQueue chans) (CmdResumeSubAgent 999 2 Nothing Nothing)
+  mErr999 <- timeout 2000000 $ atomically $ do
+    ev <- readTQueue (appEventQueue es)
+    case ev of
+      EvError msg -> pure msg
+      _           -> retry
+  assert "Resuming non-existent sId emits EvError"
+    (maybe False ("SubAgent #999 not found" `T.isInfixOf`) mErr999)
+
+  -- 2. Resuming an already-running subagent
+  aRun <- async $ runEphemeralSubAgent es gateDriver (SubAgentSpec "researcher" "Blocked task" 2 [])
+  mStarted <- timeout 2000000 $ atomically $ readTMVar startedVar
+  assert "Subagent reached driver barrier" (isJust mStarted)
+  subsRunning <- readTVarIO (appSubAgents es)
+  let [runningTask] = Map.elems subsRunning
+      sId = subAgentId runningTask
+  resAlreadyRunning <- resumeEphemeralSubAgent es gateDriver sId 2 Nothing Nothing []
+  assert "Resuming already-running subagent returns Left"
+    (case resAlreadyRunning of
+       Left err -> "already running" `T.isInfixOf` err
+       Right _  -> False)
+  atomically $ putTMVar unblockedVar ()
+  _ <- wait aRun
+
+  -- 3. Budget=0 fallback & real budget exhaustion on resume
+  let exhaustDriver = simpleModelDriver $ \_ _ cb -> do
+        cb (ChunkToolCallStart "call_rf_91" "read_file")
+        cb (ChunkToolCallArgs "call_rf_91" "{\"path\":\"README.md\"}")
+        cb ChunkDone
+  _ <- runEphemeralSubAgent es exhaustDriver (SubAgentSpec "unknown-role" "Exhaust" 1 [])
+  subsExh <- readTVarIO (appSubAgents es)
+  let Just sIdExh = fmap subAgentId $ case filter ((== "unknown-role") . subAgentRole) (Map.elems subsExh) of
+        (x:_) -> Just x
+        []    -> Nothing
+  resExh <- resumeEphemeralSubAgent es exhaustDriver sIdExh 0 Nothing Nothing []
+  assert "Resume with budget=0 falls back to 6 and exhausts with INCONCLUSIVE"
+    (case resExh of
+       Right rep -> reportStatus rep == "INCONCLUSIVE"
+       Left _    -> False)
+  subsAfterExh <- readTVarIO (appSubAgents es)
+  assert "subAgentBudget updated to 1 + 6 = 7"
+    (fmap subAgentBudget (Map.lookup sIdExh subsAfterExh) == Just 7)
+
+  -- 4. CmdInterrupt cancels a running CmdResumeSubAgent
+  resumeStartedVar <- newEmptyTMVarIO
+  let slowResumeDriver = simpleModelDriver $ \_ _ cb -> do
+        atomically $ void $ tryPutTMVar resumeStartedVar ()
+        threadDelay 5000000
+        cb ChunkDone
+  rt2 <- startEngineRuntime cfg (Just sess) (Just slowResumeDriver)
+  let es2 = erEngineState rt2
+      chans2 = erChannels rt2
+  tSeed <- registerSubAgentTask es2 "researcher" "Seed" 2
+  updateSubAgentStatus es2 (subAgentId tSeed) (SubAgentSuccess "INCONCLUSIVE")
+  atomically $ writeTBQueue (cmdQueue chans2) (CmdResumeSubAgent (subAgentId tSeed) 2 Nothing Nothing)
+  mResStarted <- timeout 2000000 $ atomically $ readTMVar resumeStartedVar
+  assert "CmdResumeSubAgent started running" (isJust mResStarted)
+  atomically $ writeTBQueue (cmdQueue chans2) CmdInterrupt
+  mCancelled <- timeout 2000000 $ atomically $ do
+    subs <- readTVar (appSubAgents es2)
+    cancels <- readTVar (appSubAgentAsyncs es2)
+    check (fmap subAgentStatus (Map.lookup (subAgentId tSeed) subs) == Just (SubAgentBlocked "Cancelled by user")
+           && Map.null cancels)
+  assert "CmdInterrupt cancels running CmdResumeSubAgent and clears appSubAgentAsyncs" (isJust mCancelled)
+
+  stopEngineRuntime rt2
+  stopEngineRuntime rt
+  removeDirectoryRecursive tmpWs
+  putStrLn "  -> OK: CmdResumeSubAgent edge cases and CmdInterrupt cancellation verified."
+
+-- 92. OpenCode Wildcard tools: "*": false + permission: bash: "rm *": deny End-to-End
+testOpenCodeWildcardAndBashDenyEndToEnd :: IO ()
+testOpenCodeWildcardAndBashDenyEndToEnd = do
+  putStrLn "\n[Test 92] OpenCode Wildcard & Bash Subcommand Deny End-to-End"
+  let tmpWs = "/tmp/lambda_spec_92"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+
+  let mdWild = T.unlines
+        [ "---"
+        , "description: Strict reader"
+        , "tools:"
+        , "  \"*\": false"
+        , "  read: true"
+        , "---"
+        , "Only read files."
+        ]
+  case parseMarkdownAgent mdWild of
+    Nothing -> failTest "Expected parseMarkdownAgent to parse wildcard tools" >> exitFailure
+    Just scWild -> do
+      assert "tools: \"*\": false + read: true grants only read_file* and sd_read*"
+        ("read_file*" `elem` specialistCapabilities scWild
+         && not ("write_file*" `elem` specialistCapabilities scWild)
+         && not ("bash*" `elem` specialistCapabilities scWild))
+
+  let mdBashDeny = T.unlines
+        [ "---"
+        , "description: Safe bash runner"
+        , "permission:"
+        , "  bash:"
+        , "    \"*\": allow"
+        , "    \"rm *\": deny"
+        , "---"
+        , "Run safe commands only."
+        ]
+  scBash <- case parseMarkdownAgent mdBashDeny of
+    Nothing -> failTest "Expected parseMarkdownAgent to parse bash permission map" >> exitFailure
+    Just sc -> pure sc
+
+  let mockBash = ToolDefinition "bash" "Run bash" (Aeson.object []) Destructive False
+        (\_ _ args -> pure $ ToolResult "" ("ran: " <> T.pack (show args)) "" Nothing) Universal
+      reg = registerTools [readFileTool tmpWs, mockBash] emptyRegistry
+      cfg = defaultConfig
+        { apiBaseUrl = ""
+        , mcpServers = Map.empty
+        , workspaceRoot = tmpWs
+        , specialists = Map.insert "safe-bash" scBash (specialists defaultConfig)
+        }
+  sec <- initSecurityWithRoot tmpWs [] []
+  es <- initEngineState cfg reg sec
+  atomically $ writeTVar (appMode es) ExecMode
+
+  schemasVar <- newTVarIO ([] :: [Aeson.Value])
+  stepVar <- newTVarIO (0 :: Int)
+  let bashDriver = simpleModelDriver $ \_ schemas cb -> do
+        st <- atomically $ do
+          c <- readTVar stepVar
+          writeTVar stepVar (c + 1)
+          pure c
+        case st of
+          0 -> do
+            atomically $ writeTVar schemasVar schemas
+            cb (ChunkToolCallStart "call_ok" "bash")
+            cb (ChunkToolCallArgs "call_ok" "{\"command\":\"echo ok\"}")
+            cb (ChunkToolCallStart "call_rm" "bash")
+            cb (ChunkToolCallArgs "call_rm" "{\"command\":\"rm -rf /tmp/foo\"}")
+            cb ChunkDone
+          _ -> do
+            cb (ChunkToolCallStart "call_rep_92" "submit_report")
+            cb (ChunkToolCallArgs "call_rep_92" "{\"status\":\"SUCCESS\",\"summary\":\"Checked\",\"details\":\"ok\"}")
+            cb ChunkDone
+
+  res <- runEphemeralSubAgent es bashDriver (SubAgentSpec "safe-bash" "Test bash" 3 [])
+  assert "Subagent completed" (case res of Right _ -> True; Left _ -> False)
+
+  schemasSeen <- readTVarIO schemasVar
+  assert "bash remains in toolSchemas when only subcommand rm * is denied"
+    ("bash" `T.isInfixOf` T.pack (show schemasSeen))
+
+  subs <- readTVarIO (appSubAgents es)
+  let [task] = Map.elems subs
+      toolRes = [ tr | Turn _ ToolRole blks <- subAgentTurns task, ToolResultBlock tr <- blks ]
+  assert "echo ok executed"
+    (any (\tr -> resultCallIdRef tr == "call_ok" && "ran:" `T.isInfixOf` resultStdout tr) toolRes)
+  assert "rm -rf /tmp/foo blocked by policy"
+    (any (\tr -> resultCallIdRef tr == "call_rm" && "Blocked" `T.isInfixOf` resultStderr tr) toolRes)
+
+  removeDirectoryRecursive tmpWs
+  putStrLn "  -> OK: OpenCode wildcard and bash subcommand deny end-to-end verified."
+
+-- 93. ACP Same-Role Parallel Subagents & resume_subagent Routing
+testAcpSameRoleParallelAndResumeRouting :: IO ()
+testAcpSameRoleParallelAndResumeRouting = do
+  putStrLn "\n[Test 93] ACP Same-Role Parallel Subagents & resume_subagent Routing"
+  let tmpWs = "/tmp/lambda_spec_93"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+
+  let cfg = defaultConfig { apiBaseUrl = "", mcpServers = Map.empty, workspaceRoot = tmpWs }
+  acpOutQ <- newTQueueIO
+  acpState <- initAcpServerStateWithSink cfg (\bytes -> atomically $ writeTQueue acpOutQ bytes)
+  _ <- startAcpSession acpState (Just tmpWs)
+  Just acpEs <- readTVarIO (acpActiveEngine acpState)
+  _ <- drainQueue acpOutQ
+
+  let awaitAcpJson :: Int -> IO [Aeson.Value]
+      awaitAcpJson n = do
+        mRes <- timeout 2000000 $ mapM (\_ -> atomically (readTQueue acpOutQ)) [1..n]
+        case mRes of
+          Just bs -> pure (mapMaybe Aeson.decode bs)
+          Nothing -> failTest "Timed out waiting for ACP JSON messages" >> exitFailure
+
+      extractToolCallId :: Aeson.Value -> Maybe Text
+      extractToolCallId = parseMaybe $ Aeson.withObject "rpc" $ \o -> do
+        p <- o .: "params"
+        u <- p .: "update"
+        u .: "toolCallId"
+
+  let spawnAndResumeTurn = Turn 1 AssistantRole
+        [ ToolCallBlock (ToolCall "call_r_1" "spawn_specialist_subagent"
+            (Aeson.object ["role" .= ("researcher" :: Text), "task" .= ("Task A" :: Text)]))
+        , ToolCallBlock (ToolCall "call_r_2" "spawn_specialist_subagent"
+            (Aeson.object ["role" .= ("researcher" :: Text), "task" .= ("Task B" :: Text)]))
+        , ToolCallBlock (ToolCall "call_res_3" "resume_subagent"
+            (Aeson.object ["subagent_id" .= (3 :: Int), "additional_budget" .= (2 :: Int)]))
+        ]
+  atomically $ writeTQueue (appEventQueue acpEs) (EvTurnUpdated spawnAndResumeTurn)
+  _ <- awaitAcpJson 3
+
+  let subA = SubAgentTask 1 "researcher" "Task A" 1 5 SubAgentRunning Nothing [] (Just 1) emptySubAgentPermissions (Just "call_r_1")
+      subB = SubAgentTask 2 "researcher" "Task B" 1 5 SubAgentRunning Nothing [] (Just 1) emptySubAgentPermissions (Just "call_r_2")
+      subC = SubAgentTask 3 "coder" "Original C" 2 5 SubAgentRunning Nothing [] (Just 1) emptySubAgentPermissions (Just "call_res_3")
+
+  atomically $ writeTQueue (appEventQueue acpEs) (EvSubAgentUpdate subB)
+  [msgB] <- awaitAcpJson 1
+  assert "Same-role Task B routes to call_r_2" (extractToolCallId msgB == Just "call_r_2")
+
+  atomically $ writeTQueue (appEventQueue acpEs) (EvSubAgentUpdate subA)
+  [msgA] <- awaitAcpJson 1
+  assert "Same-role Task A routes to call_r_1" (extractToolCallId msgA == Just "call_r_1")
+
+  atomically $ writeTQueue (appEventQueue acpEs) (EvSubAgentUpdate subC)
+  [msgC] <- awaitAcpJson 1
+  assert "Concurrent resume_subagent #3 routes to call_res_3" (extractToolCallId msgC == Just "call_res_3")
+
+  removeDirectoryRecursive tmpWs
+  putStrLn "  -> OK: ACP same-role parallel and resume_subagent routing verified."
+
+-- 94. Omitted submit_report & Exception Classification
+testOmittedReportAndExceptionClassification :: IO ()
+testOmittedReportAndExceptionClassification = do
+  putStrLn "\n[Test 94] Omitted submit_report & Exception Classification"
+  let tmpWs = "/tmp/lambda_spec_94"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+
+  sec <- initSecurityWithRoot tmpWs [] []
+  let cfg = defaultConfig { apiBaseUrl = "", mcpServers = Map.empty, workspaceRoot = tmpWs }
+  es <- initEngineState cfg emptyRegistry sec
+
+  -- 1. Omitted submit_report with normal text -> SubAgentSuccess "COMPLETED"
+  let textOnlyDriver = simpleModelDriver $ \_ _ cb -> do
+        cb (ChunkText "All done directly.")
+        cb ChunkDone
+  resOk <- runEphemeralSubAgent es textOnlyDriver (SubAgentSpec "researcher" "Quick answer" 2 [])
+  assert "Text-only completion yields SubAgentReport COMPLETED"
+    (case resOk of Right rep -> reportStatus rep == "COMPLETED"; Left _ -> False)
+
+  -- 2. Omitted submit_report with [API Error: 500] -> Left & SubAgentFailed
+  let apiErrDriver = simpleModelDriver $ \_ _ cb -> do
+        cb (ChunkText "[API Error: 500]")
+        cb ChunkDone
+  resApi <- runEphemeralSubAgent es apiErrDriver (SubAgentSpec "researcher" "Fail API" 2 [])
+  assert "API error text aborts with Left" (case resApi of Left _ -> True; Right _ -> False)
+
+  -- 3. ChunkError -> Left & SubAgentFailed
+  let chunkErrDriver = simpleModelDriver $ \_ _ cb -> cb (ChunkError "rate limit")
+  resChunk <- runEphemeralSubAgent es chunkErrDriver (SubAgentSpec "researcher" "Chunk err" 2 [])
+  assert "ChunkError aborts with Left" (case resChunk of Left _ -> True; Right _ -> False)
+
+  -- 4. Synchronous exception in streamCompletion -> SubAgentFailed (NOT Cancelled by user)
+  let throwDriver = simpleModelDriver $ \_ _ _ -> throwIO (ErrorCall "boom")
+  eThrow <- (Right <$> runEphemeralSubAgent es throwDriver (SubAgentSpec "researcher" "Throw" 2 []))
+    `catch` (\(e :: ErrorCall) -> pure (Left (T.pack (show e))))
+  assert "Synchronous exception rethrown to caller" (case eThrow of Left _ -> True; Right _ -> False)
+  subs <- readTVarIO (appSubAgents es)
+  let thrownTasks = filter ((== "Throw") . subAgentHypothesis) (Map.elems subs)
+  assert "Synchronous exception marks SubAgentFailed (not Cancelled by user)"
+    (any (\t -> case subAgentStatus t of SubAgentFailed _ -> True; _ -> False) thrownTasks)
+
+  removeDirectoryRecursive tmpWs
+  putStrLn "  -> OK: Omitted submit_report and exception classification verified."
+
+-- 95. onPromptStatus Cleanup Under AsyncCancelled & Coalesced Waiters
+testPromptStatusAsyncCancelAndCoalesced :: IO ()
+testPromptStatusAsyncCancelAndCoalesced = do
+  putStrLn "\n[Test 95] onPromptStatus Cleanup Under AsyncCancelled & Coalesced Waiters"
+  let tmpWs = "/tmp/lambda_spec_95"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+
+  sec <- initSecurityWithRoot tmpWs [] []
+  let cfg = defaultConfig { apiBaseUrl = "", mcpServers = Map.empty, workspaceRoot = tmpWs }
+  sess <- newSession
+  es <- initEngineStateWithSession cfg emptyRegistry sec (Just sess)
+
+  task <- registerSubAgentTask es "worker" "Cancel prompts" 5
+  let sId = subAgentId task
+      caller = SubAgentId sId "worker"
+
+  -- 1. Cancel single blocked prompt without calling resolvePrompt
+  aSingle <- async $ checkAuthorization (appSecurity es) caller "cargo build" (Aeson.object []) Nothing
+  _ <- atomically $ readTBQueue (uiPromptQueue (appSecurity es))
+  subsWait <- readTVarIO (appSubAgents es)
+  assert "Blocked prompt sets SubAgentBlocked"
+    (fmap subAgentStatus (Map.lookup sId subsWait) == Just (SubAgentBlocked "Awaiting user decision"))
+
+  cancel aSingle
+  _ <- waitCatch aSingle
+  actEmpty <- Map.null <$> readTVarIO (activePrompts (appSecurity es))
+  pendEmpty <- Map.null <$> readTVarIO (pendingWaiters (appSecurity es))
+  subsAfterSingle <- readTVarIO (appSubAgents es)
+  assert "Cancelling prompt clears activePrompts and pendingWaiters" (actEmpty && pendEmpty)
+  assert "Cancelling single prompt restores SubAgentRunning"
+    (fmap subAgentStatus (Map.lookup sId subsAfterSingle) == Just SubAgentRunning)
+
+  -- 2. Two concurrent prompts: cancel p1, keep p2 pending -> stays SubAgentBlocked until p2 resolves
+  a1 <- async $ checkAuthorization (appSecurity es) caller "cargo check" (Aeson.object []) (Just "call_check")
+  a2 <- async $ checkAuthorization (appSecurity es) caller "cargo test" (Aeson.object []) (Just "call_test")
+  pA <- atomically $ readTBQueue (uiPromptQueue (appSecurity es))
+  pB <- atomically $ readTBQueue (uiPromptQueue (appSecurity es))
+  let pTest = if promptToolCallId pA == Just "call_test" then pA else pB
+
+  cancel a1
+  _ <- waitCatch a1
+  subsStillBlocked <- readTVarIO (appSubAgents es)
+  assert "Cancelling 1 of 2 prompts keeps SubAgentBlocked"
+    (fmap subAgentStatus (Map.lookup sId subsStillBlocked) == Just (SubAgentBlocked "Awaiting user decision"))
+
+  resolvePrompt pTest (PermissionResponse Allow Once)
+  _ <- wait a2
+  subsUnblocked <- readTVarIO (appSubAgents es)
+  assert "Resolving remaining prompt restores SubAgentRunning"
+    (fmap subAgentStatus (Map.lookup sId subsUnblocked) == Just SubAgentRunning)
+
+  -- 3. Coalesced waiters (same command -> 1 prompt in uiPromptQueue, 2 threads waiting)
+  c1 <- async $ checkAuthorization (appSecurity es) caller "cargo clippy" (Aeson.object []) Nothing
+  pCoal <- atomically $ readTBQueue (uiPromptQueue (appSecurity es))
+  c2 <- async $ checkAuthorization (appSecurity es) caller "cargo clippy" (Aeson.object []) Nothing
+  -- Wait until second thread is also coalesced (pendingWaiters has 1 entry, both threads blocked)
+  cancel c2
+  _ <- waitCatch c2
+  subsCoal <- readTVarIO (appSubAgents es)
+  assert "Cancelling coalesced waiter keeps SubAgentBlocked while owner still waits"
+    (fmap subAgentStatus (Map.lookup sId subsCoal) == Just (SubAgentBlocked "Awaiting user decision"))
+
+  resolvePrompt pCoal (PermissionResponse Allow Once)
+  _ <- wait c1
+  subsCoalDone <- readTVarIO (appSubAgents es)
+  assert "Resolving coalesced owner restores SubAgentRunning"
+    (fmap subAgentStatus (Map.lookup sId subsCoalDone) == Just SubAgentRunning)
+
+  -- 4. Cancelling coalesced owner does NOT poison replyVar for waiting sibling
+  d1 <- async $ checkAuthorization (appSecurity es) caller "cargo doc" (Aeson.object []) Nothing
+  pOwner <- atomically $ readTBQueue (uiPromptQueue (appSecurity es))
+  d2 <- async $ checkAuthorization (appSecurity es) caller "cargo doc" (Aeson.object []) Nothing
+  mCoalesced <- timeout 2000000 $ atomically $ do
+    pw <- readTVar (pendingWaiters (appSecurity es))
+    case Map.lookup (promptId pOwner) pw of
+      Just (_, _, cnt, _) | cnt == 2 -> pure ()
+      _ -> retry
+  assert "Second waiter coalesced onto owner prompt" (isJust mCoalesced)
+  cancel d1
+  _ <- waitCatch d1
+  subsOwnerCancelled <- readTVarIO (appSubAgents es)
+  assert "Cancelling owner keeps SubAgentBlocked while coalesced sibling still waits"
+    (fmap subAgentStatus (Map.lookup sId subsOwnerCancelled) == Just (SubAgentBlocked "Awaiting user decision"))
+  resolvePrompt pOwner (PermissionResponse Allow Once)
+  d2Out <- wait d2
+  assert "Coalesced sibling still receives Authorized (not poisoned by owner cancel)" (d2Out == Authorized)
+  subsSibDone <- readTVarIO (appSubAgents es)
+  assert "Resolving sibling restores SubAgentRunning"
+    (fmap subAgentStatus (Map.lookup sId subsSibDone) == Just SubAgentRunning)
+
+  removeDirectoryRecursive tmpWs
+  putStrLn "  -> OK: onPromptStatus AsyncCancelled and coalesced waiter cleanup verified."
+
+-- 96. Duplicate CmdResumeSubAgent Guard, Session Reset Drain & subAgentParentCallId E2E
+testEngineLifecycleAndDuplicateResume :: IO ()
+testEngineLifecycleAndDuplicateResume = do
+  putStrLn "\n[Test 96] Duplicate CmdResumeSubAgent Guard, Session Reset Drain & subAgentParentCallId E2E"
+  let tmpWs = "/tmp/lambda_spec_96"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+
+  sec <- initSecurityWithRoot tmpWs [] []
+  let cfg = defaultConfig
+        { apiBaseUrl = ""
+        , mcpServers = Map.empty
+        , workspaceRoot = tmpWs
+        }
+  sess <- newSession
+  startedVar <- newEmptyTMVarIO
+  unwoundVar <- newEmptyTMVarIO
+  let blockingResumeDriver = simpleModelDriver $ \_ _ cb -> do
+        atomically $ void $ tryPutTMVar startedVar ()
+        (threadDelay 5000000 >> cb ChunkDone)
+          `finally` atomically (void $ tryPutTMVar unwoundVar ())
+
+  rt <- startEngineRuntime cfg (Just sess) (Just blockingResumeDriver)
+  let es = erEngineState rt
+      chans = erChannels rt
+
+  tSeed <- registerSubAgentTask es "researcher" "Seed task" 2
+  let sId = subAgentId tSeed
+  updateSubAgentStatus es sId (SubAgentSuccess "INCONCLUSIVE")
+
+  -- 1. Duplicate CmdResumeSubAgent guard
+  atomically $ writeTBQueue (cmdQueue chans) (CmdResumeSubAgent sId 2 Nothing Nothing)
+  mStarted <- timeout 2000000 $ atomically $ readTMVar startedVar
+  assert "First CmdResumeSubAgent started" (isJust mStarted)
+
+  atomically $ writeTBQueue (cmdQueue chans) (CmdResumeSubAgent sId 2 Nothing Nothing)
+  let awaitErr = do
+        ev <- atomically $ readTQueue (evQueue chans)
+        case ev of
+          EvError msg -> pure msg
+          _           -> awaitErr
+  mDupErr <- timeout 2000000 awaitErr
+  assert "Duplicate CmdResumeSubAgent emits EvError without overwriting active worker"
+    (maybe False ("already resuming" `T.isInfixOf`) mDupErr)
+
+  -- 2. CmdNewSession drains active/resumed workers before resetting session state
+  atomically $ writeTBQueue (cmdQueue chans) CmdNewSession
+  let awaitSwitched = do
+        ev <- atomically $ readTQueue (evQueue chans)
+        case ev of
+          EvSessionSwitched{} -> pure ()
+          _                   -> awaitSwitched
+  mSwitched <- timeout 2000000 awaitSwitched
+  assert "CmdNewSession completed and emitted EvSessionSwitched" (isJust mSwitched)
+
+  mUnwound <- timeout 100000 $ atomically $ readTMVar unwoundVar
+  assert "CmdNewSession drained and unwound running resumed subagent" (isJust mUnwound)
+
+  seqAfter <- readTVarIO (appSubAgentSeq es)
+  subsAfter <- readTVarIO (appSubAgents es)
+  asyncsAfter <- readTVarIO (appSubAgentAsyncs es)
+  assert "New session resets appSubAgentSeq=1 and clears appSubAgents/appSubAgentAsyncs"
+    (seqAfter == 1 && Map.null subsAfter && Map.null asyncsAfter)
+
+  stopEngineRuntime rt
+
+  -- 3. End-to-end subAgentParentCallId propagation through executeToolDispatch
+  let quickReportDriver = simpleModelDriver $ \_ _ cb -> do
+        cb (ChunkToolCallStart "sr_96" "submit_report")
+        cb (ChunkToolCallArgs "sr_96" "{\"status\":\"SUCCESS\",\"summary\":\"Done\",\"details\":\"Checked callId\"}")
+        cb ChunkDone
+  esE2E <- initEngineState cfg emptyRegistry sec
+  let spawnReg = registerTool (spawnSpecialistSubAgentTool esE2E quickReportDriver) emptyRegistry
+  atomically $ writeTVar (appToolRegistry esE2E) spawnReg
+  resTool <- executeToolDispatch esE2E MainAgent []
+    (ToolCall "call_e2e_96" "spawn_specialist_subagent"
+      (Aeson.object ["role" .= ("researcher" :: Text), "task" .= ("Verify parentCallId" :: Text)]))
+  assert "spawn_specialist_subagent tool call succeeds" (T.null (resultStderr resTool))
+  subsE2E <- readTVarIO (appSubAgents esE2E)
+  assert "SubAgentTask records exact subAgentParentCallId from dispatcher"
+    (any (\t -> subAgentParentCallId t == Just "call_e2e_96") (Map.elems subsE2E))
+
+  removeDirectoryRecursive tmpWs
+  putStrLn "  -> OK: Duplicate CmdResumeSubAgent guard, session reset drain, and subAgentParentCallId E2E verified."
+
+-- 97. SubAgent Bounded Context Compaction
+testSubAgentBoundedContextCompaction :: IO ()
+testSubAgentBoundedContextCompaction = do
+  putStrLn "\n[Test 97] SubAgent Bounded Context Compaction"
+  -- 1. Pure unit properties of compactSubAgentTurns
+  let sysTurn = Turn 1 SystemRole [TextBlock "Specialist persona and submit_report instructions."]
+      usrTurn = Turn 2 UserRole [TextBlock "Begin task: survey."]
+      mkPair idx txt =
+        [ Turn idx AssistantRole [ToolCallBlock (ToolCall ("c" <> T.pack (show idx)) "big_read" (Aeson.object []))]
+        , Turn (idx + 1) ToolRole [ToolResultBlock (ToolResult ("c" <> T.pack (show idx)) txt "" Nothing)]
+        ]
+      smallTurns = [sysTurn, usrTurn] ++ mkPair 3 "short"
+  assert "compactSubAgentTurns is a no-op under 85% threshold"
+    (compactSubAgentTurns 2000 smallTurns == smallTurns)
+
+  let bigChunk = T.replicate 800 "x" -- ~200 tokens each
+      largeTurns = [sysTurn, usrTurn]
+        ++ mkPair 3 bigChunk
+        ++ mkPair 5 bigChunk
+        ++ mkPair 7 bigChunk
+        ++ mkPair 9 bigChunk
+      compacted = compactSubAgentTurns 800 largeTurns
+  assert "compactSubAgentTurns pins leading SystemRole Turn 1 verbatim"
+    (case compacted of (t0:_) -> t0 == sysTurn; [] -> False)
+  assert "compactSubAgentTurns synthesizes Context Summary for older turns"
+    (any (\t -> turnRole t == SystemRole && any (\case TextBlock b -> "[Context Summary:" `T.isInfixOf` b; _ -> False) (turnBlocks t)) (drop 1 compacted))
+  assert "compactSubAgentTurns never orphans a ToolRole turn at start of recent window"
+    (case drop 2 compacted of
+       (Turn _ ToolRole _ : _) -> False
+       _ -> True)
+  assert "compactSubAgentTurns falls back to recentCount=2 when 4 recent turns exceed budget"
+    (length compacted < length largeTurns && length (drop 2 compacted) <= 4)
+
+  -- 2. End-to-end subAgentLoop compaction with low contextWindowLimit
+  let tmpWs = "/tmp/lambda_spec_97"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+
+  sec <- initSecurityWithRoot tmpWs ["big_read*"] []
+  let bigReadTool = ToolDefinition "big_read" "Return large output" (Aeson.object []) ReadOnly False
+        (\_ _ _ -> pure (ToolResult "" (T.replicate 1000 "y") "" Nothing)) Universal
+      cfg = defaultConfig
+        { apiBaseUrl = ""
+        , mcpServers = Map.empty
+        , workspaceRoot = tmpWs
+        , contextWindowLimit = 450
+        }
+  es <- initEngineState cfg (registerTool bigReadTool emptyRegistry) sec
+
+  stepVar <- newTVarIO (0 :: Int)
+  seenTurnListsVar <- newTVarIO ([] :: [[Turn]])
+  let loopingDriver = simpleModelDriver $ \ts _ cb -> do
+        atomically $ modifyTVar' seenTurnListsVar (++ [ts])
+        n <- atomically $ do
+          k <- readTVar stepVar
+          writeTVar stepVar (k + 1)
+          pure k
+        case n of
+          0 -> do
+            cb (ChunkToolCallStart "br_1" "big_read")
+            cb (ChunkToolCallArgs "br_1" "{}")
+            cb ChunkDone
+          1 -> do
+            cb (ChunkToolCallStart "br_2" "big_read")
+            cb (ChunkToolCallArgs "br_2" "{}")
+            cb ChunkDone
+          2 -> do
+            cb (ChunkToolCallStart "br_3" "big_read")
+            cb (ChunkToolCallArgs "br_3" "{}")
+            cb ChunkDone
+          _ -> do
+            cb (ChunkToolCallStart "sr_97" "submit_report")
+            cb (ChunkToolCallArgs "sr_97" "{\"status\":\"SUCCESS\",\"summary\":\"Compacted cleanly\",\"details\":\"Bounded.\"}")
+            cb ChunkDone
+
+  res <- runEphemeralSubAgent es loopingDriver (SubAgentSpec "researcher" "Bounded context test" 6 ["big_read*"])
+  assert "subAgentLoop completes with Right after compaction"
+    (case res of Right r -> reportStatus r == "SUCCESS"; Left _ -> False)
+
+  seenLists <- readTVarIO seenTurnListsVar
+  let lastSeenTurns = last seenLists
+  assert "Driver on final turn still receives specialist SystemRole Turn 1 with submit_report"
+    (case lastSeenTurns of
+       (Turn _ SystemRole [TextBlock sysTxt] : _) -> "submit_report" `T.isInfixOf` sysTxt
+       _ -> False)
+  assert "Driver on final turn receives compacted Context Summary turn"
+    (any (\t -> turnRole t == SystemRole && any (\case TextBlock b -> "[Context Summary:" `T.isInfixOf` b; _ -> False) (turnBlocks t)) (drop 1 lastSeenTurns))
+
+  subs <- readTVarIO (appSubAgents es)
+  assert "Persisted subAgentTurns also reflects compacted history"
+    (any (\t -> any (\tr -> turnRole tr == SystemRole && any (\case TextBlock b -> "[Context Summary:" `T.isInfixOf` b; _ -> False) (turnBlocks tr)) (drop 1 (subAgentTurns t))) (Map.elems subs))
+
+  removeDirectoryRecursive tmpWs
+  putStrLn "  -> OK: SubAgent bounded context compaction verified."

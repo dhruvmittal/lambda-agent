@@ -287,6 +287,7 @@ data SubAgentTask = SubAgentTask
   , subAgentTurns        :: ![Turn]
   , subAgentParentTurnId :: !(Maybe Int)
   , subAgentPermissions  :: !SubAgentPermissions
+  , subAgentParentCallId :: !(Maybe Text)
   } deriving stock (Eq, Show, Generic)
 
 instance Aeson.ToJSON SubAgentTask
@@ -303,6 +304,7 @@ instance Aeson.FromJSON SubAgentTask where
       <*> o .:? "subAgentTurns" .!= []
       <*> o .:? "subAgentParentTurnId"
       <*> o .:? "subAgentPermissions" .!= emptySubAgentPermissions
+      <*> o .:? "subAgentParentCallId"
 
 -- | Engine to Frontend notification events
 data EngineEvent

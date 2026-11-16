@@ -122,7 +122,7 @@ executeToolDispatchWithPerms engineState@AppEngineState{..} caller subPerms Tool
           authOutcome <- checkAuthorizationSubject appSecurity grantCtx subject toolCallArgs (Just toolCallId)
           case authOutcome of
             Authorized -> do
-              execRes <- try (toolExecute caller toolCallArgs)
+              execRes <- try (toolExecute caller (Just toolCallId) toolCallArgs)
               case execRes of
                 Left (ex :: SomeException) ->
                   pure $ ToolResult toolCallId "" ("Tool execution failure: " <> T.pack (show ex)) Nothing
