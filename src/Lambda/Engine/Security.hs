@@ -39,7 +39,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import GHC.Generics (Generic)
-import Lambda.Config (defaultAllowGlobs, persistSecurityRule)
+import Lambda.Config (defaultAllowGlobs, planModeSafeGlobs, persistSecurityRule)
 import Lambda.Types
 
 -- | Pure snapshot of all active allow/deny policy rules
@@ -233,6 +233,45 @@ applyDecision PermissionResponse{..} rules pr@PolicyRules{..} =
 defaultSafeRules :: [Text]
 defaultSafeRules = map T.pack defaultAllowGlobs
 
+planModeSafeRules :: [Text]
+planModeSafeRules = map T.pack planModeSafeGlobs
+
+-- | Strips benign read-only git global flags (--no-pager, -P) before the subcommand
+-- so allowlist globs match commands like `git --no-pager diff`.
+normalizeSafeGitFlags :: Text -> Text
+normalizeSafeGitFlags cmd =
+  case T.words (T.strip cmd) of
+    ("git" : rest) -> T.unwords ("git" : dropSafeFlags rest)
+    _              -> T.strip cmd
+  where
+    dropSafeFlags ("--no-pager" : xs) = dropSafeFlags xs
+    dropSafeFlags ("-P" : xs)         = dropSafeFlags xs
+    dropSafeFlags xs                  = xs
+
+-- | Detects flags on otherwise read-only commands that can write files or execute commands.
+hasPlanModeUnsafeFlags :: Text -> Bool
+hasPlanModeUnsafeFlags cmd =
+  case T.words (T.strip cmd) of
+    ("git" : rest)  -> any isUnsafeGitFlag rest
+    ("rg" : rest)   -> any isUnsafeRgFlag rest
+    ("sort" : rest) -> any isUnsafeSortFlag rest
+    ("date" : rest) -> any isUnsafeDateFlag rest
+    _               -> False
+  where
+    isUnsafeGitFlag w =
+      w `elem` ["--output", "--ext-diff"]
+      || "--output=" `T.isPrefixOf` w
+    isUnsafeRgFlag w =
+      w `elem` ["--pre", "--pre-glob"]
+      || any (`T.isPrefixOf` w) ["--pre=", "--pre-glob="]
+    isUnsafeSortFlag w =
+      w `elem` ["-o", "--output"]
+      || "--output=" `T.isPrefixOf` w
+      || ("-o" `T.isPrefixOf` w && T.length w > 2)
+    isUnsafeDateFlag w =
+      w `elem` ["-s", "--set"]
+      || "--set=" `T.isPrefixOf` w
+
 -- | Evaluate a single atomic subject against PolicyRules and CallerGrantContext
 evaluateSubject :: PolicyRules -> CallerGrantContext -> SecuritySubject -> AuthEvaluation
 evaluateSubject PolicyRules{..} CallerGrantContext{..} subj =
@@ -290,6 +329,13 @@ evaluateSubject PolicyRules{..} CallerGrantContext{..} subj =
       not (hasUnsafeShellSyntax seg)
       && any (`matchGlob` stripCommandWrappers seg) defaultSafeRules
 
+    isPlanModeSafe seg =
+      let cleanSeg = stripCommandWrappers seg
+          normalizedSeg = normalizeSafeGitFlags cleanSeg
+      in not (hasUnsafeShellSyntax seg)
+         && not (hasPlanModeUnsafeFlags cleanSeg)
+         && any (`matchGlob` normalizedSeg) planModeSafeRules
+
     evaluateBashSegments fullCmd segs =
       let segEvals = map evalSeg segs
       in case [ out | EvalDeny out <- segEvals ] of
@@ -307,8 +353,10 @@ evaluateSubject PolicyRules{..} CallerGrantContext{..} subj =
       in case checkDeny cleanSeg of
            Just out -> EvalDeny out
            Nothing
-             | cgcAgentMode == PlanMode && (unsafe || not (isSafeDefault seg)) ->
-                 EvalDeny (DeniedByPlanMode seg)
+             | cgcAgentMode == PlanMode ->
+                 if isPlanModeSafe seg
+                   then EvalAllow
+                   else EvalDeny (DeniedByPlanMode seg)
              | unsafe ->
                  case checkExplicitAllow cleanSeg rule of
                    EvalAllow -> EvalAllow

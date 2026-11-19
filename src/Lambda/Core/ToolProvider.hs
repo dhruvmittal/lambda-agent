@@ -67,7 +67,8 @@ formatMcpCatalog mode (ToolRegistry m) =
        else "Invoke a lazily-loaded MCP tool by name. Available tools:\n" <> T.unlines catalogLines
 
 -- | Serializes registered tools into OpenAI function calling format.
--- Strictly filters out Destructive tools when in PlanMode!
+-- Strictly filters out Destructive tools when in PlanMode, except `bash` which is exposed
+-- with a read-only local discovery description and enforced per-segment by Security.hs!
 -- Raw MCP tools are hidden behind the call_mcp_tool lazy gateway.
 toolsToOpenAISchema :: AgentMode -> ToolRegistry -> [Aeson.Value]
 toolsToOpenAISchema mode reg@(ToolRegistry m) =
@@ -79,14 +80,21 @@ toolsToOpenAISchema mode reg@(ToolRegistry m) =
         | otherwise = True
       eagerTools = filter isEligible allTools
       availableTools = case mode of
-        PlanMode -> filter (\t -> toolCapability t == ReadOnly) eagerTools
+        PlanMode -> filter (\t -> toolCapability t == ReadOnly || toolName t == "bash") eagerTools
         ExecMode -> eagerTools
   in map toolToJson availableTools
   where
+    planBashDesc =
+      "Execute a read-only local state discovery command in the workspace directory (Plan mode). "
+      <> "Allowed command families: git (status, diff, log, show, blame, rev-parse, ls-files, ls-tree, describe, shortlog, merge-base, symbolic-ref, cat-file, branch --list/-l/--show-current, tag -l, remote -v, stash list), "
+      <> "ls, pwd, stat, file, tree, du, df, wc, head, tail, cat, diff, cmp, realpath, readlink, rg, grep, sort, uniq, cut, tr, which, type, uname, ps, id, whoami, hostname, date, env. "
+      <> "Mutating commands, output redirects, command substitutions, and network tools are blocked."
+
     toolToJson ToolDefinition{..} =
-      let desc = if toolName == "call_mcp_tool"
-                   then formatMcpCatalog mode reg
-                   else toolDescription
+      let desc
+            | toolName == "call_mcp_tool" = formatMcpCatalog mode reg
+            | toolName == "bash" && mode == PlanMode = planBashDesc
+            | otherwise = toolDescription
       in Aeson.object
         [ "type"     .= ("function" :: Text)
         , "function" .= Aeson.object

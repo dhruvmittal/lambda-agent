@@ -359,17 +359,27 @@ testModeFiltering = do
   putStrLn "\n[Test 5] Dual-Gate Mode Safety (/plan vs /exec)"
   let readTool = ToolDefinition "read_file" "Read file" (Aeson.object []) ReadOnly False (\_ _ _ -> pure (ToolResult "" "" "" Nothing)) Universal
       destTool = ToolDefinition "write_file" "Write file" (Aeson.object []) Destructive False (\_ _ _ -> pure (ToolResult "" "" "" Nothing)) Universal
+      bashT    = ToolDefinition "bash" "Execute arbitrary bash" (Aeson.object []) Destructive False (\_ _ _ -> pure (ToolResult "" "" "" Nothing)) Universal
       reg = registerTools [readTool, destTool] emptyRegistry
+      regWithBash = registerTools [readTool, destTool, bashT] emptyRegistry
 
   let planSchemas = toolsToOpenAISchema PlanMode reg
   assert "PlanMode has exactly 1 tool" (length planSchemas == 1)
   assert "PlanMode schema includes read_file" ("read_file" `T.isInfixOf` T.pack (show planSchemas))
   assert "PlanMode schema excludes write_file" (not ("write_file" `T.isInfixOf` T.pack (show planSchemas)))
 
+  let planWithBashSchemas = toolsToOpenAISchema PlanMode regWithBash
+  assert "PlanMode with bash exposes read_file and bash (not write_file)" (length planWithBashSchemas == 2)
+  assert "PlanMode schema includes bash" ("\"bash\"" `T.isInfixOf` T.pack (show planWithBashSchemas))
+  assert "PlanMode bash schema uses read-only Plan mode description" ("read-only local state discovery" `T.isInfixOf` T.pack (show planWithBashSchemas))
+  assert "PlanMode with bash still excludes write_file" (not ("write_file" `T.isInfixOf` T.pack (show planWithBashSchemas)))
+
   let execSchemas = toolsToOpenAISchema ExecMode reg
   assert "ExecMode has 2 tools" (length execSchemas == 2)
   assert "ExecMode schema includes write_file" ("write_file" `T.isInfixOf` T.pack (show execSchemas))
-  putStrLn "  -> OK: Destructive tools statically excluded from PlanMode schemas."
+  let execWithBashSchemas = toolsToOpenAISchema ExecMode regWithBash
+  assert "ExecMode bash schema uses normal description" ("Execute arbitrary bash" `T.isInfixOf` T.pack (show execWithBashSchemas))
+  putStrLn "  -> OK: Destructive tools statically excluded from PlanMode schemas while bash is mode-gated."
 
 -- 6. Verify Environment Variable Fallbacks (OpenRouter & OpenAI)
 testConfigFallbacks :: IO ()
@@ -4753,6 +4763,60 @@ testPermissionAlgebraAndPipelineSpec = do
     (deriveSecurityGlob "python3 -c \"import os\"" /= "python3 -c*")
   assert "bash -c does not derive bash -c*"
     (deriveSecurityGlob "bash -c \"rm -rf /\"" /= "bash -c*")
+
+  -- PlanMode read-only local discovery allowlist (both MainAgent and SubAgent)
+  let subPlanCtx = CallerGrantContext (SubAgentId 1 "surveyor") emptySubAgentPermissions PlanMode
+      subDenyBlameCtx = CallerGrantContext (SubAgentId 2 "surveyor") (SubAgentPermissions Set.empty (Set.singleton "git blame*")) PlanMode
+      allowedPlanCmds =
+        [ "git status"
+        , "git diff HEAD~1"
+        , "git log --oneline -10"
+        , "git show HEAD:README.md"
+        , "git blame src/Lambda/Types.hs"
+        , "git rev-parse HEAD"
+        , "git --no-pager diff --stat"
+        , "git branch --show-current"
+        , "git branch"
+        , "stat README.md"
+        , "ps aux"
+        , "ls -la"
+        , "diff a.txt b.txt"
+        , "rg PlanMode src/"
+        , "git log --oneline -20 | head -n 5"
+        , "git diff --stat | wc -l"
+        ]
+      deniedPlanCmds =
+        [ "git commit -m \"nope\""
+        , "git push origin main"
+        , "git branch -D feature"
+        , "git -c core.pager=sh log"
+        , "git diff --output=/tmp/out.patch"
+        , "rg --pre=sh foo src/"
+        , "sort -o /tmp/sorted.txt README.md"
+        , "date -s \"2020-01-01\""
+        , "curl https://example.com"
+        , "wget https://example.com"
+        , "cabal test"
+        , "pytest"
+        , "rm -rf build"
+        ]
+  forM_ allowedPlanCmds $ \cmd -> do
+    assert ("PlanMode allows subagent discovery cmd: " <> T.unpack cmd)
+      (evaluateSubject emptyRules subPlanCtx (SubjBash cmd) == EvalAllow)
+    assert ("PlanMode allows main agent discovery cmd: " <> T.unpack cmd)
+      (evaluateSubject emptyRules mainPlanCtx (SubjBash cmd) == EvalAllow)
+  forM_ deniedPlanCmds $ \cmd -> do
+    assert ("PlanMode denies non-discovery/mutating cmd for subagent: " <> T.unpack cmd)
+      (case evaluateSubject emptyRules subPlanCtx (SubjBash cmd) of
+         EvalDeny (DeniedByPlanMode _) -> True
+         _                             -> False)
+    assert ("PlanMode denies non-discovery/mutating cmd for main agent: " <> T.unpack cmd)
+      (case evaluateSubject emptyRules mainPlanCtx (SubjBash cmd) of
+         EvalDeny (DeniedByPlanMode _) -> True
+         _                             -> False)
+  assert "Subagent explicit sapDeny overrides PlanMode safe discovery allowlist"
+    (evaluateSubject emptyRules subDenyBlameCtx (SubjBash "git blame src/Lambda/Types.hs")
+       == EvalDeny (DeniedByPolicy Lambda.Types.Session "git blame*"))
 
   putStrLn "  -> OK: Pure permission algebra, precedence, and shell pipeline invariants verified."
 

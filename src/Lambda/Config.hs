@@ -29,6 +29,7 @@ module Lambda.Config
   , loadAllMarkdownAgents
   , defaultAllowGlobs
   , defaultDenyGlobs
+  , planModeSafeGlobs
   , persistSecurityRule
   , persistAllowGlob
   , persistDenyGlob
@@ -308,6 +309,84 @@ defaultDenyGlobs =
   [ "rm -rf /*"
   , "mkfs*"
   , ":(){ :|:& };:"
+  ]
+
+-- | Strictly read-only, local-only shell command globs permitted via `bash` in PlanMode
+-- for both the orchestrator and specialist subagents.
+planModeSafeGlobs :: [String]
+planModeSafeGlobs =
+  [ -- Read-only git state inspection
+    "git status*"
+  , "git diff*"
+  , "git log*"
+  , "git show*"
+  , "git blame*"
+  , "git rev-parse*"
+  , "git ls-files*"
+  , "git ls-tree*"
+  , "git describe*"
+  , "git shortlog*"
+  , "git merge-base*"
+  , "git symbolic-ref*"
+  , "git cat-file*"
+  , "git branch"
+  , "git branch --list*"
+  , "git branch -l*"
+  , "git branch --show-current*"
+  , "git branch -a*"
+  , "git branch -r*"
+  , "git branch -v*"
+  , "git tag"
+  , "git tag -l*"
+  , "git tag --list*"
+  , "git remote"
+  , "git remote -v*"
+  , "git stash list*"
+    -- Local filesystem, text, and process inspection (no network or mutation)
+  , "ls"
+  , "ls *"
+  , "pwd"
+  , "pwd *"
+  , "stat *"
+  , "file *"
+  , "tree"
+  , "tree *"
+  , "du"
+  , "du *"
+  , "df"
+  , "df *"
+  , "wc"
+  , "wc *"
+  , "head"
+  , "head *"
+  , "tail"
+  , "tail *"
+  , "cat *"
+  , "diff *"
+  , "cmp *"
+  , "realpath *"
+  , "readlink *"
+  , "rg *"
+  , "grep *"
+  , "sort"
+  , "sort *"
+  , "uniq"
+  , "uniq *"
+  , "cut *"
+  , "tr *"
+  , "which *"
+  , "type *"
+  , "uname"
+  , "uname *"
+  , "ps"
+  , "ps *"
+  , "id"
+  , "id *"
+  , "whoami"
+  , "hostname"
+  , "date"
+  , "date *"
+  , "env"
   ]
 
 defaultConfig :: Config
