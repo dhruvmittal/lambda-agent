@@ -30,7 +30,8 @@ data ResourceName
   | ButtonDenySession
   | ButtonDenyAlways
   | HudOverlay
-  | HudScroll
+  | JumpToBottom
+  | JumpSubAgentToBottom
   | CompletionPopup
   | SessionChooserOverlay
   | SessionItem !Int
@@ -66,19 +67,21 @@ data UIState = UIState
   , uiMode             :: !AgentMode
   , uiEditor           :: !(E.Editor Text ResourceName)
   , uiWorkingState     :: !Text
-  , uiChannels         :: !EngineChannels
-  , uiLastEscTime      :: !(Maybe UTCTime)
-  , uiContextLimit     :: !Int
-  , uiPromptHistory    :: ![Text]
-  , uiHistoryIndex     :: !(Maybe Int)
-  , uiSavedDraft       :: !Text
-  , uiModelName        :: !Text
-  , uiThinkingVisible  :: !Bool
-  , uiSelectedSubAgent :: !(Maybe Int)
-  , uiShowHud          :: !Bool
-  , uiCompletion       :: !(Maybe CompletionState)
-  , uiSessionChooser   :: !(Maybe SessionChooserState)
-  , uiIsGenerating     :: !Bool
+  , uiChannels           :: !EngineChannels
+  , uiContextLimit       :: !Int
+  , uiPromptHistory      :: ![Text]
+  , uiHistoryIndex       :: !(Maybe Int)
+  , uiSavedDraft         :: !Text
+  , uiModelName          :: !Text
+  , uiThinkingVisible    :: !Bool
+  , uiSelectedSubAgent   :: !(Maybe Int)
+  , uiShowHud            :: !Bool
+  , uiCompletion         :: !(Maybe CompletionState)
+  , uiSessionChooser     :: !(Maybe SessionChooserState)
+  , uiIsGenerating       :: !Bool
+  , uiIsStopping         :: !Bool
+  , uiAutoScroll         :: !Bool
+  , uiSubAgentAutoScroll :: !Bool
   , uiSpinnerStep      :: !Int
   , uiExecutionStart   :: !(Maybe UTCTime)
   , uiElapsedSeconds   :: !Int
@@ -93,6 +96,9 @@ makeLensesFor
   , ("uiMode", "modeL")
   , ("uiThinkingVisible", "thinkingVisibleL")
   , ("uiIsGenerating", "isGeneratingL")
+  , ("uiIsStopping", "isStoppingL")
+  , ("uiAutoScroll", "autoScrollL")
+  , ("uiSubAgentAutoScroll", "subAgentAutoScrollL")
   , ("uiSpinnerStep", "spinnerStepL")
   , ("uiExecutionStart", "executionStartL")
   , ("uiElapsedSeconds", "elapsedSecondsL")
@@ -114,19 +120,21 @@ defaultUIState chans cfg = UIState
   , uiMode             = PlanMode
   , uiEditor           = E.editor EditorInput (Just 1) ""
   , uiWorkingState     = ""
-  , uiChannels         = chans
-  , uiLastEscTime      = Nothing
-  , uiContextLimit     = 128000
-  , uiPromptHistory    = []
-  , uiHistoryIndex     = Nothing
-  , uiSavedDraft       = ""
-  , uiModelName        = "mock-model"
-  , uiThinkingVisible  = True
-  , uiSelectedSubAgent = Nothing
-  , uiShowHud          = False
-  , uiCompletion       = Nothing
-  , uiSessionChooser   = Nothing
-  , uiIsGenerating     = False
+  , uiChannels           = chans
+  , uiContextLimit       = 128000
+  , uiPromptHistory      = []
+  , uiHistoryIndex       = Nothing
+  , uiSavedDraft         = ""
+  , uiModelName          = "mock-model"
+  , uiThinkingVisible    = True
+  , uiSelectedSubAgent   = Nothing
+  , uiShowHud            = False
+  , uiCompletion         = Nothing
+  , uiSessionChooser     = Nothing
+  , uiIsGenerating       = False
+  , uiIsStopping         = False
+  , uiAutoScroll         = True
+  , uiSubAgentAutoScroll = True
   , uiSpinnerStep      = 0
   , uiExecutionStart   = Nothing
   , uiElapsedSeconds   = 0

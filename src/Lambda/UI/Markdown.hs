@@ -84,9 +84,10 @@ parseMarkdownBlocks rawText = go (T.lines rawText)
           in MdCode lang codeLines : go restLs
 
       -- Headings
-      | "# " `T.isPrefixOf` l   = MdH1 (tokenizeInlines (T.drop 2 l)) : go ls
-      | "## " `T.isPrefixOf` l  = MdH2 (tokenizeInlines (T.drop 3 l)) : go ls
-      | "### " `T.isPrefixOf` l = MdH3 (tokenizeInlines (T.drop 4 l)) : go ls
+      | "# " `T.isPrefixOf` l    = MdH1 (tokenizeInlines (T.drop 2 l)) : go ls
+      | "## " `T.isPrefixOf` l   = MdH2 (tokenizeInlines (T.drop 3 l)) : go ls
+      | "### " `T.isPrefixOf` l  = MdH3 (tokenizeInlines (T.drop 4 l)) : go ls
+      | "#### " `T.isPrefixOf` l = MdH3 (tokenizeInlines (T.drop 5 l)) : go ls
 
       -- Thematic breaks / Horizontal rules
       | T.strip l `elem` ["---", "***", "___"] = MdThematicBreak : go ls
@@ -176,6 +177,7 @@ parseMarkdownBlocks rawText = go (T.lines rawText)
            && not ("# " `T.isPrefixOf` line)
            && not ("## " `T.isPrefixOf` line)
            && not ("### " `T.isPrefixOf` line)
+           && not ("#### " `T.isPrefixOf` line)
            && not (s `elem` ["---", "***", "___"])
            && not (isTableLine line)
            && not (isQuoteLine line)
@@ -314,18 +316,24 @@ tokenTypeToAttrName = \case
   OtherTok            -> attrName "syntaxNormal"
   NormalTok           -> attrName "syntaxNormal"
 
+renderHeading :: String -> AttrName -> [WordToken] -> Widget ResourceName
+renderHeading prefix hAttr tokens =
+  let styled = map (\t -> if tokAttr t == attrName "mdNormal" then t { tokAttr = hAttr } else t) tokens
+  in hBox [withAttr hAttr (str prefix), renderWrappedInlines styled]
+
 -- | Render individual Markdown block elements to Brick Widgets
 renderMdBlock :: MdBlock -> Widget ResourceName
 renderMdBlock (MdH1 tokens) =
   padTop (Pad 1) $ padBottom (Pad 1) $
-    hBox [withAttr (attrName "mdH1") (str "# "), renderWrappedInlines tokens]
+    renderHeading "# " (attrName "mdH1") tokens
 
 renderMdBlock (MdH2 tokens) =
   padTop (Pad 1) $
-    hBox [withAttr (attrName "mdH2") (str "## "), renderWrappedInlines tokens]
+    renderHeading "## " (attrName "mdH2") tokens
 
 renderMdBlock (MdH3 tokens) =
-  hBox [withAttr (attrName "mdH3") (str "### "), renderWrappedInlines tokens]
+  padTop (Pad 1) $
+    renderHeading "### " (attrName "mdH3") tokens
 
 renderMdBlock (MdCode mLang codeLines) =
   padBottom (Pad 1) $

@@ -244,6 +244,7 @@ main = do
   testPromptStatusAsyncCancelAndCoalesced
   testEngineLifecycleAndDuplicateResume
   testSubAgentBoundedContextCompaction
+  testUiUxScrollCancelHeadingsAndTab
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -3324,7 +3325,6 @@ testWorkingStateBackwardsCompatibility = do
         , uiEditor = E.editor EditorInput (Just 1) ""
         , uiWorkingState = ""
         , uiChannels = chans
-        , uiLastEscTime = Nothing
         , uiContextLimit = 200000
         , uiPromptHistory = []
         , uiHistoryIndex = Nothing
@@ -3336,6 +3336,9 @@ testWorkingStateBackwardsCompatibility = do
         , uiCompletion = Nothing
         , uiSessionChooser = Nothing
         , uiIsGenerating = False
+        , uiIsStopping = False
+        , uiAutoScroll = True
+        , uiSubAgentAutoScroll = True
         , uiSpinnerStep = 0
         , uiExecutionStart = Nothing
         , uiElapsedSeconds = 0
@@ -5994,3 +5997,128 @@ testSubAgentBoundedContextCompaction = do
 
   removeDirectoryRecursive tmpWs
   putStrLn "  -> OK: SubAgent bounded context compaction verified."
+
+-- 98. Sticky Auto-Scroll State, AsyncCancelled Turn/Resume Unwinding & Heading Parsing
+testUiUxScrollCancelHeadingsAndTab :: IO ()
+testUiUxScrollCancelHeadingsAndTab = do
+  putStrLn "\n[Test 98] Sticky Auto-Scroll State, AsyncCancelled Unwinding & Heading Parsing"
+  let tmpWs = "/tmp/lambda_spec_98"
+  removeDirectoryRecursive tmpWs `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True tmpWs
+
+  sec <- initSecurityWithRoot tmpWs [] []
+  let cfg = defaultConfig { apiBaseUrl = "", mcpServers = Map.empty, workspaceRoot = tmpWs }
+
+  -- 1. Pure applyEngineEvent invariants for uiAutoScroll, uiSubAgentAutoScroll, uiIsStopping
+  es0 <- initEngineState cfg emptyRegistry sec
+  chans0 <- initEngineChannels (appEventQueue es0)
+  let baseUI = (defaultUIState chans0 cfg)
+        { uiIsGenerating = True
+        , uiIsStopping = True
+        , uiAutoScroll = False
+        , uiSubAgentAutoScroll = False
+        }
+      doneUI = applyEngineEvent EvDone baseUI
+  assert "EvDone clears uiIsGenerating and uiIsStopping without overriding uiAutoScroll"
+    (not (uiIsGenerating doneUI) && not (uiIsStopping doneUI) && not (uiAutoScroll doneUI))
+
+  let errUI = applyEngineEvent (EvError "boom") baseUI
+  assert "EvError clears uiIsGenerating and uiIsStopping"
+    (not (uiIsGenerating errUI) && not (uiIsStopping errUI))
+
+  let switchedUI = applyEngineEvent (EvSessionSwitched "s2" PlanMode [] Map.empty) baseUI
+  assert "EvSessionSwitched resets uiAutoScroll, uiSubAgentAutoScroll, and uiIsStopping"
+    (uiAutoScroll switchedUI && uiSubAgentAutoScroll switchedUI && not (uiIsStopping switchedUI))
+
+  let subRunning = SubAgentTask 1 "researcher" "hyp" 1 5 SubAgentRunning Nothing [] Nothing emptySubAgentPermissions Nothing
+      subDone = subRunning { subAgentStatus = SubAgentSuccess "OK" }
+      idleStoppingUI = (defaultUIState chans0 cfg) { uiIsGenerating = False, uiIsStopping = True }
+      stillStoppingUI = applyEngineEvent (EvSubAgentUpdate subRunning) idleStoppingUI
+      clearedStoppingUI = applyEngineEvent (EvSubAgentUpdate subDone) stillStoppingUI
+  assert "EvSubAgentUpdate keeps uiIsStopping while a subagent is running and clears when done"
+    (uiIsStopping stillStoppingUI && not (uiIsStopping clearedStoppingUI))
+
+  -- 2. CmdInterrupt emits EvDone and finalizes interrupted Assistant turn on AsyncCancelled
+  sess <- newSession
+  streamStartedVar <- newEmptyTMVarIO
+  let blockingDriver = simpleModelDriver $ \_ _ cb -> do
+        atomically $ void $ tryPutTMVar streamStartedVar ()
+        cb (ChunkText "Partial output")
+        threadDelay 5000000
+        cb ChunkDone
+  rt <- startEngineRuntime cfg (Just sess) (Just blockingDriver)
+  let es = erEngineState rt
+      chans = erChannels rt
+
+  atomically $ writeTBQueue (cmdQueue chans) (CmdUserPrompt "Stream and cancel")
+  mStreamed <- timeout 2000000 $ atomically $ readTMVar streamStartedVar
+  assert "Streaming turn started" (isJust mStreamed)
+
+  -- Wait briefly for Partial output to appear in appTurns before interrupting
+  mPartial <- timeout 2000000 $ atomically $ do
+    ts <- readTVar (appTurns es)
+    check (any (\t -> turnRole t == AssistantRole && any (\case TextBlock b -> "Partial output" `T.isInfixOf` b; _ -> False) (turnBlocks t)) ts)
+  assert "Partial output recorded in Assistant turn" (isJust mPartial)
+
+  atomically $ writeTBQueue (cmdQueue chans) CmdInterrupt
+  let awaitEvDone = do
+        ev <- atomically $ readTQueue (evQueue chans)
+        case ev of
+          EvDone -> pure True
+          _      -> awaitEvDone
+  mEvDone <- timeout 2000000 awaitEvDone
+  assert "CmdInterrupt guarantees EvDone emission on AsyncCancelled unwind" (mEvDone == Just True)
+
+  turnsAfterInt <- readTVarIO (appTurns es)
+  assert "Interrupted assistant turn finalized with interruption marker"
+    (any (\t -> turnRole t == AssistantRole && any (\case TextBlock b -> "Turn interrupted by user" `T.isInfixOf` b; _ -> False) (turnBlocks t)) turnsAfterInt)
+
+  -- CmdInterrupt when idle (mTask == Nothing) also emits EvDone
+  atomically $ writeTBQueue (cmdQueue chans) CmdInterrupt
+  mIdleDone <- timeout 2000000 awaitEvDone
+  assert "CmdInterrupt when idle (mTask == Nothing) still emits EvDone" (mIdleDone == Just True)
+
+  -- CmdResumeSubAgent cancelled by CmdInterrupt does NOT emit spurious EvError
+  tSeed <- registerSubAgentTask es "researcher" "Resume cancel check" 2
+  updateSubAgentStatus es (subAgentId tSeed) (SubAgentSuccess "INCONCLUSIVE")
+  resumeStartVar <- newEmptyTMVarIO
+  let slowResumeDriver = simpleModelDriver $ \_ _ cb -> do
+        atomically $ void $ tryPutTMVar resumeStartVar ()
+        threadDelay 5000000
+        cb ChunkDone
+  rtRes <- startEngineRuntime cfg (Just sess) (Just slowResumeDriver)
+  let esRes = erEngineState rtRes
+      chansRes = erChannels rtRes
+  tResSeed <- registerSubAgentTask esRes "researcher" "Resume cancel check" 2
+  updateSubAgentStatus esRes (subAgentId tResSeed) (SubAgentSuccess "INCONCLUSIVE")
+  atomically $ writeTBQueue (cmdQueue chansRes) (CmdResumeSubAgent (subAgentId tResSeed) 2 Nothing Nothing)
+  mResStart <- timeout 2000000 $ atomically $ readTMVar resumeStartVar
+  assert "Resumed subagent started" (isJust mResStart)
+  atomically $ writeTBQueue (cmdQueue chansRes) CmdInterrupt
+  mResDone <- timeout 2000000 $ do
+    let drainNoErr = do
+          ev <- atomically $ readTQueue (evQueue chansRes)
+          case ev of
+            EvError e -> pure (Left e)
+            EvDone    -> pure (Right ())
+            _         -> drainNoErr
+    drainNoErr
+  assert "Cancelling CmdResumeSubAgent emits EvDone without spurious EvError" (mResDone == Just (Right ()))
+
+  stopEngineRuntime rtRes
+  stopEngineRuntime rt
+
+  -- 3. Markdown heading parsing (#### excluded from MdPara, maps to MdH3)
+  let mdSample = T.unlines
+        [ "Intro paragraph line"
+        , "#### Fourth level heading"
+        , "### Third level **bold** heading"
+        ]
+      blocks = parseMarkdownBlocks mdSample
+  assert "#### heading following paragraph is parsed separately as MdH3 (not absorbed into MdPara)"
+    (case blocks of
+       [MdPara _, MdH3 _, MdH3 _] -> True
+       _ -> False)
+
+  removeDirectoryRecursive tmpWs
+  putStrLn "  -> OK: Sticky auto-scroll, AsyncCancelled unwinding, and heading parsing verified."

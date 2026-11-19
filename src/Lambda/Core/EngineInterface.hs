@@ -16,9 +16,9 @@ module Lambda.Core.EngineInterface
 import Control.Concurrent (forkIO, myThreadId, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.Async (Async, async, asyncThreadId, asyncWithUnmask, cancel, mapConcurrently, race)
 import Control.Concurrent.STM
-import Control.Exception (try, catch, SomeException, displayException, finally)
+import Control.Exception (SomeAsyncException, SomeException, displayException, catch, finally, fromException, onException, throwIO, try)
 import Control.Monad (forever, when, unless)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Text (Text)
 import qualified Data.Text as T
 
@@ -180,6 +180,8 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       mapM_ cancel (Map.elems subAsyncs)
       mapM_ cancel mTask
       mapM_ cancel (Map.elems resumed)
+      when (isNothing mTask) $
+        emitEngineEvent engineState EvDone
       loop
     CmdSetMode newMode -> do
       atomically $ writeTVar appMode newMode
@@ -225,15 +227,19 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
           unmask $ do
             res <- resumeEphemeralSubAgent engineState driver sId extraBud mRole mGuidance []
             case res of
-              Left err -> emitEngineEvent engineState (EvError err)
+              Left err ->
+                unless (err == "Cancelled by user" || err == "Subagent execution cancelled by user.") $
+                  emitEngineEvent engineState (EvError err)
               Right r -> do
                 subs <- readTVarIO appSubAgents
                 let roleName = maybe (fromMaybe "specialist" mRole) subAgentRole (Map.lookup sId subs)
                     reportXml = formatSpecialistReportXml (Just sId) roleName r
                 _ <- addTurn engineState SystemRole [TextBlock reportXml]
                 pure ()
-        ) `catch` (\(e :: SomeException) ->
-          emitEngineEvent engineState (EvError ("Subagent resume failed: " <> T.pack (displayException e))))
+        ) `catch` (\(e :: SomeException) -> do
+          case fromException e :: Maybe SomeAsyncException of
+            Just _  -> throwIO e
+            Nothing -> emitEngineEvent engineState (EvError ("Subagent resume failed: " <> T.pack (displayException e))))
           `finally` do
             tid <- myThreadId
             atomically (modifyTVar' resumedAsyncsVar (Map.update (\v -> if asyncThreadId v == tid then Nothing else Just v) sId))
@@ -391,13 +397,10 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
         persistCurrentSession engineState
 
         atomically $ do
-          writeTVar appActiveTask False
           curVec <- readTVar appStateVector
           let updatedVec = T.unlines $ map (\l -> if "BLOCKED_ON:" `T.isPrefixOf` l then "BLOCKED_ON: User input" else l) (T.lines curVec)
           writeTVar appStateVector updatedVec
           writeTQueue appEventQueue (EvWorkingStateUpdate updatedVec)
-
-        emitEngineEvent engineState EvDone
 
       atomically $ writeTVar activeTaskVar (Just turnTask)
       loop
@@ -405,6 +408,7 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
     cleanupTurn = atomically $ do
       writeTVar activeTaskVar Nothing
       writeTVar appActiveTask False
+      writeTQueue appEventQueue EvDone
 
 runAgentTurnLoop
   :: AppEngineState
@@ -436,8 +440,20 @@ runAgentTurnLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
           onChunk chunk =
             atomically $ writeTQueue evQueue (EvStreamChunk chunk)
 
+      let finalizeInterruptedTurn = atomically $ do
+            ts <- readTVar appTurns
+            let appendMarker blks = case blks of
+                  [TextBlock "Thinking..."] -> [TextBlock "⚠️ [Turn interrupted by user]"]
+                  _ -> blks ++ [TextBlock "\n⚠️ [Turn interrupted by user]"]
+                updated = map (\t -> if turnId t == turnId asstTurn then t { turnBlocks = appendMarker (turnBlocks t) } else t) ts
+            writeTVar appTurns updated
+            case filter (\t -> turnId t == turnId asstTurn) updated of
+              (u:_) -> writeTQueue appEventQueue (EvTurnUpdated u)
+              []    -> pure ()
+
       (fullText, fullThinking, toolCalls, wasInterrupted, _mDriverErr) <-
         accumulateStreamChunks appInterrupted driver turns toolSchemas onProgress onChunk
+          `onException` finalizeInterruptedTurn
 
       if wasInterrupted
         then do

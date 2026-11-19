@@ -168,13 +168,13 @@ hudOverlay UIState{ uiShowHud = True, .. } =
               , padTop (Pad 1) $ withAttr (attrName "hudSection") (str "◆ KEYBINDINGS")
               , padLeft (Pad 2) $
                   vBox
-                    [ hBox [ withAttr (attrName "hudKey") (str "Tab            "), str "Contextual autocomplete (commands, sessions, paths)" ]
+                    [ hBox [ withAttr (attrName "hudKey") (str "Tab            "), str "Autocomplete (or toggle Plan / Exec on empty prompt)" ]
                     , hBox [ withAttr (attrName "hudKey") (str "Alt+M / F2     "), str "Toggle Plan / Exec mode" ]
                     , hBox [ withAttr (attrName "hudKey") (str "Alt+, / Alt+.  "), str "Navigate SubAgents (< and >) / Esc to return" ]
                     , hBox [ withAttr (attrName "hudKey") (str "^P / ^N (Alt) "), str "Previous / Next prompt history" ]
                     , hBox [ withAttr (attrName "hudKey") (str "Alt+H / F1     "), str "Toggle this Intelligence HUD" ]
                     , hBox [ withAttr (attrName "hudKey") (str "^T             "), str "Toggle Thinking/Reasoning visibility" ]
-                    , hBox [ withAttr (attrName "hudKey") (str "Esc Esc        "), str "Interrupt active generation or tool dispatch" ]
+                    , hBox [ withAttr (attrName "hudKey") (str "Esc            "), str "Interrupt active generation or tool dispatch" ]
                     , hBox [ withAttr (attrName "hudKey") (str "/help          "), str "Show full command reference in chat" ]
                     ]
               ]
@@ -234,6 +234,11 @@ subAgentDrawerOverlay UIState{ uiSelectedSubAgent = Just sId, .. } =
                         if null (subAgentTurns task)
                           then padAll 1 (withAttr (attrName "thinkingDim") (str "Awaiting dialogue turns recorded for this subagent..."))
                           else vBox (map renderTurn (subAgentTurns task))
+                  , if uiSubAgentAutoScroll
+                      then emptyWidget
+                      else clickable JumpSubAgentToBottom $
+                             vLimit 1 $ C.hCenter $ withAttr (attrName "selectedBadge") $
+                               str " ↓ Scrolled up — Ctrl+End or click to jump to bottom "
                   , vLimit 1 $ withBorderStyle BS.unicodeRounded B.hBorder
                   , vLimit 1 $ padLeftRight 1 $
                       hBox
@@ -253,16 +258,18 @@ mainLayout UIState{..} =
       mElapsed = if isWaiting && uiElapsedSeconds > 0
                    then Just (formatElapsed uiElapsedSeconds)
                    else Nothing
-      headerStateText = case uiCurrentPrompt of
-        Just p  -> "GOAL: " <> wsGoal (parseWorkingState uiWorkingState) <> "\nBLOCKED_ON: Awaiting user decision (" <> promptTool p <> ")"
-        Nothing -> uiWorkingState
+      headerStateText
+        | uiIsStopping = "GOAL: " <> wsGoal (parseWorkingState uiWorkingState) <> "\nBLOCKED_ON: Stopping..."
+        | Just p <- uiCurrentPrompt = "GOAL: " <> wsGoal (parseWorkingState uiWorkingState) <> "\nBLOCKED_ON: Awaiting user decision (" <> promptTool p <> ")"
+        | otherwise = uiWorkingState
   in vBox
     [ headerBarWithElapsed headerStateText uiSelectedSubAgent mElapsed
-    , renderMainPane uiSelectedSubAgent uiTurns uiSubAgents uiCompletion uiMode uiModelName uiContextLimit uiConfig uiEditor isWaiting uiSpinnerStep mElapsed
+    , renderMainPane uiAutoScroll uiSelectedSubAgent uiTurns uiSubAgents uiCompletion uiMode uiModelName uiContextLimit uiConfig uiEditor isWaiting uiSpinnerStep mElapsed
     ]
 
 renderMainPane
-  :: Maybe Int
+  :: Bool
+  -> Maybe Int
   -> [Turn]
   -> Map.Map Int SubAgentTask
   -> Maybe CompletionState
@@ -275,7 +282,7 @@ renderMainPane
   -> Int
   -> Maybe Text
   -> Widget ResourceName
-renderMainPane mSelected turns subs uiComp mode model ctxLimit cfg editor isWaiting spinnerStep mElapsed =
+renderMainPane autoScroll mSelected turns subs uiComp mode model ctxLimit cfg editor isWaiting spinnerStep mElapsed =
   vBox
     [ viewport ChatView Vertical $
         padLeftRight 1 $
@@ -284,6 +291,11 @@ renderMainPane mSelected turns subs uiComp mode model ctxLimit cfg editor isWait
                    then emptyWidget
                    else renderFleetStrip mSelected subList
             else vBox (map renderTurnItem (groupTurnsForDisplay turnPairs))
+    , if autoScroll
+        then emptyWidget
+        else clickable JumpToBottom $
+               vLimit 1 $ C.hCenter $ withAttr (attrName "selectedBadge") $
+                 str " ↓ Scrolled up — press Ctrl+End or click to jump to bottom "
     , renderCompletionLine uiComp
     , renderPowerlinePromptWithElapsed mode model (apiBaseUrl cfg) turns ctxLimit editor isWaiting spinnerStep mElapsed
     ]

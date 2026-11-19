@@ -12,7 +12,7 @@ module Lambda.Driver.OpenAI
   , processSseStream
   ) where
 
-import Control.Exception (try, SomeException)
+import Control.Exception (SomeAsyncException, SomeException, fromException, throwIO, try)
 import Control.Monad (forM, forM_, when, unless)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?))
@@ -108,6 +108,9 @@ openAiDynamicDriverWithManager manager cfg@Config{..} getActiveModel = ModelDriv
 
               case res of
                 Left (ex :: SomeException) -> do
+                  case fromException ex :: Maybe SomeAsyncException of
+                    Just _  -> throwIO ex
+                    Nothing -> pure ()
                   let msg = "HTTP/Network Exception: " <> T.pack (show ex)
                   callback (ChunkError msg)
                   callback (ChunkText ("\n[" <> msg <> "]\n"))
@@ -345,4 +348,7 @@ fetchEndpointModels cfg
             else pure []
       case res of
         Right models -> pure models
-        Left (_ :: SomeException) -> pure []
+        Left (ex :: SomeException) ->
+          case fromException ex :: Maybe SomeAsyncException of
+            Just _  -> throwIO ex
+            Nothing -> pure []
