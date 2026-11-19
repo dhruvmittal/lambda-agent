@@ -1000,8 +1000,11 @@ handleCommand cmdText = do
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) CmdQuit
       halt
     _ -> do
-      now <- liftIO getCurrentTime
-      put st { uiIsGenerating = True, uiExecutionStart = Just now, uiElapsedSeconds = 0 }
+      if uiIsGenerating st
+        then pure ()
+        else do
+          now <- liftIO getCurrentTime
+          put st { uiIsGenerating = True, uiExecutionStart = Just now, uiElapsedSeconds = 0 }
       liftIO $ atomically $ writeTBQueue (cmdQueue channels) (CmdUserPrompt cmdText)
 
 toggleMouseTracking :: EventM ResourceName UIState ()

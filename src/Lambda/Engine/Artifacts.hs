@@ -33,15 +33,22 @@ spoolDiagnosticArtifact artifactDir toolName rawOutput = do
           fullPath = artifactDir </> filename
       BS.writeFile fullPath (TE.encodeUtf8 rawOutput)
 
-      -- Generate universal head/tail window summary
+      -- Generate summary window without negative counts or overlapping head/tail lines
       let ls = T.lines rawOutput
-          headLines = take 15 ls
-          tailLines = drop (max 0 (length ls - 25)) ls
-          summaryText = T.unlines
-            [ T.unlines headLines
-            , "... [" <> T.pack (show (lineCount - 40)) <> " lines omitted. Full dump spooled out-of-band] ..."
-            , T.unlines tailLines
-            ]
+          summaryText
+            | lineCount > 40 =
+                let headLines = take 15 ls
+                    tailLines = drop (max 0 (lineCount - 25)) ls
+                in T.unlines
+                     [ T.unlines headLines
+                     , "... [" <> T.pack (show (lineCount - 40)) <> " lines omitted. Full dump spooled out-of-band] ..."
+                     , T.unlines tailLines
+                     ]
+            | otherwise =
+                T.unlines
+                  [ "... [" <> T.pack (show (max 0 (charCount - 500))) <> " chars omitted. Full dump spooled out-of-band] ..."
+                  , T.takeEnd 500 rawOutput
+                  ]
           pointer = formatArtifactPointer (T.pack filename) fullPath summaryText lineCount
       pure (pointer, Just fullPath)
     else

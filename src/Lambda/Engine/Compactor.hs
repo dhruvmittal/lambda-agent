@@ -6,8 +6,11 @@ module Lambda.Engine.Compactor
   , sanitizeForApiPayload
   , pruneHistoricalThinking
   , turnsToOpenAIPayload
+  , turnsToOpenAIPayloadWithSystem
+  , buildRootSystemPrompt
   , isThinkingBlock
   , estimateTotalTokens
+  , compactionThreshold
   , defaultAgentSystemPrompt
   , compactHistory
   , synthesizeTurnSummary
@@ -15,8 +18,10 @@ module Lambda.Engine.Compactor
 
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString.Lazy as BL
-import Data.Aeson ((.=))
-import Data.Maybe (mapMaybe)
+import Data.Aeson ((.=), (.:))
+import Data.Aeson.Types (parseMaybe)
+import Data.Containers.ListUtils (nubOrd)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Lambda.Types
@@ -26,27 +31,25 @@ defaultAgentSystemPrompt :: Text
 defaultAgentSystemPrompt = T.unlines
   [ "# Identity & Purpose"
   , "You are lambdA, the Lead Systems Architect and orchestrator implemented in Haskell."
-  , "You operate in an interactive terminal environment directing high-level orchestration, hypothesis formulation, task fan-out, and synthesis."
+  , "You operate in an interactive terminal environment directing high-level orchestration, hypothesis formulation, parallel specialist fan-out, and synthesis."
   , ""
   , "# Operational Invariants & Guidelines"
-  , "1. **Lead Architect & Specialist Subagent Delegation Doctrine**:"
-  , "   - Your role is high-level orchestration, hypothesis formulation, task fan-out, and synthesis."
-  , "   - **MANDATORY SPECIALIST DELEGATION**:"
-  , "     * Never run profilers (valgrind, perf), sanitizer runs (ASan, TSan), large codebase surveys, test cascades, or large refactorings directly in the main conversation."
-  , "     * Always spawn the appropriate specialist (`surveyor`, `debugger`, `profiler`, `implementer`, `reviewer`) using `spawn_specialist_subagent`."
-  , "     * Maintain O(1) context mass: specialist subagents run concurrently in isolated loops and return compact, structured reports."
-  , "   - **Parallel Specialist Fan-Out**:"
-  , "     * When surveying multiple disparate modules, inspecting multiple files, testing competing hypotheses, or running parallel benchmarks, emit multiple `spawn_specialist_subagent` tool calls simultaneously in a single turn. The Haskell runtime executes them concurrently across lightweight green threads."
+  , "1. **Parallel Specialist Delegation Doctrine**:"
+  , "   - Maintain O(1) context mass: delegate multi-file surveys, debugging, profiling, test cascades, and deep edits to specialist subagents (`surveyor`, `debugger`, `profiler`, `implementer`, `reviewer`) via `spawn_specialist_subagent`."
+  , "   - **Default to Parallel Fan-Out**: Whenever a task spans 2+ modules, has 2+ hypotheses, or splits into independent edits, emit multiple `spawn_specialist_subagent` calls in a single turn. Handle trivial single-target lookups directly when spawning would add pure latency."
+  , "   - **Disjoint File Ownership**: Never assign two concurrent `implementer` subagents to edit the same file."
+  , "   - **Self-Contained Task Briefs**: Include exact file paths, symbols, constraints, and acceptance criteria in `task` so workers succeed on turn 1."
+  , "   - **Resume-to-Pivot**: Every `<specialist_report id=\"N\">` includes a subagent ID. Prefer `resume_subagent` (with `specialize_role`) to pivot a warm `surveyor` or `debugger` into an `implementer` without re-reading files."
+  , "   - **Parallel Verify & Review**: After edits, fan out `reviewer` and verification checks concurrently."
   , ""
   , "2. **Hypothesis-Driven Problem Solving**:"
   , "   - Formulate clear hypotheses about root cause, performance bottlenecks, or architecture before acting."
   , "   - Verify hypotheses systematically through specialist subagents."
   , ""
   , "3. **Dual-Gate Safety & Mode Discipline**:"
-  , "   - In [/plan] mode: Only read-only operations are permitted. Formulate architectures, explore dependencies, and verify assumptions."
-  , "   - `spawn_specialist_subagent` is fully available in [/plan] mode for read-only surveys, inspections, profiling analysis, and architecture planning."
-  , "   - In [/exec] mode: Modifying operations (write_file, replace_lines, bash) are enabled, subject to security capability grants."
-  , "   - When modifying files, always preserve existing architectural invariants, comments, and style conventions."
+  , "   - In [/plan] mode: Only read-only operations are permitted—including `read_file`, `list_directory`, read-only `bash` local discovery (`git`, `rg`, `ls`, `stat`, `ps`, `diff`, etc.), MCP read tools, and `spawn_specialist_subagent` for parallel surveys and architecture planning."
+  , "   - In [/exec] mode: Modifying operations (`write_file`, `edit_file`, `bash`) are enabled, subject to security capability grants."
+  , "   - When modifying files, preserve existing architectural invariants, comments, and style conventions."
   , ""
   , "4. **Communication Style**:"
   , "   - Concise, rigorous, and action-oriented. Synthesize specialist findings and state next architectural steps clearly."
@@ -60,6 +63,14 @@ defaultAgentSystemPrompt = T.unlines
   , "   - Always use `read_file` (or specialist subagents) for local workspace files and `file://` URIs."
   , "   - Never use `fetch_url` for local files or `file://` links; `fetch_url` is exclusively for remote HTTP/HTTPS endpoints."
   ]
+
+-- | Builds the static, prompt-cache-stable root system prompt for the orchestrator,
+-- appending workspace root and capped hierarchical project instructions when present.
+buildRootSystemPrompt :: FilePath -> Text -> Text
+buildRootSystemPrompt wsRoot projCtx =
+  let wsSection = "\n## Workspace\n- Root: " <> T.pack wsRoot
+      ctxSection = if T.null (T.strip projCtx) then "" else "\n\n" <> T.strip projCtx
+  in T.stripEnd defaultAgentSystemPrompt <> "\n" <> wsSection <> ctxSection <> "\n"
 
 -- | Opaque wrapper guaranteeing that historical reasoning blocks have been pruned before egress.
 newtype SanitizedTurns = SanitizedTurns { unSanitizedTurns :: [Turn] }
@@ -89,7 +100,14 @@ isThinkingBlock _                  = False
 -- non-banner system message is already present (which subagents have for their persona).
 -- Correctly generates native assistant `tool_calls` and `tool` role responses!
 turnsToOpenAIPayload :: [Turn] -> [Aeson.Value]
-turnsToOpenAIPayload turns =
+turnsToOpenAIPayload = turnsToOpenAIPayloadWithSystem Nothing
+
+-- | Converts dialogue turns into OpenAI wire-protocol JSON messages with an optional
+-- enriched root system prompt. Ensures mid-conversation SystemRole turns (compaction
+-- summaries, /goal, /model notifications) never suppress the root system prompt or emit
+-- mid-stream role:"system" messages, and coalesces adjacent user messages.
+turnsToOpenAIPayloadWithSystem :: Maybe Text -> [Turn] -> [Aeson.Value]
+turnsToOpenAIPayloadWithSystem mRootSys turns =
   let SanitizedTurns sanitized = sanitizeForApiPayload turns
       isUiBanner (Turn _ SystemRole blks) =
         let txt = T.concat [ t | TextBlock t <- blks ]
@@ -98,27 +116,48 @@ turnsToOpenAIPayload turns =
            || "[Compaction Checkpoint:" `T.isPrefixOf` txt
            || "⚠️" `T.isPrefixOf` txt
       isUiBanner _ = False
+      isRuntimeSystemText txt =
+        "[Context Summary:" `T.isPrefixOf` txt
+        || "Goal set to:" `T.isPrefixOf` txt
+        || "Switched active model" `T.isPrefixOf` txt
+        || "Resuming SubAgent" `T.isPrefixOf` txt
+        || "Debug execution trace" `T.isPrefixOf` txt
+        || "<specialist_report" `T.isPrefixOf` txt
       wireTurns = filter (not . isUiBanner) sanitized
-      wireMsgs = concatMap turnToMessages wireTurns
-      hasExplicitSystem = any (\t -> turnRole t == SystemRole) wireTurns
+      hasLeadingPersonaSystem = case wireTurns of
+        (Turn _ SystemRole blks : _) -> not (isRuntimeSystemText (renderTextBlocks blks))
+        _                            -> False
+      rootContent = fromMaybe defaultAgentSystemPrompt mRootSys
       sysMsg =
         [ Aeson.object
             [ "role"    .= ("system" :: Text)
-            , "content" .= defaultAgentSystemPrompt
+            , "content" .= rootContent
             ]
-        | not hasExplicitSystem
+        | not hasLeadingPersonaSystem
         ]
-  in sysMsg ++ wireMsgs
+      wireMsgs = concat (zipWith turnToMessages [0 :: Int ..] wireTurns)
+  in coalesceUserMessages (sysMsg ++ wireMsgs)
   where
-    turnToMessages :: Turn -> [Aeson.Value]
-    turnToMessages (Turn _ role blocks) =
+    turnToMessages :: Int -> Turn -> [Aeson.Value]
+    turnToMessages idx (Turn _ role blocks) =
       case role of
         SystemRole ->
-          [ Aeson.object
-              [ "role"    .= ("system" :: Text)
-              , "content" .= renderTextBlocks blocks
-              ]
-          ]
+          let txt = renderTextBlocks blocks
+          in if idx == 0 && not (isRuntimeSystemText txt)
+               then [ Aeson.object
+                        [ "role"    .= ("system" :: Text)
+                        , "content" .= txt
+                        ]
+                    ]
+               else
+                 let wrapped = if "[Context Summary:" `T.isPrefixOf` txt
+                       then "<compaction_summary>\n" <> txt <> "\n</compaction_summary>"
+                       else txt
+                 in [ Aeson.object
+                        [ "role"    .= ("user" :: Text)
+                        , "content" .= wrapped
+                        ]
+                    ]
         UserRole ->
           [ Aeson.object
               [ "role"    .= ("user" :: Text)
@@ -142,6 +181,33 @@ turnsToOpenAIPayload turns =
                     ]
         ToolRole ->
           mapMaybe toolResultToMessage blocks
+
+    isRuntimeSystemText txt =
+      "[Context Summary:" `T.isPrefixOf` txt
+      || "Goal set to:" `T.isPrefixOf` txt
+      || "Switched active model" `T.isPrefixOf` txt
+      || "Resuming SubAgent" `T.isPrefixOf` txt
+      || "Debug execution trace" `T.isPrefixOf` txt
+      || "<specialist_report" `T.isPrefixOf` txt
+
+    coalesceUserMessages :: [Aeson.Value] -> [Aeson.Value]
+    coalesceUserMessages [] = []
+    coalesceUserMessages (m1 : m2 : rest)
+      | Just c1 <- extractUserContent m1
+      , Just c2 <- extractUserContent m2 =
+          let merged = Aeson.object
+                [ "role"    .= ("user" :: Text)
+                , "content" .= (c1 <> "\n\n" <> c2)
+                ]
+          in coalesceUserMessages (merged : rest)
+    coalesceUserMessages (m : rest) = m : coalesceUserMessages rest
+
+    extractUserContent :: Aeson.Value -> Maybe Text
+    extractUserContent = parseMaybe $ Aeson.withObject "msg" $ \o -> do
+      r <- o .: "role"
+      if (r :: Text) == "user"
+        then o .: "content"
+        else fail "not user"
 
     extractToolCall (ToolCallBlock tc) = Just tc
     extractToolCall _                  = Nothing
@@ -209,23 +275,66 @@ compactHistory maxTokens recentCount turns
       | not (null older) = adjustSplit (init older, last older : recent)
     adjustSplit pair = pair
 
--- | Synthesizes a structured summary from a sequence of turns
+-- | Computes context-rot-aware auto-compaction trigger: min(60% of window, 200k tokens),
+-- subtracting a 4,000-token system/tool reserve on real-sized windows while remaining safe
+-- for small mock test limits.
+compactionThreshold :: Int -> Int
+compactionThreshold limit =
+  let scaled  = min ((limit * 60) `div` 100) 200000
+      reserve = if scaled > 8000 then 4000 else 0
+  in max 64 (scaled - reserve)
+
+-- | Synthesizes a structured high-signal summary from a sequence of turns
 synthesizeTurnSummary :: [Turn] -> Text
 synthesizeTurnSummary turns =
   let totalCompacted = length turns
-      userPrompts = [ p | Turn _ UserRole blks <- turns, TextBlock p <- blks ]
-      toolCalls   = [ toolCallName tc | Turn _ AssistantRole blks <- turns, ToolCallBlock tc <- blks ]
-      artifacts   = [ T.pack path | Turn _ ToolRole blks <- turns, ToolResultBlock tr <- blks, Just path <- [resultArtifactPath tr] ]
+      userPrompts = [ p | Turn _ UserRole blks <- turns, TextBlock p <- blks, not (T.null (T.strip p)) ]
+      goalUpdates = [ T.strip (T.drop 12 s) | Turn _ SystemRole blks <- turns, TextBlock s <- blks, "Goal set to:" `T.isPrefixOf` s ]
+      toolCalls   = [ tc | Turn _ AssistantRole blks <- turns, ToolCallBlock tc <- blks ]
+      toolNames   = nubOrd (map toolCallName toolCalls)
+      extractPath tc = case toolCallName tc of
+        n | n `elem` ["read_file", "edit_file", "write_file", "list_directory"] ->
+              parseMaybe (Aeson.withObject "args" (Aeson..: "path")) (toolCallArgs tc)
+        _ -> Nothing
+      filesTouched = nubOrd (mapMaybe extractPath toolCalls)
+      specialistReports =
+        [ T.take 200 (T.replace "\n" " " (T.strip out))
+        | Turn _ ToolRole blks <- turns
+        , ToolResultBlock tr <- blks
+        , let out = resultStdout tr
+        , "<specialist_report" `T.isInfixOf` out
+        ]
+      assistantFindings =
+        [ T.take 240 (T.replace "\n" " " (T.strip t))
+        | Turn _ AssistantRole blks <- reverse turns
+        , TextBlock t <- blks
+        , not (T.null (T.strip t))
+        , not ("Thinking..." == T.strip t)
+        ]
+      artifacts   = nubOrd [ T.pack path | Turn _ ToolRole blks <- turns, ToolResultBlock tr <- blks, Just path <- [resultArtifactPath tr] ]
       priorSummaries = [ s | Turn _ SystemRole blks <- turns, TextBlock s <- blks, "[Context Summary:" `T.isInfixOf` s ]
-      promptSummary = if null userPrompts
+      objectives = goalUpdates ++ take 3 userPrompts
+      promptSummary = if null objectives
                         then "None recorded"
-                        else T.intercalate "; " (take 3 userPrompts)
-      toolSummary = if null toolCalls
+                        else T.intercalate "; " (take 4 objectives)
+      toolSummary = if null toolNames
                       then "No tools executed"
-                      else T.intercalate ", " (take 5 toolCalls) <> (if length toolCalls > 5 then "..." else "")
+                      else T.intercalate ", " (take 8 toolNames) <> (if length toolNames > 8 then "..." else "")
       artifactSummary = if null artifacts
                           then "None"
                           else T.intercalate ", " (take 5 artifacts)
+      filesSection =
+        [ "- Files Touched: " <> T.intercalate ", " (take 12 filesTouched)
+        | not (null filesTouched)
+        ]
+      reportsSection =
+        [ "- Specialist Reports: " <> T.intercalate " | " (take 4 specialistReports)
+        | not (null specialistReports)
+        ]
+      findingsSection =
+        [ "- Recent Findings: " <> T.intercalate " | " (reverse (take 2 assistantFindings))
+        | not (null assistantFindings)
+        ]
       priorSection = case priorSummaries of
         [] -> []
         (p:_) -> ["- Prior Context: " <> T.strip (T.take 300 (T.replace "\n" " " p))]
@@ -234,5 +343,5 @@ synthesizeTurnSummary turns =
        , "- Key Objectives: " <> promptSummary
        , "- Tools Executed: " <> toolSummary
        , "- Active Artifacts: " <> artifactSummary
-       ] ++ priorSection
+       ] ++ filesSection ++ reportsSection ++ findingsSection ++ priorSection
 

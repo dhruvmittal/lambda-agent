@@ -25,14 +25,14 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import Data.Time.Clock (getCurrentTime, diffUTCTime, addUTCTime)
-import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive, doesFileExist, removeFile)
+import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive, doesFileExist, removeFile, createFileLink)
 import System.Environment (setEnv, unsetEnv)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
 import Skylighting (TokenType(..))
 import qualified Test.QuickCheck as QC
 
-import Lambda.Config (loadConfig, Config(..), McpServerConfig(..), SpecialistConfig(..), defaultConfig, defaultAllowGlobs, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, lookupModelContextLimitWithConfig, resolveEnvTemplates, persistTheme, extractProviderAndModel, parseMarkdownAgent, loadAllMarkdownAgents)
+import Lambda.Config (loadConfig, loadProjectContext, Config(..), McpServerConfig(..), SpecialistConfig(..), defaultConfig, defaultSpecialists, defaultAllowGlobs, resolveModelAlias, resolveModelWithConfig, formatEndpointBadge, lookupModelContextLimit, lookupModelContextLimitWithConfig, resolveEnvTemplates, persistTheme, extractProviderAndModel, parseMarkdownAgent, loadAllMarkdownAgents)
 import Lambda.Engine.PromptMacro (listPromptMacros, loadPromptMacro, expandPromptMacro)
 import Lambda.Core.EngineInterface (initEngineChannels, cmdQueue, startEngineLoop, EngineChannels(..), EngineRuntime(..), startEngineRuntime, stopEngineRuntime)
 import Lambda.Core.ModelDriver (ModelDriver(..), simpleModelDriver)
@@ -245,6 +245,7 @@ main = do
   testEngineLifecycleAndDuplicateResume
   testSubAgentBoundedContextCompaction
   testUiUxScrollCancelHeadingsAndTab
+  testPiErgonomicsAndParallelSubAgents
 
   putStrLn "\n=== All Invariant Tests Passed Successfully! ==="
 
@@ -575,23 +576,27 @@ testPlanModeSubAgentAndContextGuard = do
   TIO.writeFile largeFilePath largeContent
 
   let readTool = readFileTool "."
-  -- MainAgent direct read of large file (> 250 lines) should be intercepted by Context Mass Guard
+  -- MainAgent direct read of large file (> 250 lines) should soft-truncate to 250 lines with Context Mass Guard footer
   resMainLarge <- toolExecute readTool MainAgent Nothing (Aeson.object ["path" Aeson..= T.pack largeFilePath])
-  assert "Context Mass Guard blocks main agent direct large read" ("Context Mass Guard" `T.isInfixOf` resultStderr resMainLarge)
+  assert "Context Mass Guard soft-truncates main agent direct large read without erroring" (resultStderr resMainLarge == "")
+  assert "Context Mass Guard footer present in stdout" ("Context Mass Guard" `T.isInfixOf` resultStdout resMainLarge)
+  assert "Main agent large read includes header with Lines 1-250 of 300" ("Lines 1-250 of 300" `T.isInfixOf` resultStdout resMainLarge)
 
-  -- MainAgent targeted slice (<= 250 lines) should succeed
+  -- MainAgent targeted slice (<= 250 lines) should succeed with header + 50 lines
   resMainSlice <- toolExecute readTool MainAgent Nothing (Aeson.object
     [ "path" Aeson..= T.pack largeFilePath
     , "start_line" Aeson..= (1 :: Int)
     , "line_count" Aeson..= (50 :: Int)
     ])
   assert "Main agent sliced read succeeds" (resultStderr resMainSlice == "")
-  assert "Main agent sliced read returned 50 lines" (length (T.lines (resultStdout resMainSlice)) == 50)
+  assert "Main agent sliced read includes Lines 1-50 of 300 header" ("Lines 1-50 of 300" `T.isInfixOf` resultStdout resMainSlice)
+  assert "Main agent sliced read returned header + 50 lines" (length (T.lines (resultStdout resMainSlice)) == 51)
 
-  -- Subagent direct read of large file should succeed without restriction (isolated context)
+  -- Subagent direct read of large file should succeed without main-agent 250-line restriction
   resSubLarge <- toolExecute readTool (SubAgentId 1 "Survey task") Nothing (Aeson.object ["path" Aeson..= T.pack largeFilePath])
   assert "Subagent direct large read succeeds without guard" (resultStderr resSubLarge == "")
-  assert "Subagent received all 300 lines" (length (T.lines (resultStdout resSubLarge)) == 300)
+  assert "Subagent received header + all 300 lines" (length (T.lines (resultStdout resSubLarge)) == 301)
+  assert "Subagent header marks EOF" ("Lines 1-300 of 300 (EOF)" `T.isInfixOf` resultStdout resSubLarge)
 
   removeFile largeFilePath
   putStrLn "  -> OK: Large file reads properly guarded for MainAgent and delegated to SubAgents."
@@ -3390,8 +3395,8 @@ testLongRunningUnboundedAndCancellation = do
   assert "Unbounded task runs without timeout error" ("unbounded task completed" `T.isInfixOf` resultStdout resUnbounded)
   assert "Small task does not produce artifact" (resultArtifactPath resUnbounded == Nothing)
 
-  -- 2. Test large output (> 40 lines) spools directly to disk artifact and generates pointer
-  let largeCmd = "for i in $(seq 1 60); do echo \"Log line $i generated by compute task\"; done"
+  -- 2. Test large output (> 120 lines for MainAgent) spools directly to disk artifact and generates pointer
+  let largeCmd = "for i in $(seq 1 150); do echo \"Log line $i generated by compute task\"; done"
       largeArgs = Aeson.object
         [ "command" .= (largeCmd :: Text)
         , "timeout_seconds" .= (10 :: Int)
@@ -3403,7 +3408,7 @@ testLongRunningUnboundedAndCancellation = do
     Just path -> do
       exists <- doesFileExist path
       assert "Artifact file physically exists on disk" exists
-    Nothing -> failTest "Expected artifact path for 60-line output"
+    Nothing -> failTest "Expected artifact path for 150-line output"
 
   -- 3. Test Cooperative Cancellation in JsonRpc
   client <- startRpcClient LineFramed "cat" []
@@ -6186,3 +6191,147 @@ testUiUxScrollCancelHeadingsAndTab = do
 
   removeDirectoryRecursive tmpWs
   putStrLn "  -> OK: Sticky auto-scroll, AsyncCancelled unwinding, and heading parsing verified."
+
+-- 99. Pi-Grade Ergonomics, Wire Safety, Context-Rot Compaction & Parallel Subagent Supercharge
+testPiErgonomicsAndParallelSubAgents :: IO ()
+testPiErgonomicsAndParallelSubAgents = do
+  putStrLn "\n[Test 99] Pi-Grade Ergonomics, Wire Safety, Compaction & Parallel Subagent Invariants"
+
+  -- 1. Ghost tool cleanup & specialist capability alignment
+  case Map.lookup "implementer" defaultSpecialists of
+    Nothing -> failTest "implementer specialist missing"
+    Just imp -> do
+      assert "implementer has edit_file* grant" ("edit_file*" `elem` specialistCapabilities imp)
+      assert "implementer no longer has ghost replace_lines*" (not ("replace_lines*" `elem` specialistCapabilities imp))
+  case Map.lookup "surveyor" defaultSpecialists of
+    Nothing -> failTest "surveyor specialist missing"
+    Just surv -> do
+      assert "surveyor has rg * grant for ExecMode parity" ("rg *" `elem` specialistCapabilities surv)
+      assert "surveyor no longer references ghost find_by_name" (not ("find_by_name" `T.isInfixOf` specialistPrompt surv))
+      assert "surveyor no longer references ghost grep_search" (not ("grep_search" `T.isInfixOf` specialistPrompt surv))
+  assert "defaultConfig maxTurnBudget raised to 60" (maxTurnBudget defaultConfig == 60)
+
+  -- 2. Context-rot compaction threshold scaling & small-limit guard
+  assert "compactionThreshold 32k -> 15200" (compactionThreshold 32000 == 15200)
+  assert "compactionThreshold 128k -> 72800" (compactionThreshold 128000 == 72800)
+  assert "compactionThreshold 256k -> 149600" (compactionThreshold 256000 == 149600)
+  assert "compactionThreshold 1M -> 196000 (20% cap)" (compactionThreshold 1000000 == 196000)
+  assert "compactionThreshold small mock limit 450 stays positive (270)" (compactionThreshold 450 == 270)
+
+  -- 3. turnsToOpenAIPayloadWithSystem preserves root system prompt after compaction & coalesces user messages
+  let compactedTurns =
+        [ Turn 1 SystemRole [TextBlock "[Context Summary: 5 historical turns compacted into working state]\n- Key Objectives: fix bug"]
+        , Turn 2 UserRole [TextBlock "First steered message"]
+        , Turn 3 UserRole [TextBlock "Second steered message"]
+        , Turn 4 AssistantRole [TextBlock "Done."]
+        ]
+      rootSys = buildRootSystemPrompt "/tmp/ws" "<project_instructions>\nRule 1\n</project_instructions>"
+      wire = turnsToOpenAIPayloadWithSystem (Just rootSys) compactedTurns
+      extractRole v = parseMaybe (Aeson.withObject "m" (.: "role")) v :: Maybe Text
+      extractContent v = parseMaybe (Aeson.withObject "m" (.: "content")) v :: Maybe Text
+      roles = mapMaybe extractRole wire
+  assert "Wire payload keeps root system prompt at index 0 after compaction" (roles == ["system", "user", "assistant"])
+  assert "Root system prompt includes project instructions"
+    (case wire of
+       (m0:_) -> maybe False ("Rule 1" `T.isInfixOf`) (extractContent m0)
+       _      -> False)
+  assert "Compaction summary and consecutive user turns coalesced into single user message"
+    (case wire of
+       (_:m1:_) ->
+         let c = maybe "" id (extractContent m1)
+         in "<compaction_summary>" `T.isInfixOf` c
+            && "First steered message" `T.isInfixOf` c
+            && "Second steered message" `T.isInfixOf` c
+       _ -> False)
+
+  -- 4. Enriched synthesizeTurnSummary retains files touched and findings
+  let richTurns =
+        [ Turn 1 UserRole [TextBlock "Refactor security module"]
+        , Turn 2 AssistantRole
+            [ TextBlock "Found the root cause in Security.hs."
+            , ToolCallBlock (ToolCall "tc1" "edit_file" (Aeson.object ["path" .= ("src/Lambda/Engine/Security.hs" :: Text)]))
+            ]
+        , Turn 3 ToolRole [ToolResultBlock (ToolResult "tc1" "<specialist_report id=\"2\" role=\"surveyor\" status=\"SUCCESS\"><summary>Mapped</summary></specialist_report>" "" Nothing)]
+        ]
+      richSummary = synthesizeTurnSummary richTurns
+  assert "Enriched summary keeps Files Touched" ("src/Lambda/Engine/Security.hs" `T.isInfixOf` richSummary)
+  assert "Enriched summary keeps Recent Findings" ("Found the root cause" `T.isInfixOf` richSummary)
+  assert "Enriched summary keeps Specialist Reports" ("<specialist_report" `T.isInfixOf` richSummary)
+
+  -- 5. loadProjectContext: workspace AGENTS.md, CLAUDE.md fallback, and symlink confinement
+  let tmpRoot = "/tmp/lambda_test_99_ctx"
+      tmpHome = tmpRoot </> "home"
+      tmpWs1  = tmpRoot </> "ws1"
+      tmpWs2  = tmpRoot </> "ws2"
+      tmpOutside = tmpRoot </> "secret.txt"
+  removeDirectoryRecursive tmpRoot `catch` (\(_ :: IOException) -> pure ())
+  createDirectoryIfMissing True (tmpHome </> ".config" </> "lambdA")
+  createDirectoryIfMissing True tmpWs1
+  createDirectoryIfMissing True tmpWs2
+  TIO.writeFile (tmpWs1 </> "AGENTS.md") "Workspace rule A"
+  TIO.writeFile (tmpWs2 </> "CLAUDE.md") "Fallback Claude rule B"
+  TIO.writeFile tmpOutside "TOP_SECRET_KEY"
+  ctx1 <- loadProjectContext tmpHome tmpWs1
+  assert "loadProjectContext loads workspace AGENTS.md" ("Workspace rule A" `T.isInfixOf` ctx1 && "<project_instructions>" `T.isInfixOf` ctx1)
+  ctx2 <- loadProjectContext tmpHome tmpWs2
+  assert "loadProjectContext falls back to CLAUDE.md" ("Fallback Claude rule B" `T.isInfixOf` ctx2)
+  let tmpWsSym = tmpRoot </> "ws_sym"
+  createDirectoryIfMissing True tmpWsSym
+  createFileLink tmpOutside (tmpWsSym </> "AGENTS.md")
+  ctxSym <- loadProjectContext tmpHome tmpWsSym
+  assert "loadProjectContext blocks symlink escaping workspace" (not ("TOP_SECRET_KEY" `T.isInfixOf` ctxSym))
+
+  -- 6. readFileTool & bashTool safety edge cases (explicit line_count > 250 clamp, empty, out-of-range, binary, long-line bash)
+  let readT = readFileTool tmpWs1
+      bashT = bashTool tmpWs1 (tmpWs1 </> ".lambda" </> "artifacts")
+  TIO.writeFile (tmpWs1 </> "empty.txt") ""
+  TIO.writeFile (tmpWs1 </> "big.txt") (T.unlines [ "L" <> T.pack (show i) | i <- [1..300 :: Int] ])
+  BS.writeFile (tmpWs1 </> "bin.dat") (BS.pack [0x89, 0x50, 0x4E, 0x47, 0x00, 0x01])
+  resEmpty <- toolExecute readT MainAgent Nothing (Aeson.object ["path" .= ("empty.txt" :: Text)])
+  assert "readFileTool handles empty file cleanly" ("Empty file (0 lines)" `T.isInfixOf` resultStdout resEmpty)
+  resOob <- toolExecute readT MainAgent Nothing (Aeson.object ["path" .= ("big.txt" :: Text), "start_line" .= (999 :: Int)])
+  assert "readFileTool handles out-of-range start_line cleanly" ("exceeds file length" `T.isInfixOf` resultStdout resOob)
+  resBin <- toolExecute readT MainAgent Nothing (Aeson.object ["path" .= ("bin.dat" :: Text)])
+  assert "readFileTool rejects binary file with NUL bytes" ("Binary file detected" `T.isInfixOf` resultStderr resBin)
+  resExplicitBig <- toolExecute readT MainAgent Nothing (Aeson.object ["path" .= ("big.txt" :: Text), "start_line" .= (1 :: Int), "line_count" .= (300 :: Int)])
+  assert "readFileTool enforces 250-line cap even with explicit line_count=300 for MainAgent"
+    ("Lines 1-250 of 300" `T.isInfixOf` resultStdout resExplicitBig && "Context Mass Guard" `T.isInfixOf` resultStdout resExplicitBig)
+
+  -- Long single-line bash output (> 12KB on 1 line): must NOT emit negative omitted line count
+  resLongLine <- toolExecute bashT MainAgent Nothing (Aeson.object ["command" .= ("python3 -c 'print(\"x\" * 15000)' || printf '%0.sx' $(seq 1 15000)" :: Text)])
+  assert "bashTool spools >12KB single-line output without negative omitted count"
+    (resultArtifactPath resLongLine /= Nothing && not ("-" `T.isInfixOf` (T.take 60 (T.dropWhile (/= '[') (resultStdout resLongLine)))))
+
+  -- 7. spawn_specialist_subagent returns <specialist_report id="..."> & resume specialize_role does not leak mutating grants
+  sec <- initSecurity defaultAllowGlobs []
+  let cfg99 = defaultConfig { workspaceRoot = tmpWs1, projectContext = ctx1 }
+  es99 <- initEngineState cfg99 emptyRegistry sec
+  let reportDriver = simpleModelDriver $ \_ _ cb -> do
+        cb (ChunkToolCallStart "tc_rep" "submit_report")
+        cb (ChunkToolCallArgs "" "{\"status\":\"SUCCESS\",\"summary\":\"Surveyed\",\"details\":\"All good\"}")
+        cb ChunkDone
+      spawnTool = spawnSpecialistSubAgentTool es99 reportDriver
+  resSpawn <- toolExecute spawnTool MainAgent (Just "parent_call") (Aeson.object ["role" .= ("implementer" :: Text), "task" .= ("Test id" :: Text)])
+  assert "spawn_specialist_subagent returns id attribute in <specialist_report>"
+    ("<specialist_report id=\"1\"" `T.isInfixOf` resultStdout resSpawn)
+
+  -- Pivot implementer -> surveyor via resume_subagent in ExecMode: must NOT retain write_file* / edit_file*
+  atomically $ writeTVar (appMode es99) ExecMode
+  let resumeTool = resumeSpecialistSubAgentTool es99 reportDriver
+  resResume <- toolExecute resumeTool MainAgent (Just "parent_call_2")
+    (Aeson.object ["subagent_id" .= (1 :: Int), "specialize_role" .= ("surveyor" :: Text), "guidance" .= ("Audit read-only" :: Text)])
+  assert "resume_subagent returns id attribute in <specialist_report>"
+    ("<specialist_report id=\"1\"" `T.isInfixOf` resultStdout resResume)
+  subs99 <- readTVarIO (appSubAgents es99)
+  case Map.lookup 1 subs99 of
+    Nothing -> failTest "Subagent #1 missing after resume"
+    Just t1 -> do
+      let allows = sapAllow (subAgentPermissions t1)
+      assert "Pivoting implementer -> surveyor drops write_file* grant" (not (Set.member "write_file*" allows))
+      assert "Pivoting implementer -> surveyor drops edit_file* grant" (not (Set.member "edit_file*" allows))
+      assert "Resumed subagent continuation turn includes updated Operating Mode"
+        (any (\turn -> any (\b -> case b of TextBlock txt -> "[EXEC MODE - Mutating]" `T.isInfixOf` txt; _ -> False) (turnBlocks turn)) (subAgentTurns t1))
+
+  removeDirectoryRecursive tmpRoot `catch` (\(_ :: IOException) -> pure ())
+  putStrLn "  -> OK: Pi-grade ergonomics, wire safety, compaction, and parallel subagent invariants verified."
+

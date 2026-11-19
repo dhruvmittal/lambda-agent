@@ -23,6 +23,7 @@ import System.Posix.Signals (signalProcessGroup, sigTERM, sigKILL)
 import qualified Data.Aeson as Aeson
 import Data.Aeson ((.=), (.:), (.:?), (.!=))
 import Data.Aeson.Types (parseEither)
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe)
@@ -34,8 +35,8 @@ import Network.HTTP.Client
 import Network.HTTP.Client.TLS (newTlsManager)
 import Network.HTTP.Types.Header (hUserAgent, hAccept)
 import System.Directory (doesFileExist, doesDirectoryExist, listDirectory, createDirectoryIfMissing, getFileSize, removeFile)
-import System.FilePath (takeDirectory, isAbsolute, (</>))
-import System.IO (withFile, IOMode(..), hSetBuffering, BufferMode(..), hFlush)
+import System.FilePath (takeDirectory, takeFileName, isAbsolute, (</>))
+import System.IO (withFile, IOMode(..), SeekMode(..), hSetBuffering, BufferMode(..), hFlush, hClose, hSeek, openTempFile)
 import System.Process.Typed
 import System.Timeout (timeout)
 import Data.Time.Clock (getCurrentTime)
@@ -106,7 +107,7 @@ bashTool wsRoot artDir = ToolDefinition
   , toolCapability = Destructive
   , toolIsMcp = False
   , toolScope = Universal
-  , toolExecute = \_caller _mCallId args -> do
+  , toolExecute = \caller _mCallId args -> do
       case parseEither (Aeson.withObject "bash" $ \o -> (,) <$> o .: "command" <*> (o .:? "timeout_seconds")) args of
         Left err -> pure $ ToolResult "" "" ("Invalid arguments: " <> T.pack err) Nothing
         Right (cmd, mTimeout) -> do
@@ -120,8 +121,8 @@ bashTool wsRoot artDir = ToolDefinition
           now <- getCurrentTime
           let ts = formatTime defaultTimeLocale "%Y%m%d_%H%M%S" now
               pico = take 6 (formatTime defaultTimeLocale "%q" now)
-              filename = "bash_" <> ts <> "_" <> pico <> ".log"
-              logPath = artDir </> filename
+          (logPath, hLog) <- openTempFile artDir ("bash_" <> ts <> "_" <> pico <> "_.log")
+          let filename = takeFileName logPath
 
           let killProcessGroup p = do
                 mPid <- getPid p
@@ -134,7 +135,7 @@ bashTool wsRoot artDir = ToolDefinition
                     pure ()
                   _ -> pure ()
 
-          res <- withFile logPath WriteMode $ \hLog -> do
+          res <- do
             hSetBuffering hLog LineBuffering
             let pConf = setStdin closed
                       $ setStdout (useHandleOpen hLog)
@@ -142,7 +143,7 @@ bashTool wsRoot artDir = ToolDefinition
                       $ setWorkingDir wsRoot
                       $ setCreateGroup True
                       $ shell (T.unpack cmd)
-            try $ withProcessTerm pConf $ \p -> do
+            r <- try $ withProcessTerm pConf $ \p -> do
               let runProc = do
                     let waitExit = atomically $ waitExitCodeSTM p
                     mRes <- if isUnbounded
@@ -156,6 +157,8 @@ bashTool wsRoot artDir = ToolDefinition
                         hFlush hLog
                         pure (Just code)
               runProc `onException` killProcessGroup p
+            hClose hLog
+            pure r
 
           fSize <- getFileSize logPath
           case res of
@@ -167,33 +170,41 @@ bashTool wsRoot artDir = ToolDefinition
             Right Nothing ->
               pure $ ToolResult "" "" ("Command timed out after " <> T.pack (show effTimeout) <> " seconds.") (if fSize > 0 then Just logPath else Nothing)
             Right (Just exitCode) -> do
+              let (maxBytes, maxLines) = case caller of
+                    MainAgent      -> (12288 :: Int, 120 :: Int)
+                    SubAgentId _ _ -> (24576 :: Int, 250 :: Int)
               (compactOutput, mArtifact) <-
-                if fSize <= 2000
+                if fSize <= fromIntegral maxBytes
                   then do
-                    content <- TIO.readFile logPath
-                    let ls = T.lines content
-                    if length ls <= 40
+                    rawBs <- withFile logPath ReadMode (`BS.hGet` maxBytes)
+                    let content = TE.decodeUtf8Lenient rawBs
+                        ls = T.lines content
+                        lineCnt = length ls
+                    if lineCnt <= maxLines
                       then do
                         _ <- try (removeFile logPath) :: IO (Either SomeException ())
                         pure (content, Nothing)
                       else do
-                        let headLines = take 15 ls
-                            tailLines = drop (max 0 (length ls - 25)) ls
+                        let omitted = lineCnt - maxLines
+                            tailLines = drop omitted ls
                             summaryText = T.unlines
-                              [ T.unlines headLines
-                              , "... [" <> T.pack (show (length ls - 40)) <> " lines omitted. Full dump spooled out-of-band] ..."
+                              [ "... [" <> T.pack (show omitted) <> " earlier lines omitted. Full dump spooled out-of-band] ..."
                               , T.unlines tailLines
                               ]
-                            pointer = formatArtifactPointer (T.pack filename) logPath summaryText (length ls)
+                            pointer = formatArtifactPointer (T.pack filename) logPath summaryText lineCnt
                         pure (pointer, Just logPath)
                   else do
-                    content <- TIO.readFile logPath
-                    let ls = T.lines content
-                        headLines = take 15 ls
-                        tailLines = drop (max 0 (length ls - 25)) ls
+                    rawBs <- withFile logPath ReadMode $ \h -> do
+                      hSeek h SeekFromEnd (negate (fromIntegral maxBytes))
+                      BS.hGet h maxBytes
+                    let decoded = TE.decodeUtf8Lenient rawBs
+                        ls0 = T.lines decoded
+                        ls = case ls0 of
+                          (_ : rest@(_ : _)) -> rest
+                          _                  -> ls0
+                        tailLines = drop (max 0 (length ls - maxLines)) ls
                         summaryText = T.unlines
-                          [ T.unlines headLines
-                          , "... [" <> T.pack (show (length ls - 40)) <> " lines omitted. Full dump spooled out-of-band] ..."
+                          [ "... [Output exceeded " <> T.pack (show maxBytes) <> " bytes (" <> T.pack (show fSize) <> " bytes total); showing tail. Full dump spooled out-of-band] ..."
                           , T.unlines tailLines
                           ]
                         pointer = formatArtifactPointer (T.pack filename) logPath summaryText (length ls)
@@ -301,18 +312,53 @@ readFileTool wsRoot = ToolDefinition
             else if not isFile
               then pure $ ToolResult "" "" ("File not found: " <> relPath) Nothing
               else do
-                fileContent <- TIO.readFile fullPath
-                let allLines = T.lines fileContent
-                    totalLines = length allLines
-                    sIdx = maybe 0 (\s -> max 0 (s - 1)) mStart
-                    cCount = maybe (totalLines - sIdx) (max 0) mCount
-                    selectedLines = take cCount (drop sIdx allLines)
-                    numbered = zipWith (\n l -> T.pack (show n) <> ": " <> l) [sIdx + 1 ..] selectedLines
-                if caller == MainAgent && cCount > 250
-                  then pure $ ToolResult "" ""
-                         ("Context Mass Guard: Direct file read of " <> T.pack (show cCount) <> " lines is restricted for the primary agent to prevent context explosion. Please delegate reading/surveying large files to a subagent via 'spawn_specialist_subagent', or specify 'start_line' and a 'line_count' (<= 250) for targeted inspection.")
-                         Nothing
-                  else pure $ ToolResult "" (T.unlines numbered) "" Nothing
+                let maxReadBytes = 2 * 1024 * 1024 :: Int
+                rawBs <- withFile fullPath ReadMode (`BS.hGet` maxReadBytes)
+                if BS.elem 0 (BS.take 8192 rawBs)
+                  then pure $ ToolResult "" "" ("Binary file detected (contains NUL bytes): " <> relPath) Nothing
+                  else do
+                    let fileContent = TE.decodeUtf8Lenient rawBs
+                        allLines = T.lines fileContent
+                        totalLines = length allLines
+                        sIdx = maybe 0 (\s -> max 0 (s - 1)) mStart
+                        (maxLines, maxBytes) = case caller of
+                          MainAgent      -> (250 :: Int, 24576 :: Int)
+                          SubAgentId _ _ -> (1000 :: Int, 65536 :: Int)
+                    if totalLines == 0
+                      then pure $ ToolResult "" ("[File: " <> relPath <> " | Empty file (0 lines)]") "" Nothing
+                      else if sIdx >= totalLines
+                        then pure $ ToolResult "" ("[File: " <> relPath <> " | Requested start_line " <> T.pack (show (sIdx + 1)) <> " exceeds file length (" <> T.pack (show totalLines) <> " lines)]") "" Nothing
+                        else do
+                          let availLines = totalLines - sIdx
+                              reqCount = maybe availLines (max 0) mCount
+                              lineClamped = min maxLines (min reqCount availLines)
+                              lineTruncated = reqCount > maxLines && availLines > maxLines
+                              selectedLines = take lineClamped (drop sIdx allLines)
+                              numbered = zipWith (\n l -> T.pack (show n) <> ": " <> l) [sIdx + 1 ..] selectedLines
+                              takeByBytes _ [] = ([], False)
+                              takeByBytes remB (x:xs) =
+                                let bLen = BS.length (TE.encodeUtf8 x) + 1
+                                in if bLen <= remB
+                                     then let (rest, trunc) = takeByBytes (remB - bLen) xs
+                                          in (x : rest, trunc)
+                                     else ([], True)
+                              (keptLines, byteTruncated) = case takeByBytes maxBytes numbered of
+                                ([], True) -> case numbered of
+                                  (firstL : _) -> ([T.take maxBytes firstL <> " ... [line truncated]"], True)
+                                  []           -> ([], False)
+                                res -> res
+                              startNum = sIdx + 1
+                              endNum = sIdx + length keptLines
+                              eofTag = if endNum >= totalLines && not byteTruncated then " (EOF)" else ""
+                              header = "[File: " <> relPath <> " | Lines " <> T.pack (show startNum) <> "-" <> T.pack (show endNum) <> " of " <> T.pack (show totalLines) <> eofTag <> "]"
+                              wasTruncated = lineTruncated || byteTruncated
+                              footer
+                                | not wasTruncated = []
+                                | caller == MainAgent =
+                                    ["[Context Mass Guard: Showing lines " <> T.pack (show startNum) <> "-" <> T.pack (show endNum) <> " of " <> T.pack (show totalLines) <> ". Pass start_line=" <> T.pack (show (endNum + 1)) <> " for more, or delegate full-file analysis to 'spawn_specialist_subagent'.]"]
+                                | otherwise =
+                                    ["[Truncated: Showing lines " <> T.pack (show startNum) <> "-" <> T.pack (show endNum) <> " of " <> T.pack (show totalLines) <> ". Pass start_line=" <> T.pack (show (endNum + 1)) <> " to continue.]"]
+                          pure $ ToolResult "" (T.unlines ([header] ++ keptLines ++ footer)) "" Nothing
   }
 
 -- | File writing tool

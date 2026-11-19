@@ -34,7 +34,7 @@ import Network.HTTP.Types.Status (statusCode, statusMessage)
 
 import Lambda.Config (Config(..), isLocalEndpoint, resolveModelWithConfig)
 import Lambda.Core.ModelDriver (ModelDriver(..))
-import Lambda.Engine.Compactor (turnsToOpenAIPayload)
+import Lambda.Engine.Compactor (buildRootSystemPrompt, turnsToOpenAIPayloadWithSystem)
 import Lambda.Types
 
 openAiDriver :: Config -> IO ModelDriver
@@ -69,7 +69,8 @@ openAiDynamicDriverWithManager manager cfg@Config{..} getActiveModel = ModelDriv
          | otherwise -> do
               let cleanBase = T.dropWhileEnd (== '/') apiBaseUrl
                   endpoint = T.unpack cleanBase <> "/chat/completions"
-                  messages = turnsToOpenAIPayload turns
+                  rootSys = buildRootSystemPrompt workspaceRoot projectContext
+                  messages = turnsToOpenAIPayloadWithSystem (Just rootSys) turns
                   baseBody =
                     [ "model"    .= curModel
                     , "messages" .= messages

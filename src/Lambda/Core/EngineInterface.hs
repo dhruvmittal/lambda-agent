@@ -28,7 +28,7 @@ import Lambda.Core.ModelDriver (ModelDriver(..))
 import Network.HTTP.Client.TLS (newTlsManager)
 
 import Lambda.Core.ToolProvider (emptyRegistry, registerTools, registerTool, toolsToOpenAISchema)
-import Lambda.Engine.Compactor (compactHistory, estimateTotalTokens)
+import Lambda.Engine.Compactor (compactHistory, compactionThreshold, estimateTotalTokens)
 import Lambda.Engine.Dispatcher (executeToolDispatch)
 import Lambda.Engine.Security (SecurityState(..), initSecurityWithRoot)
 import Lambda.Engine.Session (exportSessionTrace, loadSession, forkSession, deriveTitle, Session(..))
@@ -143,7 +143,10 @@ startEngineLoop state driver channels = do
 
 drainActiveWorkers :: AppEngineState -> TVar (Maybe (Async ())) -> TVar (Map.Map Int (Async ())) -> IO ()
 drainActiveWorkers AppEngineState{..} activeTaskVar resumedAsyncsVar = do
-  atomically $ writeTVar appInterrupted True
+  atomically $ do
+    writeTVar appInterrupted True
+    _ <- flushTBQueue appPendingPrompts
+    pure ()
   mTask <- atomically $ swapTVar activeTaskVar Nothing
   resumed <- atomically $ swapTVar resumedAsyncsVar Map.empty
   subAsyncs <- atomically $ swapTVar appSubAgentAsyncs Map.empty
@@ -166,6 +169,7 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
     CmdInterrupt -> do
       (subAsyncs, mTask, resumed) <- atomically $ do
         writeTVar appInterrupted True
+        _ <- flushTBQueue appPendingPrompts
         subs <- readTVar appSubAgents
         let (changed, updatedSubs) = Map.mapAccumWithKey (\acc _k t ->
               if subAgentStatus t == SubAgentRunning
@@ -297,6 +301,7 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       loop
     CmdRewindTurns n -> do
       mRewound <- atomically $ do
+        _ <- flushTBQueue appPendingPrompts
         ts <- readTVar appTurns
         if length ts <= 1
           then pure Nothing
@@ -340,70 +345,108 @@ engineWorkerLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       _ <- addTurn engineState SystemRole [TextBlock $ "Debug execution trace exported to: " <> T.pack path]
       loop
     CmdUserPrompt promptText -> do
-      -- If prior turn task is still active, cancel it before running new prompt
-      mPrev <- readTVarIO activeTaskVar
-      case mPrev of
-        Just prev -> cancel prev
-        Nothing   -> pure ()
+      -- If a prior turn task is actively running (and not interrupted), queue the prompt
+      -- non-destructively for mid-turn steering / follow-up instead of cancelling in-flight work.
+      queued <- atomically $ do
+        mPrev <- readTVar activeTaskVar
+        intr  <- readTVar appInterrupted
+        case mPrev of
+          Just _ | not intr -> do
+            full <- isFullTBQueue appPendingPrompts
+            if full
+              then pure False
+              else do
+                writeTBQueue appPendingPrompts promptText
+                pure True
+          _ -> pure False
 
-      -- 1. Reset interrupt flag, update State Vector, and add user turn
-      atomically $ do
-        writeTVar appInterrupted False
-        curVec <- readTVar appStateVector
-        let linesVec = T.lines curVec
-            hasGoal = any ("GOAL:" `T.isPrefixOf`) linesVec
-            currentGoal = case filter ("GOAL:" `T.isPrefixOf`) linesVec of
-              (g:_) -> T.strip (T.drop 5 g)
-              []    -> "Awaiting task"
-            newGoal
-              | "/goal " `T.isPrefixOf` promptText = T.strip (T.drop 6 promptText)
-              | currentGoal == "Awaiting task" || T.null currentGoal = deriveTitle promptText
-              | otherwise = currentGoal
-            updatedVec = if hasGoal
-              then T.unlines $ map (\l ->
-                if | "GOAL:" `T.isPrefixOf` l -> "GOAL: " <> newGoal
-                   | "BLOCKED_ON:" `T.isPrefixOf` l -> "BLOCKED_ON: Model execution"
-                   | otherwise -> l) linesVec
-              else "GOAL: " <> newGoal
-                <> "\nINVARIANTS: [Safe workspace ops, User grant required]"
-                <> "\nACTIVE_HYPOTHESIS: Formulating execution path"
-                <> "\nBLOCKED_ON: Model execution"
-        writeTVar appStateVector updatedVec
-        writeTQueue appEventQueue (EvWorkingStateUpdate updatedVec)
+      if queued
+        then loop
+        else do
+          mPrev <- readTVarIO activeTaskVar
+          case mPrev of
+            Just prev -> cancel prev
+            Nothing   -> pure ()
 
-      _ <- addTurn engineState UserRole [TextBlock promptText]
+          -- 1. Reset interrupt flag, update State Vector, and add user turn
+          atomically $ do
+            writeTVar appInterrupted False
+            curVec <- readTVar appStateVector
+            let linesVec = T.lines curVec
+                hasGoal = any ("GOAL:" `T.isPrefixOf`) linesVec
+                currentGoal = case filter ("GOAL:" `T.isPrefixOf`) linesVec of
+                  (g:_) -> T.strip (T.drop 5 g)
+                  []    -> "Awaiting task"
+                newGoal
+                  | "/goal " `T.isPrefixOf` promptText = T.strip (T.drop 6 promptText)
+                  | currentGoal == "Awaiting task" || T.null currentGoal = deriveTitle promptText
+                  | otherwise = currentGoal
+                updatedVec = if hasGoal
+                  then T.unlines $ map (\l ->
+                    if | "GOAL:" `T.isPrefixOf` l -> "GOAL: " <> newGoal
+                       | "BLOCKED_ON:" `T.isPrefixOf` l -> "BLOCKED_ON: Model execution"
+                       | otherwise -> l) linesVec
+                  else "GOAL: " <> newGoal
+                    <> "\nINVARIANTS: [Safe workspace ops, User grant required]"
+                    <> "\nACTIVE_HYPOTHESIS: Formulating execution path"
+                    <> "\nBLOCKED_ON: Model execution"
+            writeTVar appStateVector updatedVec
+            writeTQueue appEventQueue (EvWorkingStateUpdate updatedVec)
 
-      -- Check if automatic context compaction is required prior to LLM call
-      atomically $ do
-        ts <- readTVar appTurns
-        let maxLimit = contextWindowLimit appConfig
-        if estimateTotalTokens ts > maxLimit
-          then writeTVar appTurns (compactHistory maxLimit 4 ts)
-          else pure ()
+          _ <- addTurn engineState UserRole [TextBlock promptText]
 
-      -- 2. Run agent conversation loop in async task so cmdQueue remains responsive
-      let maxBudget = max 1 (maxTurnBudget appConfig)
-      turnTask <- async $ (`finally` cleanupTurn) $ do
-        atomically $ writeTVar appActiveTask True
-        turnRes <- try $ runAgentTurnLoop engineState driver channels 1 maxBudget
-        case turnRes of
-          Left (ex :: SomeException) -> do
-            intr <- readTVarIO appInterrupted
-            unless intr $
-              emitEngineEvent engineState (EvError $ "Engine loop failure: " <> T.pack (show ex))
-          Right () -> pure ()
+          -- Check if proactive context compaction is required prior to LLM call
+          atomically $ do
+            ts <- readTVar appTurns
+            liveLimit <- readTVar appContextLimit
+            let triggerLimit = compactionThreshold liveLimit
+            when (estimateTotalTokens ts > triggerLimit) $
+              writeTVar appTurns (compactHistory triggerLimit 4 ts)
 
-        -- Auto-save session state before signalling task completion so telemetry sees the persisted file
-        persistCurrentSession engineState
+          -- 2. Run agent conversation loop in async task so cmdQueue remains responsive
+          let maxBudget = max 1 (maxTurnBudget appConfig)
+              runUntilDrained = do
+                turnRes <- try $ runAgentTurnLoop engineState driver channels 1 maxBudget
+                case turnRes of
+                  Left (ex :: SomeException) -> do
+                    intr <- readTVarIO appInterrupted
+                    unless intr $
+                      emitEngineEvent engineState (EvError $ "Engine loop failure: " <> T.pack (show ex))
+                  Right () -> do
+                    -- Atomically check for follow-up prompts before releasing activeTaskVar
+                    mNext <- atomically $ do
+                      intr <- readTVar appInterrupted
+                      if intr
+                        then do
+                          writeTVar activeTaskVar Nothing
+                          pure Nothing
+                        else do
+                          pending <- flushTBQueue appPendingPrompts
+                          if null pending
+                            then do
+                              writeTVar activeTaskVar Nothing
+                              pure Nothing
+                            else pure (Just (T.intercalate "\n\n" pending))
+                    case mNext of
+                      Nothing -> pure ()
+                      Just nextPrompt -> do
+                        _ <- addTurn engineState UserRole [TextBlock nextPrompt]
+                        runUntilDrained
+          turnTask <- async $ (`finally` cleanupTurn) $ do
+            atomically $ writeTVar appActiveTask True
+            runUntilDrained
 
-        atomically $ do
-          curVec <- readTVar appStateVector
-          let updatedVec = T.unlines $ map (\l -> if "BLOCKED_ON:" `T.isPrefixOf` l then "BLOCKED_ON: User input" else l) (T.lines curVec)
-          writeTVar appStateVector updatedVec
-          writeTQueue appEventQueue (EvWorkingStateUpdate updatedVec)
+            -- Auto-save session state before signalling task completion so telemetry sees the persisted file
+            persistCurrentSession engineState
 
-      atomically $ writeTVar activeTaskVar (Just turnTask)
-      loop
+            atomically $ do
+              curVec <- readTVar appStateVector
+              let updatedVec = T.unlines $ map (\l -> if "BLOCKED_ON:" `T.isPrefixOf` l then "BLOCKED_ON: User input" else l) (T.lines curVec)
+              writeTVar appStateVector updatedVec
+              writeTQueue appEventQueue (EvWorkingStateUpdate updatedVec)
+
+          atomically $ writeTVar activeTaskVar (Just turnTask)
+          loop
   where
     cleanupTurn = atomically $ do
       writeTVar activeTaskVar Nothing
@@ -425,7 +468,17 @@ runAgentTurnLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
       emitEngineEvent engineState
         (EvError $ "Turn budget limit of " <> T.pack (show maxTurns) <> " reached for current prompt. To allow longer tool loops, increase 'max_turn_budget' in .lambda/config.json.")
     else do
-      turns <- readTVarIO appTurns
+      -- Proactive mid-loop compaction using live appContextLimit
+      turns <- atomically $ do
+        ts <- readTVar appTurns
+        liveLimit <- readTVar appContextLimit
+        let triggerLimit = compactionThreshold liveLimit
+        if estimateTotalTokens ts > triggerLimit
+          then do
+            let compacted = compactHistory triggerLimit 4 ts
+            writeTVar appTurns compacted
+            pure compacted
+          else pure ts
       mode <- readTVarIO appMode
       reg <- readTVarIO appToolRegistry
       let toolSchemas = toolsToOpenAISchema mode reg
@@ -487,7 +540,12 @@ runAgentTurnLoop engineState@AppEngineState{..} driver channels@EngineChannels{.
               results <- runToolsWithInterrupt engineState toolCalls
               _ <- addTurn engineState ToolRole (map ToolResultBlock results)
               stillActive <- not <$> readTVarIO appInterrupted
-              when stillActive $
+              when stillActive $ do
+                -- Drain any queued mid-turn steering prompts strictly AFTER ToolRole results
+                steered <- atomically $ flushTBQueue appPendingPrompts
+                unless (null steered) $ do
+                  _ <- addTurn engineState UserRole [TextBlock (T.intercalate "\n\n" steered)]
+                  pure ()
                 runAgentTurnLoop engineState driver channels (turnIdx + 1) maxTurns
   where
     runToolsWithInterrupt es tcs = do

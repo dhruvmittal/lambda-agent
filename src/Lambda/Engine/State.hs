@@ -62,6 +62,7 @@ data AppEngineState = AppEngineState
   , appSessionDir   :: !FilePath
   , appUndoStack    :: !(TVar [[Turn]])
   , appActiveTask   :: !(TVar Bool)
+  , appPendingPrompts :: !(TBQueue Text)
   }
 
 initEngineState :: Config -> ToolRegistry -> SecurityState -> IO AppEngineState
@@ -96,6 +97,7 @@ initEngineStateWithSession cfg reg sec maybeSess = do
   activeModVar <- newTVarIO (modelName cfg)
   ctxLimitVar  <- newTVarIO (contextWindowLimit cfg)
   activeTask   <- newTVarIO False
+  pendingPromptsQ <- newTBQueueIO 32
   subAsyncsVar <- newTVarIO Map.empty
   promptCountsVar <- newTVarIO (Map.empty :: Map Int Int)
   let secWithStatus = sec
@@ -143,6 +145,7 @@ initEngineStateWithSession cfg reg sec maybeSess = do
     , appSessionDir   = sessDir
     , appUndoStack    = undoVar
     , appActiveTask   = activeTask
+    , appPendingPrompts = pendingPromptsQ
     }
 
 -- | Derives the current canonical lifecycle state and telemetry snapshot in STM

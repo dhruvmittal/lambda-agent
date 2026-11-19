@@ -265,14 +265,14 @@ runEphemeralSubAgent
   -> SubAgentSpec
   -> IO (Either Text SubAgentReport)
 runEphemeralSubAgent engineState driver spec =
-  runEphemeralSubAgentWithCallId engineState driver Nothing spec
+  fmap (fmap snd) (runEphemeralSubAgentWithCallId engineState driver Nothing spec)
 
 runEphemeralSubAgentWithCallId
   :: AppEngineState
   -> ModelDriver
   -> Maybe Text
   -> SubAgentSpec
-  -> IO (Either Text SubAgentReport)
+  -> IO (Either Text (Int, SubAgentReport))
 runEphemeralSubAgentWithCallId engineState@AppEngineState{..} driver mParentCallId SubAgentSpec{..} = do
   turns <- readTVarIO appTurns
   let parentTurnId = if null turns then Nothing else Just (turnId (last turns))
@@ -291,9 +291,19 @@ runEphemeralSubAgentWithCallId engineState@AppEngineState{..} driver mParentCall
         if effectiveBudget == 1
           then "\n\n[CRITICAL NOTICE: SINGLE-TURN BUDGET (1/1). You have exactly ONE turn. You MUST synthesize your answer and call `submit_report` on this turn.]"
           else ""
+      rawProjCtx = T.strip (projectContext appConfig)
+      subProjCtxSection =
+        if T.null rawProjCtx
+          then []
+          else
+            let capped = if T.length rawProjCtx > 6144
+                  then T.take 6144 rawProjCtx <> "\n... [project instructions truncated for subagent]\n</project_instructions>"
+                  else rawProjCtx
+            in ["", capped]
       sysPrompt = T.unlines
-        [ specPrompt
+        ([ specPrompt
         , ""
+        , "## Workspace: " <> T.pack (workspaceRoot appConfig)
         , "## Operating Mode: " <> (if curMode == PlanMode then "[PLAN MODE - Read-Only]" else "[EXEC MODE - Mutating]")
         , "## Turn Budget: " <> T.pack (show effectiveBudget) <> " turns"
         , "## Assigned Objective: " <> subTaskDescription
@@ -301,7 +311,7 @@ runEphemeralSubAgentWithCallId engineState@AppEngineState{..} driver mParentCall
         , "## Reporting Invariant:"
         , "Operate within your turn budget (" <> T.pack (show effectiveBudget) <> " turns maximum). You have access to the synthetic tool `submit_report`."
         , "When your work, survey, diagnosis, profiling, or implementation is complete — or on your final turn — you MUST call `submit_report` with status, summary, and details."
-        ] <> singleTurnNotice
+        ] ++ subProjCtxSection) <> singleTurnNotice
       initTurns =
         [ Turn 1 SystemRole [TextBlock sysPrompt]
         , Turn 2 UserRole [TextBlock ("Begin task: " <> subTaskDescription)]
@@ -310,13 +320,14 @@ runEphemeralSubAgentWithCallId engineState@AppEngineState{..} driver mParentCall
   updateSubAgentTurns engineState sId initTurns
 
   -- Step 3: Run execution loop with per-subagent cancellation and artifact capture
-  executeSubAgentSession engineState effectiveDriver sId subPerms subTurnsVar 1 effectiveBudget
+  fmap (fmap (\rep -> (sId, rep))) (executeSubAgentSession engineState effectiveDriver sId subPerms subTurnsVar 1 effectiveBudget)
 
--- | Compacts subagent conversation history when total tokens exceed 85% of the model context limit,
+-- | Compacts subagent conversation history when total tokens exceed 85% of the model context limit
+-- (capped at 200k tokens to avoid context rot on 1M-window models),
 -- preserving the leading specialist SystemRole prompt turn and tool-call pairing.
 compactSubAgentTurns :: Int -> [Turn] -> [Turn]
 compactSubAgentTurns targetLimit turns =
-  let triggerLimit = max 64 ((targetLimit * 85) `div` 100)
+  let triggerLimit = max 64 (min 200000 ((targetLimit * 85) `div` 100))
   in if estimateTotalTokens turns <= triggerLimit
        then turns
        else case turns of
@@ -592,7 +603,7 @@ spawnSpecialistSubAgentTool engineState driver =
             , "granted_capabilities" .= Aeson.object
                 [ "type" .= ("array" :: Text)
                 , "items" .= Aeson.object [ "type" .= ("string" :: Text) ]
-                , "description" .= ("Optional list of capability glob patterns (e.g. ['read_file*', 'grep_search*', 'sd_*'])." :: Text)
+                , "description" .= ("Optional list of capability glob patterns (e.g. ['read_file*', 'edit_file*', 'sd_*', 'git diff*'])." :: Text)
                 ]
             ]
         , "required" .= (["role", "task"] :: [Text])
@@ -610,8 +621,8 @@ spawnSpecialistSubAgentTool engineState driver =
             res <- runEphemeralSubAgentWithCallId engineState driver mCallId spec
             case res of
               Left err -> pure $ ToolResult "" "" ("Specialist subagent failed: " <> err) Nothing
-              Right rep@SubAgentReport{..} -> do
-                let summary = formatSpecialistReportXml Nothing role rep
+              Right (sId, rep@SubAgentReport{..}) -> do
+                let summary = formatSpecialistReportXml (Just sId) role rep
                 pure $ ToolResult "" summary "" (fmap T.unpack reportArtifact)
     }
   where
@@ -659,8 +670,8 @@ resumeEphemeralSubAgentWithCallId engineState@AppEngineState{..} driver mParentC
                 effectiveRole = case mNewRole of
                   Just r | not (T.null (T.strip r)) -> T.strip r
                   _ -> currentRole
-                isSpecialized = effectiveRole /= currentRole
-                prevAllow = Set.toList (sapAllow (subAgentPermissions task))
+                isSpecialized = T.toLower effectiveRole /= T.toLower currentRole
+                prevAllow = if isSpecialized then [] else Set.toList (sapAllow (subAgentPermissions task))
                 prevDeny  = Set.toList (sapDeny (subAgentPermissions task))
                 (specPrompt, defaultBud, effectiveDriver, subPerms) =
                   resolveSpecialistSetup appConfig curMode driver effectiveRole prevAllow prevDeny additionalGrants
@@ -668,6 +679,7 @@ resumeEphemeralSubAgentWithCallId engineState@AppEngineState{..} driver mParentC
                 newTotalBudget = max 1 (subAgentBudget task + effectiveAddBudget)
                 continuationLines =
                   [ "## Task Resumed"
+                  , "## Operating Mode: " <> (if curMode == PlanMode then "[PLAN MODE - Read-Only]" else "[EXEC MODE - Mutating]")
                   , "Your turn budget has been extended by " <> T.pack (show effectiveAddBudget) <> " turns (total budget: " <> T.pack (show newTotalBudget) <> " turns)."
                   ]
                   ++ [ "## Role Specialization: " <> effectiveRole | isSpecialized ]
@@ -747,7 +759,7 @@ resumeSpecialistSubAgentTool engineState driver =
               Right rep@SubAgentReport{..} -> do
                 subsAfter <- readTVarIO (appSubAgents engineState)
                 let actualRole = maybe (fromMaybe "specialist" mRole) subAgentRole (Map.lookup sId subsAfter)
-                    summary = formatSpecialistReportXml Nothing actualRole rep
+                    summary = formatSpecialistReportXml (Just sId) actualRole rep
                 pure $ ToolResult "" summary "" (fmap T.unpack reportArtifact)
     }
   where

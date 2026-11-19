@@ -24,6 +24,7 @@ module Lambda.Config
   , curatedModels
   , resolveEnvTemplates
   , loadConfig
+  , loadProjectContext
   , parseMarkdownAgent
   , loadMarkdownAgentsFromDir
   , loadAllMarkdownAgents
@@ -38,7 +39,7 @@ module Lambda.Config
 
 import Control.Applicative ((<|>))
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
-import Control.Exception (catch, IOException)
+import Control.Exception (SomeException, catch, try, IOException)
 import Control.Monad (forM)
 import Lambda.Types (Decision(..))
 import Data.Char (isSpace)
@@ -60,9 +61,9 @@ import qualified Data.Text.Encoding as TE
 import qualified Data.Text.IO as TIO
 import qualified Data.Vector as V
 import GHC.Generics (Generic)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getHomeDirectory, listDirectory)
+import System.Directory (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getHomeDirectory, listDirectory)
 import System.Environment (lookupEnv)
-import System.FilePath (dropExtension, takeExtension, (</>))
+import System.FilePath (dropExtension, splitDirectories, takeExtension, (</>))
 import System.IO.Unsafe (unsafePerformIO)
 import Text.Read (readMaybe)
 
@@ -127,12 +128,16 @@ defaultSpecialists = Map.fromList
             , "Your mission is to map symbols, locate definitions, trace imports, and verify architectural invariants."
             , "Operational Invariants:"
             , "1. STRICT READ-ONLY: Never modify workspace files. Only read-only tools are permitted."
-            , "2. NO PATH HALLUCINATION: Never guess paths or symbols. Always verify via find_by_name, grep_search, or sd_read/sd_recall."
+            , "2. NO PATH HALLUCINATION: Never guess paths or symbols. Always verify via read_file, list_directory, read-only bash (rg, git, ls, tree, stat), or sd_read/sd_recall."
             , "3. PRECISE REFERENCES: Return exact file paths and line ranges (e.g. src/Foo.hs:L40-L65)."
             , "When your survey is complete, call `submit_report` with status, summary, details, and any artifact path."
             ]
         , specialistBudget       = 16
-        , specialistCapabilities = ["read_file*", "list_directory*", "grep_search*", "find_by_name*", "fetch_url*", "sd_*", "git status*", "git diff*", "git log*"]
+        , specialistCapabilities =
+            [ "read_file*", "list_directory*", "fetch_url*", "sd_*"
+            , "git status*", "git diff*", "git log*", "git show*", "git blame*"
+            , "rg *", "grep *", "ls", "ls *", "tree*", "stat *", "wc *", "head *", "tail *"
+            ]
         , specialistDenyGlobs    = []
         , specialistModel        = Nothing
         }
@@ -150,7 +155,7 @@ defaultSpecialists = Map.fromList
             , "When your diagnosis is complete, call `submit_report` with status, summary, details, and any artifact path."
             ]
         , specialistBudget       = 14
-        , specialistCapabilities = ["read_file*", "grep_search*", "find_by_name*", "cabal test*", "ctest*", "pytest*", "bash*", "sd_*"]
+        , specialistCapabilities = ["read_file*", "list_directory*", "cabal test*", "ctest*", "pytest*", "bash*", "sd_*"]
         , specialistDenyGlobs    = []
         , specialistModel        = Nothing
         }
@@ -186,7 +191,7 @@ defaultSpecialists = Map.fromList
             , "When changes are complete, call `submit_report` with status, summary, details, and the modified file paths."
             ]
         , specialistBudget       = 12
-        , specialistCapabilities = ["write_file*", "replace_lines*", "read_file*", "sd_read*"]
+        , specialistCapabilities = ["write_file*", "edit_file*", "read_file*", "sd_read*"]
         , specialistDenyGlobs    = []
         , specialistModel        = Nothing
         }
@@ -231,6 +236,7 @@ data Config = Config
   , themeName           :: !Text
   , customThemes        :: !(Map Text (Map Text Text))
   , mouseSupport        :: !Bool
+  , projectContext      :: !Text
   } deriving stock (Eq, Show, Generic)
 
 instance Aeson.ToJSON Config where
@@ -262,7 +268,7 @@ instance Aeson.FromJSON Config where
     customHeaders      <- obj .:? "custom_headers" .!= Map.empty
     alwaysAllowGlobs   <- obj .:? "always_allow_globs" .!= defaultAllowGlobs
     alwaysDenyGlobs    <- obj .:? "always_deny_globs" .!= defaultDenyGlobs
-    maxTurnBudget      <- obj .:? "max_turn_budget" .!= 30
+    maxTurnBudget      <- obj .:? "max_turn_budget" .!= 60
     contextWindowLimit <- obj .:? "context_limit" .!= 128000
     mcpServers         <- obj .:? "mcp_servers" .!= Map.empty
     userSpecialists    <- obj .:? "specialists" .!= Map.empty
@@ -282,6 +288,7 @@ instance Aeson.FromJSON Config where
     let specialists = Map.union userSpecialists (Map.union userSubagents defaultSpecialists)
         workspaceRoot  = "."
         artifactDir    = ".lambda/artifacts"
+        projectContext = ""
     pure Config{..}
 
 defaultAllowGlobs :: [String]
@@ -399,7 +406,7 @@ defaultConfig = Config
   , alwaysDenyGlobs     = defaultDenyGlobs
   , workspaceRoot       = "."
   , artifactDir         = ".lambda/artifacts"
-  , maxTurnBudget       = 30
+  , maxTurnBudget       = 60
   , contextWindowLimit  = 128000
   , mcpServers          = Map.empty
   , specialists         = defaultSpecialists
@@ -410,6 +417,7 @@ defaultConfig = Config
   , themeName           = "default"
   , customThemes        = Map.empty
   , mouseSupport        = True
+  , projectContext      = ""
   }
 
 -- | Default capabilities granted to OpenCode markdown agents unless restricted by frontmatter
@@ -417,10 +425,7 @@ defaultOpenCodeCapabilities :: [Text]
 defaultOpenCodeCapabilities =
   [ "read_file*"
   , "list_directory*"
-  , "grep_search*"
-  , "find_by_name*"
   , "fetch_url*"
-  , "replace_lines*"
   , "edit_file*"
   , "write_file*"
   , "bash*"
@@ -434,9 +439,9 @@ defaultOpenCodeCapabilities =
 mapOpenCodeToolKey :: Text -> [Text]
 mapOpenCodeToolKey k =
   case T.toLower (T.strip k) of
-    "edit"      -> ["replace_lines*", "edit_file*"]
-    "patch"     -> ["replace_lines*", "edit_file*"]
-    "multiedit" -> ["replace_lines*", "edit_file*"]
+    "edit"      -> ["edit_file*"]
+    "patch"     -> ["edit_file*"]
+    "multiedit" -> ["edit_file*"]
     "write"     -> ["write_file*"]
     "bash"      -> ["bash*"]
     "shell"     -> ["bash*"]
@@ -817,6 +822,8 @@ loadConfig wsRoot = do
   createDirectoryIfMissing True artDir `catch` (\(_ :: IOException) -> pure ())
   createDirectoryIfMissing True (home </> ".config" </> "lambdA") `catch` (\(_ :: IOException) -> pure ())
 
+  projCtx <- loadProjectContext home wsRoot
+
   pure mergedCfg
     { apiBaseUrl         = finalUrl
     , apiKey             = finalKey
@@ -826,7 +833,52 @@ loadConfig wsRoot = do
     , artifactDir        = artDir
     , contextWindowLimit = finalLimit
     , themeName          = finalTheme
+    , projectContext     = projCtx
     }
+
+-- | Discover and load hierarchical project instructions (global ~/.config/lambdA/AGENTS.md
+-- plus workspace-confined AGENTS.md, falling back to CLAUDE.md).
+-- Caps combined content at 16 KB and wraps in <project_instructions> delimiters.
+loadProjectContext :: FilePath -> FilePath -> IO Text
+loadProjectContext home wsRoot = do
+  globalTxt <- readSafeFile Nothing (home </> ".config" </> "lambdA" </> "AGENTS.md")
+  wsAgents  <- readSafeFile (Just wsRoot) (wsRoot </> "AGENTS.md")
+  wsTxt     <- if T.null wsAgents
+                 then readSafeFile (Just wsRoot) (wsRoot </> "CLAUDE.md")
+                 else pure wsAgents
+  let parts = filter (not . T.null) [globalTxt, wsTxt]
+  if null parts
+    then pure ""
+    else do
+      let combined = T.intercalate "\n\n" parts
+          maxChars = 16384
+          capped = if T.length combined > maxChars
+                     then T.take maxChars combined <> "\n... [project instructions truncated at 16 KB]"
+                     else combined
+      pure $ "<project_instructions>\n" <> capped <> "\n</project_instructions>"
+  where
+    readSafeFile mConfineRoot fp = do
+      res <- try $ do
+        exists <- doesFileExist fp
+        if not exists
+          then pure ""
+          else do
+            allowed <- case mConfineRoot of
+              Nothing -> pure True
+              Just root -> do
+                cRoot <- canonicalizePath root
+                cFile <- canonicalizePath fp
+                let rParts = splitDirectories cRoot
+                    fParts = splitDirectories cFile
+                pure (rParts `isPrefixOf` fParts)
+            if not allowed
+              then pure ""
+              else do
+                bs <- BS.readFile fp
+                pure (T.strip (TE.decodeUtf8Lenient bs))
+      case res of
+        Left (_ :: SomeException) -> pure ""
+        Right t                   -> pure t
 
 -- | Resolve "{ENV:VAR_NAME}" or "{env:VAR_NAME}" placeholders using a lookup function
 resolveEnvTemplates :: (String -> IO (Maybe String)) -> Text -> IO Text
